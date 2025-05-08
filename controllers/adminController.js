@@ -193,3 +193,18 @@ exports.getLinkSummary = asyncHandler(async (req, res) => {
 
   res.json({ title: linkDoc.title, rows, grandTotal });
 });
+
+exports.deleteLink = asyncHandler(async (req, res) => {
+  const { linkId } = req.body;
+  
+  if (!linkId) return badRequest(res, 'linkId required');
+
+  // Check if the link exists
+  const link = await Link.findById(linkId);
+  if (!link) return notFound(res, 'Link not found');
+
+  // Delete the link
+  await Link.findByIdAndDelete(linkId);
+
+  res.json({ message: 'Link deleted successfully' });
+});
