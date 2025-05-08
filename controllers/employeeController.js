@@ -99,25 +99,49 @@ exports.submitEntry = asyncHandler(async (req, res) => {
   const { name, amount, employeeId, upiId: manualUpiId, notes } = req.body;
   const { linkId } = req.params;
 
+  // 1) Required fields
   if (!name || !amount || !employeeId) {
-    return res.status(400).json({ error: 'name, amount and employeeId are all required' });
+    return res.status(400).json({ error: 'name, amount, and employeeId are all required' });
   }
 
   let upiId = manualUpiId?.trim();
 
-  // Decode QR only if manual UPI ID is not provided
+  // 2) If no manual UPI, decode QR from uploaded image
   if (!upiId && req.file) {
     try {
       const img = await Jimp.read(req.file.buffer);
-      const qr = new QrCode();
+
+      // Decode QR with timeout to avoid hanging
       const upiString = await new Promise((resolve, reject) => {
+        const qr = new QrCode();
+        let done = false;
+        
         qr.callback = (err, value) => {
+          if (done) return;
+          done = true;
           if (err || !value) return reject(new Error('Failed to decode QR'));
           resolve(value.result);
         };
-        qr.decode(img.bitmap);
+
+        try {
+          qr.decode(img.bitmap);
+        } catch (decodeErr) {
+          if (!done) {
+            done = true;
+            return reject(decodeErr);
+          }
+        }
+
+        // timeout fallback
+        setTimeout(() => {
+          if (!done) {
+            done = true;
+            reject(new Error('QR decode timed out'));
+          }
+        }, 5000);
       });
 
+      // Extract UPI ID from URI or raw string
       if (upiString.startsWith('upi://')) {
         const [, query] = upiString.split('?');
         const params = parse(query);
@@ -125,30 +149,37 @@ exports.submitEntry = asyncHandler(async (req, res) => {
       } else {
         upiId = upiString.trim();
       }
+
     } catch (err) {
       console.error('QR decode error:', err);
       return res.status(400).json({ error: 'Invalid or unreadable QR code' });
     }
   }
 
+  // 3) Require UPI one way or another
   if (!upiId) {
     return res.status(400).json({ error: 'UPI ID is required via QR or manually' });
   }
 
-  // Prevent duplicate entries
-  const already = await Entry.findOne({ linkId, upiId });
-  if (already) {
+  // 4) Manual UPI format check
+  if (manualUpiId && !/^[a-zA-Z0-9_.-]+@[a-zA-Z0-9.-]+$/.test(manualUpiId)) {
+    return res.status(400).json({ error: 'Invalid UPI ID format' });
+  }
+
+  // 5) Prevent duplicates
+  const exists = await Entry.findOne({ linkId, upiId });
+  if (exists) {
     return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
   }
 
-  // Save the new entry
+  // 6) Save entry
   const entry = new Entry({
     linkId,
     employeeId,
-    name,
+    name: name.trim(),
     upiId,
     amount,
-    notes: notes?.trim() || ''
+    notes: notes?.trim() || '',
   });
 
   await entry.save();
