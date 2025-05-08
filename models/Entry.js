@@ -2,12 +2,13 @@
 const mongoose = require('mongoose');
 
 const entrySchema = new mongoose.Schema({
-  linkId:     { type: String, ref: 'Link', required: true },
+  linkId: { type: String, ref: 'Link', required: true },
   employeeId: { type: String, ref: 'Employee', required: true },
-  name:       { type: String, required: true },
-  upiId:      { type: String, required: true },
-  amount:     { type: Number, required: true },
-  createdAt:  { type: Date,   default: Date.now }
+  name: { type: String, required: true },
+  upiId: { type: String, required: true },
+  notes: { type: String },
+  amount: { type: Number, required: true },
+  createdAt: { type: Date, default: Date.now }
 });
 
 // ← enforce uniqueness of (linkId, upiId) pairs:
