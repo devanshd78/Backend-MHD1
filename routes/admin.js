@@ -23,5 +23,6 @@ router
 
 router.post('/links/entries',  ctrl.getEntries);
 router.post('/links/summary',  ctrl.getLinkSummary);
+router.post('/links/delete', ctrl.deleteLink);
 
 module.exports = router;
