@@ -18,14 +18,19 @@ exports.register = async (req, res) => {
     return res.status(400).json({ error: 'Name, email and password required' })
   }
 
-  // generate and store a unique employeeId
+  // Check for existing email
+  const existingUser = await Employee.findOne({ email })
+  if (existingUser) {
+    return res.status(409).json({ error: 'Email already in use' })
+  }
+
   const employeeId = uuidv4()
 
   const user = new Employee({
     email,
     password,
     name,
-    employeeId,          // ← new field
+    employeeId,
   })
 
   await user.save()
@@ -90,62 +95,67 @@ exports.getLink = async (req, res) => {
   res.json(link)
 }
 
-// controllers/employee.js
 exports.submitEntry = asyncHandler(async (req, res) => {
-  const { name, amount, employeeId } = req.body;
-  const { linkId }                   = req.params;
+  const { name, amount, employeeId, upiId: manualUpiId, notes } = req.body;
+  const { linkId } = req.params;
 
   if (!name || !amount || !employeeId) {
     return res.status(400).json({ error: 'name, amount and employeeId are all required' });
   }
-  if (!req.file) {
-    return res.status(400).json({ error: 'QR image file (qrImage) is required' });
+
+  let upiId = manualUpiId?.trim();
+
+  // Decode QR only if manual UPI ID is not provided
+  if (!upiId && req.file) {
+    try {
+      const img = await Jimp.read(req.file.buffer);
+      const qr = new QrCode();
+      const upiString = await new Promise((resolve, reject) => {
+        qr.callback = (err, value) => {
+          if (err || !value) return reject(new Error('Failed to decode QR'));
+          resolve(value.result);
+        };
+        qr.decode(img.bitmap);
+      });
+
+      if (upiString.startsWith('upi://')) {
+        const [, query] = upiString.split('?');
+        const params = parse(query);
+        upiId = params.pa;
+      } else {
+        upiId = upiString.trim();
+      }
+    } catch (err) {
+      console.error('QR decode error:', err);
+      return res.status(400).json({ error: 'Invalid or unreadable QR code' });
+    }
   }
 
-  // 1) Decode QR → upiString
-  let upiString;
-  try {
-    const img = await Jimp.read(req.file.buffer);
-    const qr  = new QrCode();
-    upiString = await new Promise((resolve, reject) => {
-      qr.callback = (err, value) => {
-        if (err || !value) return reject(new Error('Failed to decode QR'));
-        resolve(value.result);
-      };
-      qr.decode(img.bitmap);
-    });
-  } catch (err) {
-    console.error('QR decode error:', err);
-    return res.status(400).json({ error: 'Invalid or unreadable QR code' });
-  }
-
-  // 2) Extract UPI ID
-  let upiId;
-  if (upiString.startsWith('upi://')) {
-    const [, query] = upiString.split('?');
-    const params     = parse(query);
-    upiId            = params.pa;
-  } else {
-    upiId = upiString.trim();
-  }
   if (!upiId) {
-    return res.status(400).json({ error: 'Could not extract UPI ID from QR code' });
+    return res.status(400).json({ error: 'UPI ID is required via QR or manually' });
   }
 
-  // 3) **Prevent duplicates**: check if this UPI ID already exists for this link
+  // Prevent duplicate entries
   const already = await Entry.findOne({ linkId, upiId });
   if (already) {
-    return res
-      .status(400)
-      .json({ error: 'This UPI ID has already been used for this link' });
+    return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
   }
 
-  // 4) Save the new entry
-  const entry = new Entry({ linkId, employeeId, name, upiId, amount });
+  // Save the new entry
+  const entry = new Entry({
+    linkId,
+    employeeId,
+    name,
+    upiId,
+    amount,
+    notes: notes?.trim() || ''
+  });
+
   await entry.save();
 
   res.json({ message: 'Entry submitted successfully', upiId });
 });
+
 
 exports.getEntriesByLink = asyncHandler(async (req, res) => {
   const {
