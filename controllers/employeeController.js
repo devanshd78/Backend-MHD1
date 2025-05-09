@@ -239,7 +239,6 @@ exports.getEntryByEmployee = asyncHandler(async (req, res) => {
   res.json({ entry });
 });
 
-
 exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
   const { linkId, employeeId } = req.params;
   const { name, amount, upiId, notes } = req.body;
@@ -256,28 +255,31 @@ exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Invalid UPI ID format' });
   }
 
-  try {
-    const entry = await Entry.findOneAndUpdate(
-      { linkId, employeeId },
-      {
-        name: name.trim(),
-        upiId: upiId.trim(),
-        amount,
-        notes: notes?.trim() || ''
-      },
-      { new: true, runValidators: true }
-    );
+  // Check for conflicting UPI ID in the same link
+  const conflict = await Entry.findOne({
+    linkId,
+    upiId: upiId.trim(),
+    employeeId: { $ne: employeeId }
+  });
 
-    if (!entry) {
-      return res.status(404).json({ error: 'Entry not found for this link and employee' });
-    }
-
-    res.json({ message: 'Entry updated successfully', entry });
-
-  } catch (err) {
-    if (err.code === 11000) {
-      return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
-    }
-    throw err;
+  if (conflict) {
+    return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
   }
+
+  const entry = await Entry.findOneAndUpdate(
+    { linkId, employeeId },
+    {
+      name: name.trim(),
+      upiId: upiId.trim(),
+      amount,
+      notes: notes?.trim() || ''
+    },
+    { new: true, runValidators: true }
+  );
+
+  if (!entry) {
+    return res.status(404).json({ error: 'Entry not found for this link and employee' });
+  }
+
+  res.json({ message: 'Entry updated successfully', entry });
 });
