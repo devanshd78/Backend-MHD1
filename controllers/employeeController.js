@@ -241,48 +241,58 @@ exports.getEntryByEmployee = asyncHandler(async (req, res) => {
 
 exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
   const { linkId, employeeId } = req.params;
-  const { name, amount, upiId, notes } = req.body;
+  let { name, amount, upiId, notes } = req.body;
 
   if (!linkId || !employeeId) {
     return res.status(400).json({ error: 'linkId and employeeId are required' });
   }
-
   if (!name || !amount || !upiId) {
     return res.status(400).json({ error: 'name, amount, and upiId are required' });
   }
 
+  name = name.trim();
+  notes = notes?.trim() || '';
+  upiId = upiId.trim();
+
+  // Validate UPI format
   if (!isValidUpi(upiId)) {
     return res.status(400).json({ error: 'Invalid UPI ID format' });
   }
 
-  const newUpi = upiId.trim();
-
+  // Fetch the existing entry
   const existingEntry = await Entry.findOne({ linkId, employeeId });
-
   if (!existingEntry) {
     return res.status(404).json({ error: 'Entry not found for this link and employee' });
   }
 
-  // Only check for conflict if UPI ID is being changed
-  if (existingEntry.upiId !== newUpi) {
+  // Only check for conflicts if the UPI is actually changing
+  if (existingEntry.upiId !== upiId) {
     const conflict = await Entry.findOne({
       linkId,
-      upiId: newUpi,
-      employeeId: { $ne: employeeId }
+      upiId,
+      _id: { $ne: existingEntry._id }
     });
-
     if (conflict) {
       return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
     }
   }
 
-  // Update entry
-  existingEntry.name = name.trim();
-  existingEntry.upiId = newUpi;
+  // Apply updates
+  existingEntry.name   = name;
   existingEntry.amount = amount;
-  existingEntry.notes = notes?.trim() || '';
+  existingEntry.upiId  = upiId;
+  existingEntry.notes  = notes;
 
-  await existingEntry.save(); // this runs validation and respects uniqueness
-
-  res.json({ message: 'Entry updated successfully', entry: existingEntry });
+  // Save with error handling for unique‐index violations
+  try {
+    await existingEntry.save();
+    res.json({ message: 'Entry updated successfully', entry: existingEntry });
+  } catch (err) {
+    if (err.code === 11000) {
+      // Failsafe: catch any duplicate‐key error that slipped past our check
+      return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
+    }
+    // Propagate unexpected errors
+    throw err;
+  }
 });
