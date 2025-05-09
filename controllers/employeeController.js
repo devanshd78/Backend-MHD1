@@ -255,31 +255,34 @@ exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Invalid UPI ID format' });
   }
 
-  // Check for conflicting UPI ID in the same link
-  const conflict = await Entry.findOne({
-    linkId,
-    upiId: upiId.trim(),
-    employeeId: { $ne: employeeId }
-  });
+  const newUpi = upiId.trim();
 
-  if (conflict) {
-    return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
-  }
+  const existingEntry = await Entry.findOne({ linkId, employeeId });
 
-  const entry = await Entry.findOneAndUpdate(
-    { linkId, employeeId },
-    {
-      name: name.trim(),
-      upiId: upiId.trim(),
-      amount,
-      notes: notes?.trim() || ''
-    },
-    { new: true, runValidators: true }
-  );
-
-  if (!entry) {
+  if (!existingEntry) {
     return res.status(404).json({ error: 'Entry not found for this link and employee' });
   }
 
-  res.json({ message: 'Entry updated successfully', entry });
+  // Only check for conflict if UPI ID is being changed
+  if (existingEntry.upiId !== newUpi) {
+    const conflict = await Entry.findOne({
+      linkId,
+      upiId: newUpi,
+      employeeId: { $ne: employeeId }
+    });
+
+    if (conflict) {
+      return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
+    }
+  }
+
+  // Update entry
+  existingEntry.name = name.trim();
+  existingEntry.upiId = newUpi;
+  existingEntry.amount = amount;
+  existingEntry.notes = notes?.trim() || '';
+
+  await existingEntry.save(); // this runs validation and respects uniqueness
+
+  res.json({ message: 'Entry updated successfully', entry: existingEntry });
 });
