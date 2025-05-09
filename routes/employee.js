@@ -1,6 +1,6 @@
 // routes/employee.js
 const express = require('express');
-const multer     = require('multer')
+const multer = require('multer')
 const router = express.Router();
 const ctrl = require('../controllers/employeeController');
 
@@ -13,12 +13,15 @@ router.post('/login', ctrl.login);
 router.get('/links', ctrl.listLinks);
 router.get('/links/:linkId', ctrl.getLink);
 router.post(
-    '/links/:linkId/entries',
-    upload.single('qrImage'),
-    ctrl.submitEntry
-  )
+  '/links/:linkId/entries',
+  upload.single('qrImage'),
+  ctrl.submitEntry
+)
 router.post('/links/entries', ctrl.getEntriesByLink)
 router.get('/entries/:linkId/:employeeId', ctrl.getEntryByEmployee);
-router.post('/entries/:linkId/:employeeId', ctrl.updateEntryByEmployee);
+router.post(
+  '/entries/:linkId/:employeeId/:entryId',
+  ctrl.updateEntryByEmployee
+);
 
 module.exports = router;
