@@ -18,5 +18,7 @@ router.post(
     ctrl.submitEntry
   )
 router.post('/links/entries', ctrl.getEntriesByLink)
+router.get('/entries/:linkId/:employeeId', ctrl.getEntryByEmployee);
+router.post('/entries/:linkId/:employeeId', ctrl.updateEntryByEmployee);
 
 module.exports = router;
