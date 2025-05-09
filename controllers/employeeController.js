@@ -4,11 +4,12 @@ const Employee = require('../models/Employee')
 const Link = require('../models/Link')
 const Entry = require('../models/Entry')
 const bcrypt = require('bcrypt')
+const { PNG } = require('pngjs');
 
 // <-- fixed: pull Jimp out of the named exports in v0.16+
-const { Jimp }        = require('jimp')
-const QrCode          = require('qrcode-reader')
-const { parse } = require('querystring')    
+const { Jimp } = require('jimp')
+const QrCode = require('qrcode-reader')
+const { parse } = require('querystring')
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 
@@ -94,6 +95,7 @@ exports.getLink = async (req, res) => {
   if (!link) return res.status(404).json({ error: 'Link not found' })
   res.json(link)
 }
+
 
 exports.submitEntry = asyncHandler(async (req, res) => {
   const { name, amount, employeeId, upiId: manualUpiId, notes } = req.body;
@@ -187,12 +189,11 @@ exports.submitEntry = asyncHandler(async (req, res) => {
   res.json({ message: 'Entry submitted successfully', upiId });
 });
 
-
 exports.getEntriesByLink = asyncHandler(async (req, res) => {
   const {
     employeeId,
     linkId,
-    page  = 1,
+    page = 1,
     limit = 10,
   } = req.body;
 
@@ -205,14 +206,14 @@ exports.getEntriesByLink = asyncHandler(async (req, res) => {
   /* ---------------------------------------------------------- *
    * 1) gather counts + latestLink + page of rows in parallel   *
    * ---------------------------------------------------------- */
-  const [ total, latestLink, entries ] = await Promise.all([
+  const [total, latestLink, entries] = await Promise.all([
     Entry.countDocuments(filter),
     Link.findOne().sort({ createdAt: -1 }).select('_id').lean(),
     Entry.find(filter)
-         .sort({ createdAt: -1 })
-         .skip((page - 1) * limit)
-         .limit(limit)
-         .lean(),
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
   ]);
 
   /* grand total amount (across ALL pages) */
@@ -227,7 +228,68 @@ exports.getEntriesByLink = asyncHandler(async (req, res) => {
     totalAmount,                  // sum across ALL entries
     isLatest: latestLink?._id.toString() === linkId,
     total,                        // total rows
-    page:  Number(page),
+    page: Number(page),
     pages: Math.ceil(total / limit),
   });
+});
+
+exports.getEntryByEmployee = asyncHandler(async (req, res) => {
+  const { linkId, employeeId } = req.params;
+
+  if (!linkId || !employeeId) {
+    return res.status(400).json({ error: 'linkId and employeeId are required' });
+  }
+
+  const entry = await Entry.findOne({ linkId, employeeId });
+
+  if (!entry) {
+    return res.status(404).json({ error: 'Entry not found' });
+  }
+
+  res.json({ entry });
+});
+
+
+exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
+  const { linkId, employeeId } = req.params;
+  const { name, amount, upiId, notes } = req.body;
+
+  if (!linkId || !employeeId) {
+    return res.status(400).json({ error: 'linkId and employeeId are required' });
+  }
+
+  if (!name || !amount || !upiId) {
+    return res.status(400).json({ error: 'name, amount, and upiId are required' });
+  }
+
+  if (!/^[a-zA-Z0-9_.-]+@[a-zA-Z0-9.-]+$/.test(upiId)) {
+    return res.status(400).json({ error: 'Invalid UPI ID format' });
+  }
+
+  const duplicate = await Entry.findOne({
+    linkId,
+    upiId,
+    employeeId: { $ne: employeeId }
+  });
+
+  if (duplicate) {
+    return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
+  }
+
+  const entry = await Entry.findOneAndUpdate(
+    { linkId, employeeId },
+    {
+      name: name.trim(),
+      upiId: upiId.trim(),
+      amount,
+      notes: notes?.trim() || ''
+    },
+    { new: true }
+  );
+
+  if (!entry) {
+    return res.status(404).json({ error: 'Entry not found for this link and employee' });
+  }
+
+  res.json({ message: 'Entry updated successfully', entry });
 });
