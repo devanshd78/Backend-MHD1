@@ -13,6 +13,10 @@ const { parse } = require('querystring')
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 
+function isValidUpi(upi) {
+  return /^[a-zA-Z0-9_.-]+@[a-zA-Z0-9.-]+$/.test(upi);
+}
+
 exports.register = async (req, res) => {
   const { email, password, name } = req.body
   if (!email || !password || !name) {
@@ -101,23 +105,20 @@ exports.submitEntry = asyncHandler(async (req, res) => {
   const { name, amount, employeeId, upiId: manualUpiId, notes } = req.body;
   const { linkId } = req.params;
 
-  // 1) Required fields
   if (!name || !amount || !employeeId) {
-    return res.status(400).json({ error: 'name, amount, and employeeId are all required' });
+    return res.status(400).json({ error: 'name, amount, and employeeId are required' });
   }
 
   let upiId = manualUpiId?.trim();
 
-  // 2) If no manual UPI, decode QR from uploaded image
+  // Attempt to decode QR if no manual UPI
   if (!upiId && req.file) {
     try {
       const img = await Jimp.read(req.file.buffer);
-
-      // Decode QR with timeout to avoid hanging
       const upiString = await new Promise((resolve, reject) => {
         const qr = new QrCode();
         let done = false;
-        
+
         qr.callback = (err, value) => {
           if (done) return;
           done = true;
@@ -127,14 +128,13 @@ exports.submitEntry = asyncHandler(async (req, res) => {
 
         try {
           qr.decode(img.bitmap);
-        } catch (decodeErr) {
+        } catch (err) {
           if (!done) {
             done = true;
-            return reject(decodeErr);
+            reject(err);
           }
         }
 
-        // timeout fallback
         setTimeout(() => {
           if (!done) {
             done = true;
@@ -143,50 +143,40 @@ exports.submitEntry = asyncHandler(async (req, res) => {
         }, 5000);
       });
 
-      // Extract UPI ID from URI or raw string
-      if (upiString.startsWith('upi://')) {
-        const [, query] = upiString.split('?');
-        const params = parse(query);
-        upiId = params.pa;
-      } else {
-        upiId = upiString.trim();
-      }
+      upiId = upiString.startsWith('upi://') ? parse(upiString.split('?')[1]).pa : upiString.trim();
 
     } catch (err) {
-      console.error('QR decode error:', err);
+      console.error('QR decode error:', err.message);
       return res.status(400).json({ error: 'Invalid or unreadable QR code' });
     }
   }
 
-  // 3) Require UPI one way or another
   if (!upiId) {
     return res.status(400).json({ error: 'UPI ID is required via QR or manually' });
   }
 
-  // 4) Manual UPI format check
-  if (manualUpiId && !/^[a-zA-Z0-9_.-]+@[a-zA-Z0-9.-]+$/.test(manualUpiId)) {
+  if (!isValidUpi(upiId)) {
     return res.status(400).json({ error: 'Invalid UPI ID format' });
   }
 
-  // 5) Prevent duplicates
-  const exists = await Entry.findOne({ linkId, upiId });
-  if (exists) {
-    return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
-  }
-
-  // 6) Save entry
   const entry = new Entry({
     linkId,
     employeeId,
     name: name.trim(),
     upiId,
     amount,
-    notes: notes?.trim() || '',
+    notes: notes?.trim() || ''
   });
 
-  await entry.save();
-
-  res.json({ message: 'Entry submitted successfully', upiId });
+  try {
+    await entry.save();
+    res.json({ message: 'Entry submitted successfully', upiId });
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
+    }
+    throw err;
+  }
 });
 
 exports.getEntriesByLink = asyncHandler(async (req, res) => {
@@ -262,34 +252,32 @@ exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'name, amount, and upiId are required' });
   }
 
-  if (!/^[a-zA-Z0-9_.-]+@[a-zA-Z0-9.-]+$/.test(upiId)) {
+  if (!isValidUpi(upiId)) {
     return res.status(400).json({ error: 'Invalid UPI ID format' });
   }
 
-  const duplicate = await Entry.findOne({
-    linkId,
-    upiId,
-    employeeId: { $ne: employeeId }
-  });
+  try {
+    const entry = await Entry.findOneAndUpdate(
+      { linkId, employeeId },
+      {
+        name: name.trim(),
+        upiId: upiId.trim(),
+        amount,
+        notes: notes?.trim() || ''
+      },
+      { new: true, runValidators: true }
+    );
 
-  if (duplicate) {
-    return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
+    if (!entry) {
+      return res.status(404).json({ error: 'Entry not found for this link and employee' });
+    }
+
+    res.json({ message: 'Entry updated successfully', entry });
+
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
+    }
+    throw err;
   }
-
-  const entry = await Entry.findOneAndUpdate(
-    { linkId, employeeId },
-    {
-      name: name.trim(),
-      upiId: upiId.trim(),
-      amount,
-      notes: notes?.trim() || ''
-    },
-    { new: true }
-  );
-
-  if (!entry) {
-    return res.status(404).json({ error: 'Entry not found for this link and employee' });
-  }
-
-  res.json({ message: 'Entry updated successfully', entry });
 });
