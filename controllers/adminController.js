@@ -1,9 +1,10 @@
 // controllers/admin.controller.js
-const bcrypt   = require('bcrypt');
-const Admin    = require('../models/Admin');
-const Link     = require('../models/Link');
-const Entry    = require('../models/Entry');
+const bcrypt = require('bcrypt');
+const Admin = require('../models/Admin');
+const Link = require('../models/Link');
+const Entry = require('../models/Entry');
 const Employee = require('../models/Employee');
+const BalanceHistory = require('../models/BalanceHistory'); // Add this at the top
 
 /* ------------------------------------------------------------------ */
 /*  small helpers                                                     */
@@ -53,7 +54,7 @@ exports.listLinks = asyncHandler(async (_req, res) => {
 /* ------------------------------------------------------------------ */
 exports.getEmployees = asyncHandler(async (_req, res) => {
   const employees = await Employee.find()
-    .select('name email employeeId')
+    .select('name email employeeId balance')
     .lean();
   res.json(employees);
 });
@@ -85,7 +86,7 @@ exports.getLinksByEmployee = asyncHandler(async (req, res) => {
 
   /* 1️⃣  collect distinct linkIds this employee has entries in */
   const allIds = await Entry.distinct('linkId', { employeeId });
-  const total  = allIds.length;
+  const total = allIds.length;
 
   if (total === 0) {
     return res.json({ links: [], total: 0, page: 1, pages: 0 });
@@ -125,10 +126,10 @@ exports.getEntriesByEmployeeAndLink = asyncHandler(async (req, res) => {
 
   const [entries, total] = await Promise.all([
     Entry.find(filter)
-         .sort({ createdAt: -1 })
-         .skip((page - 1) * limit)
-         .limit(limit)
-         .lean(),
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
     Entry.countDocuments(filter),
   ]);
 
@@ -162,7 +163,7 @@ exports.getLinkSummary = asyncHandler(async (req, res) => {
       {
         $group: {
           _id: '$employeeId',
-          entryCount:    { $sum: 1 },
+          entryCount: { $sum: 1 },
           employeeTotal: { $sum: '$amount' },
         },
       },
@@ -196,7 +197,7 @@ exports.getLinkSummary = asyncHandler(async (req, res) => {
 
 exports.deleteLink = asyncHandler(async (req, res) => {
   const { linkId } = req.body;
-  
+
   if (!linkId) return badRequest(res, 'linkId required');
 
   // Check if the link exists
@@ -208,3 +209,59 @@ exports.deleteLink = asyncHandler(async (req, res) => {
 
   res.json({ message: 'Link deleted successfully' });
 });
+
+exports.addEmployeeBalance = asyncHandler(async (req, res) => {
+  const { employeeId, amount, adminId, note = '' } = req.body;
+
+  if (!employeeId || !amount || !adminId) {
+    return badRequest(res, 'employeeId, amount and adminId are required');
+  }
+
+  const employee = await Employee.findOne({ employeeId });
+  if (!employee) return notFound(res, 'Employee not found');
+
+  // Update employee balance
+  employee.balance = (employee.balance || 0) + amount;
+  await employee.save();
+
+  // Save history
+  await BalanceHistory.create({
+    employeeId,
+    amount,
+    addedBy: adminId,
+    note,
+  });
+
+  res.json({ message: 'Balance added successfully', newBalance: employee.balance });
+});
+
+
+exports.getBalanceHistory = asyncHandler(async (req, res) => {
+  const { employeeId, page = 1, limit = 20 } = req.body;
+
+  const filter = employeeId ? { employeeId } : {};
+
+  const [history, total, sumResult] = await Promise.all([
+    BalanceHistory.find(filter)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .lean(),
+    BalanceHistory.countDocuments(filter),
+    BalanceHistory.aggregate([
+      { $match: filter },
+      { $group: { _id: null, totalAmount: { $sum: "$amount" } } },
+    ]),
+  ]);
+
+  const totalAmount = sumResult[0]?.totalAmount || 0;
+
+  res.json({
+    history,
+    total,
+    totalAmount,
+    page: Number(page),
+    pages: Math.ceil(total / limit),
+  });
+});
+
