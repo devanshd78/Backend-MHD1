@@ -159,6 +159,20 @@ exports.submitEntry = asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Invalid UPI ID format' });
   }
 
+  // Check if the employee has enough balance
+  const employee = await Employee.findOne({ employeeId });
+  if (!employee) {
+    return res.status(404).json({ error: 'Employee not found' });
+  }
+
+  if (employee.balance < amount) {
+    return res.status(400).json({ error: 'Insufficient balance' });
+  }
+
+  // Deduct the balance from the employee
+  employee.balance -= amount;
+  await employee.save();
+
   const entry = new Entry({
     linkId,
     employeeId,
@@ -244,7 +258,6 @@ exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
   const { linkId, employeeId, entryId } = req.params;
   let { name, amount, upiId: rawUpi, notes: rawNotes } = req.body;
 
-  // 1) Basic validation
   if (!linkId || !employeeId || !entryId) {
     return res.status(400).json({ error: 'linkId, employeeId and entryId are required' });
   }
@@ -256,42 +269,44 @@ exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
   const notes = rawNotes?.trim() || '';
   const upiId = rawUpi.trim();
 
-  // 2) Validate UPI format
   if (!isValidUpi(upiId)) {
     return res.status(400).json({ error: 'Invalid UPI ID format' });
   }
 
-  // 3) Load exactly the entry we want to update
   const entry = await Entry.findOne({ _id: entryId, linkId, employeeId });
   if (!entry) {
     return res.status(404).json({ error: 'Entry not found for this link/employee' });
   }
 
-  // 4) If UPI changed, make sure no one else on this link is already using it
-  if (entry.upiId !== upiId) {
-    const conflict = await Entry.findOne({
-      linkId,
-      upiId,
-      _id: { $ne: entryId }
-    });
-    if (conflict) {
-      return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
-    }
+  // Calculate the difference in amount if updated
+  const amountDifference = amount - entry.amount;
+
+  // Check if the employee has enough balance
+  const employee = await Employee.findOne({ employeeId });
+  if (!employee) {
+    return res.status(404).json({ error: 'Employee not found' });
   }
 
-  // 5) Apply updates
-  entry.name   = nameTrimmed;
-  entry.amount = amount;
-  entry.upiId  = upiId;
-  entry.notes  = notes;
+  // If increasing the amount, check if balance is sufficient
+  if (amountDifference > 0 && employee.balance < amountDifference) {
+    return res.status(400).json({ error: 'Insufficient balance' });
+  }
 
-  // 6) Save & catch any leftover duplicate-key errors
+  // Update the balance
+  employee.balance -= amountDifference;
+  await employee.save();
+
+  // Update the entry
+  entry.name = nameTrimmed;
+  entry.amount = amount;
+  entry.upiId = upiId;
+  entry.notes = notes;
+
   try {
     await entry.save();
     res.json({ message: 'Entry updated successfully', entry });
   } catch (err) {
     if (err.code === 11000) {
-      // In case the index still trips for some reason
       return res.status(400).json({ error: 'This UPI ID has already been used for this link' });
     }
     throw err;
