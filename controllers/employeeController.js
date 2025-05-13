@@ -169,10 +169,6 @@ exports.submitEntry = asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Insufficient balance' });
   }
 
-  // Deduct the balance from the employee
-  employee.balance -= amount;
-  await employee.save();
-
   const entry = new Entry({
     linkId,
     employeeId,
@@ -184,6 +180,8 @@ exports.submitEntry = asyncHandler(async (req, res) => {
 
   try {
     await entry.save();
+    employee.balance -= amount;
+    await employee.save();
     res.json({ message: 'Entry submitted successfully', upiId });
   } catch (err) {
     if (err.code === 11000) {
@@ -292,10 +290,6 @@ exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Insufficient balance' });
   }
 
-  // Update the balance
-  employee.balance -= amountDifference;
-  await employee.save();
-
   // Update the entry
   entry.name = nameTrimmed;
   entry.amount = amount;
@@ -304,6 +298,9 @@ exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
 
   try {
     await entry.save();
+
+    employee.balance -= amountDifference;
+    await employee.save();
     res.json({ message: 'Entry updated successfully', entry });
   } catch (err) {
     if (err.code === 11000) {
@@ -327,4 +324,3 @@ exports.getBalance = asyncHandler(async (req, res) => {
 
   res.json({ balance: employee.balance });
 });
-
