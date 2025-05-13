@@ -312,3 +312,19 @@ exports.updateEntryByEmployee = asyncHandler(async (req, res) => {
     throw err;
   }
 });
+
+exports.getBalance = asyncHandler(async (req, res) => {
+  const { employeeId } = req.query;
+
+  if (!employeeId) {
+    return res.status(400).json({ error: 'Employee ID is required' });
+  }
+
+  const employee = await Employee.findOne({ employeeId });
+  if (!employee) {
+    return res.status(404).json({ error: 'Employee not found' });
+  }
+
+  res.json({ balance: employee.balance });
+});
+
