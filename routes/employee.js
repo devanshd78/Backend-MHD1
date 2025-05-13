@@ -23,5 +23,6 @@ router.post(
   '/entries/:linkId/:employeeId/:entryId',
   ctrl.updateEntryByEmployee
 );
+router.get('/balance', ctrl.getBalance);
 
 module.exports = router;
