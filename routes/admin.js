@@ -20,9 +20,11 @@ router
   .route('/links')
   .get(ctrl.listLinks)     // GET /admin/links
   .post(ctrl.createLink);  // POST /admin/links
+// Balance APIs
+router.post('/employees/add-balance', ctrl.addEmployeeBalance);
+router.post('/employees/balance-history', ctrl.getBalanceHistory);
 
 router.post('/links/entries',  ctrl.getEntries);
 router.post('/links/summary',  ctrl.getLinkSummary);
 router.post('/links/delete', ctrl.deleteLink);
-
 module.exports = router;
