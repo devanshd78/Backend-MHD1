@@ -33,19 +33,30 @@ exports.login = asyncHandler(async (req, res) => {
 /*  links                                                             */
 /* ------------------------------------------------------------------ */
 exports.createLink = asyncHandler(async (req, res) => {
-  const { title, adminId } = req.body;
-  if (!title || !adminId) return badRequest(res, 'title and adminId required');
+  const { title, adminId, target, amount } = req.body;
 
+  // Basic validation
+  if (!adminId || target == null || amount == null) {
+    return badRequest(res, 'adminId, target, and amount are required');
+  }
+
+  // Validate admin existence
   const adminExists = await Admin.exists({ adminId });
   if (!adminExists) return badRequest(res, 'Invalid adminId');
 
-  const link = await Link.create({ title, createdBy: adminId });
+  // Create new link
+  const link = await Link.create({
+    title,
+    createdBy: adminId,
+    target,
+    amount
+  });
 
   res.json({ link: `/employee/links/${link._id}` });
 });
 
 exports.listLinks = asyncHandler(async (_req, res) => {
-  const links = await Link.find().select('title createdBy createdAt').lean();
+  const links = await Link.find().select('title createdBy createdAt target amount ').lean();
   res.json(links);
 });
 
