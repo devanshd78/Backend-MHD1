@@ -23,6 +23,7 @@ router
 // Balance APIs
 router.post('/employees/add-balance', ctrl.addEmployeeBalance);
 router.post('/employees/balance-history', ctrl.getBalanceHistory);
+router.post('/employees/update-balance', ctrl.updateEmployeeBalance);
 
 router.post('/links/entries',  ctrl.getEntries);
 router.post('/links/summary',  ctrl.getLinkSummary);
