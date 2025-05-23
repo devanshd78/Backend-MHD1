@@ -18,6 +18,11 @@ const adminSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  username: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
   // …any other fields…
 });
 
