@@ -60,9 +60,18 @@ exports.listLinks = asyncHandler(async (_req, res) => {
   const links = await Link.find()
     .select('title createdBy createdAt target amount expireIn')
     .lean();
-  res.json(links);
-});
 
+  const updatedLinks = links.map(link => {
+    const expireAt = new Date(link.createdAt);
+    expireAt.setHours(expireAt.getHours() + (link.expireIn || 0)); // Add expireIn hours to createdAt
+    return {
+      ...link,
+      expireAt,
+    };
+  });
+
+  res.json(updatedLinks);
+});
 
 /* ------------------------------------------------------------------ */
 /*  employees & entries                                               */
@@ -200,6 +209,7 @@ exports.getLinkSummary = asyncHandler(async (req, res) => {
         employeeId: '$_id',
         name: '$emp.name',
         employeeTotal: 1,
+        walletBalance: '$emp.balance',
       },
     },
   ]);
@@ -315,3 +325,75 @@ exports.getBalanceHistory = asyncHandler(async (req, res) => {
   });
 });
 
+// Bulk add the same amount to multiple employees
+exports.bulkAddEmployeeBalance = asyncHandler(async (req, res) => {
+  const { employeeIds, amount, adminId, note = '' } = req.body;
+  if (
+    !Array.isArray(employeeIds) ||
+    employeeIds.length === 0 ||
+    typeof amount !== 'number' ||
+    !adminId
+  ) {
+    return badRequest(res, 'employeeIds (non-empty array), amount (number) and adminId are required');
+  }
+
+  // Process all in parallel
+  const results = await Promise.all(employeeIds.map(async (eid) => {
+    const emp = await Employee.findOne({ employeeId: eid });
+    if (!emp) return { employeeId: eid, error: 'Not found' };
+
+    emp.balance = (emp.balance || 0) + amount;
+    await emp.save();
+
+    await BalanceHistory.create({
+      employeeId: eid,
+      amount,
+      addedBy: adminId,
+      note: note || 'Bulk add',
+    });
+
+    return { employeeId: eid, newBalance: emp.balance };
+  }));
+
+  res.json({
+    message: 'Bulk add complete',
+    results
+  });
+});
+
+// Bulk overwrite balance for multiple employees
+exports.bulkUpdateEmployeeBalance = asyncHandler(async (req, res) => {
+  const { employeeIds, newBalance, adminId, note = '' } = req.body;
+  if (
+    !Array.isArray(employeeIds) ||
+    employeeIds.length === 0 ||
+    typeof newBalance !== 'number' ||
+    newBalance < 0 ||
+    !adminId
+  ) {
+    return badRequest(res, 'employeeIds (non-empty array), newBalance (non-negative number) and adminId are required');
+  }
+
+  const results = await Promise.all(employeeIds.map(async (eid) => {
+    const emp = await Employee.findOne({ employeeId: eid });
+    if (!emp) return { employeeId: eid, error: 'Not found' };
+
+    const oldBal = emp.balance || 0;
+    emp.balance = newBalance;
+    await emp.save();
+
+    await BalanceHistory.create({
+      employeeId: eid,
+      amount: newBalance - oldBal,  // record the delta
+      addedBy: adminId,
+      note: `Bulk update from ₹${oldBal} to ₹${newBalance}. ` + note,
+    });
+
+    return { employeeId: eid, oldBalance: oldBal, newBalance };
+  }));
+
+  res.json({
+    message: 'Bulk update complete',
+    results
+  });
+});
