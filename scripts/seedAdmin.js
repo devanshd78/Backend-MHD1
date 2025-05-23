@@ -17,7 +17,8 @@ async function seed() {
     const newAdmin = new Admin({
       adminId: uuidv4(),   // explicitly generate here
       email,
-      password: hash
+      password: hash,
+      username: 'admin'
     });
     await newAdmin.save();
     console.log('✅ Seeded admin:', email, 'with adminId', newAdmin.adminId);
