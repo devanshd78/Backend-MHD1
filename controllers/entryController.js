@@ -172,40 +172,83 @@ exports.updateEntry = asyncHandler(async (req, res) => {
   const entry = await Entry.findOne({ entryId });
   if (!entry) return notFound(res, 'Entry not found');
 
+  const changes = [];
+
   if (entry.type === 0) {
-    // employee flow
+    // Employee flow
     if (!name || !upiId || amount == null)
       return badRequest(res, 'name, upiId & amount required for employee entries');
-
     if (!isValidUpi(upiId.trim()))
       return badRequest(res, 'Invalid UPI format');
 
     const emp = await Employee.findOne({ employeeId: entry.employeeId });
     if (!emp) return notFound(res, 'Employee not found');
 
-    const diff = amount - entry.amount;
-    if (diff > 0 && emp.balance < diff)
-      return badRequest(res, 'Insufficient balance');
+    // Track name change
+    const trimmedName = name.trim();
+    if (entry.name !== trimmedName) {
+      changes.push({ field: 'name', from: entry.name, to: trimmedName });
+      entry.name = trimmedName;
+    }
 
-    entry.name       = name.trim();
-    entry.upiId      = upiId.trim();
-    entry.notes      = (notes || '').trim();
-    entry.amount     = amount;
-    emp.balance     -= diff;
-    await emp.save();
+    // Track UPI change
+    const trimmedUpi = upiId.trim();
+    if (entry.upiId !== trimmedUpi) {
+      changes.push({ field: 'upiId', from: entry.upiId, to: trimmedUpi });
+      entry.upiId = trimmedUpi;
+    }
+
+    // Track notes change
+    const newNotes = (notes || '').trim();
+    if (entry.notes !== newNotes) {
+      changes.push({ field: 'notes', from: entry.notes, to: newNotes });
+      entry.notes = newNotes;
+    }
+
+    // Track amount & adjust balance
+    if (entry.amount !== amount) {
+      const diff = amount - entry.amount;
+      if (diff > 0 && emp.balance < diff)
+        return badRequest(res, 'Insufficient balance');
+      changes.push({ field: 'amount', from: entry.amount, to: amount });
+      entry.amount = amount;
+      emp.balance -= diff;
+      await emp.save();
+    }
 
   } else {
-    // user flow
+    // User flow
     if (noOfPersons == null)
       return badRequest(res, 'noOfPersons required for user entries');
-
-    entry.noOfPersons = Number(noOfPersons);
-    entry.totalAmount = entry.noOfPersons * entry.linkAmount;
+    const newCount = Number(noOfPersons);
+    if (entry.noOfPersons !== newCount) {
+      changes.push({ field: 'noOfPersons', from: entry.noOfPersons, to: newCount });
+      entry.noOfPersons = newCount;
+    }
+    const newTotal = newCount * entry.linkAmount;
+    if (entry.totalAmount !== newTotal) {
+      changes.push({ field: 'totalAmount', from: entry.totalAmount, to: newTotal });
+      entry.totalAmount = newTotal;
+    }
   }
 
+  // Set update flag if any changes and record history
+  if (changes.length) {
+    entry.isUpdated = 1;
+    const timestamp = new Date();
+    changes.forEach(c => {
+      entry.history.push({ ...c, updatedAt: timestamp });
+    });
+  }
+
+  // Save and respond
   await entry.save();
-  res.json({ message: 'Entry updated', entry });
+  res.json({
+    message: changes.length ? 'Entry updated' : 'No changes detected',
+    entry
+  });
 });
+
 
 /* ------------------------------------------------------------------ */
 /*  6) APPROVE / REJECT                                               */
