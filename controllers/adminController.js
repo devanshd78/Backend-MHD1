@@ -4,53 +4,44 @@ const Admin = require('../models/Admin');
 const Link = require('../models/Link');
 const Entry = require('../models/Entry');
 const Employee = require('../models/Employee');
-const BalanceHistory = require('../models/BalanceHistory'); // Add this at the top
+const BalanceHistory = require('../models/BalanceHistory');
+const { default: mongoose } = require('mongoose');
+const { ObjectId } = require('mongodb');
 
-/* ------------------------------------------------------------------ */
-/*  small helpers                                                     */
-/* ------------------------------------------------------------------ */
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
-
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
-
 const notFound = (res, msg) => res.status(404).json({ error: msg });
 
 /* ------------------------------------------------------------------ */
-/*  auth                                                              */
+/*  AUTH                                                              */
 /* ------------------------------------------------------------------ */
 exports.login = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
-
-  const admin = await Admin.findOne({ email }).select('+password'); // password is usually select:false
+  const admin = await Admin.findOne({ email }).select('+password');
   if (!admin || !(await bcrypt.compare(password, admin.password))) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
-
   res.json({ message: 'Admin login successful', adminId: admin.adminId });
 });
 
 /* ------------------------------------------------------------------ */
-/*  links                                                             */
+/*  LINKS                                                             */
 /* ------------------------------------------------------------------ */
 exports.createLink = asyncHandler(async (req, res) => {
   const { title, adminId, target, amount, expireIn } = req.body;
-
-  // Basic validation
   if (!adminId || target == null || amount == null || expireIn == null) {
     return badRequest(res, 'adminId, target, amount, and expireIn are required');
   }
+  if (!await Admin.exists({ adminId })) {
+    return badRequest(res, 'Invalid adminId');
+  }
 
-  // Validate admin existence
-  const adminExists = await Admin.exists({ adminId });
-  if (!adminExists) return badRequest(res, 'Invalid adminId');
-
-  // Create new link
   const link = await Link.create({
     title,
     createdBy: adminId,
     target,
     amount,
-    expireIn, // in hours
+    expireIn
   });
 
   res.json({ link: `/employee/links/${link._id}` });
@@ -61,20 +52,28 @@ exports.listLinks = asyncHandler(async (_req, res) => {
     .select('title createdBy createdAt target amount expireIn')
     .lean();
 
-  const updatedLinks = links.map(link => {
-    const expireAt = new Date(link.createdAt);
-    expireAt.setHours(expireAt.getHours() + (link.expireIn || 0)); // Add expireIn hours to createdAt
-    return {
-      ...link,
-      expireAt,
-    };
+  const annotated = links.map(l => {
+    const expireAt = new Date(l.createdAt);
+    expireAt.setHours(expireAt.getHours() + (l.expireIn || 0));
+    return { ...l, expireAt };
   });
 
-  res.json(updatedLinks);
+  res.json(annotated.reverse());
+});
+
+exports.deleteLink = asyncHandler(async (req, res) => {
+  const { linkId } = req.body;
+  if (!linkId) return badRequest(res, 'linkId required');
+
+  const link = await Link.findById(linkId);
+  if (!link) return notFound(res, 'Link not found');
+
+  await Link.findByIdAndDelete(linkId);
+  res.json({ message: 'Link deleted successfully' });
 });
 
 /* ------------------------------------------------------------------ */
-/*  employees & entries                                               */
+/*  EMPLOYEES                                                         */
 /* ------------------------------------------------------------------ */
 exports.getEmployees = asyncHandler(async (_req, res) => {
   const employees = await Employee.find()
@@ -83,46 +82,54 @@ exports.getEmployees = asyncHandler(async (_req, res) => {
   res.json(employees);
 });
 
+/* ------------------------------------------------------------------ */
+/*  ENTRIES                                                           */
+/* ------------------------------------------------------------------ */
+// Get all entries for a given link (admin view)
 exports.getEntries = asyncHandler(async (req, res) => {
   const { linkId } = req.body;
-  if (!linkId) return badRequest(res, 'Invalid linkId');
+  if (!linkId) return badRequest(res, 'linkId required');
 
-  const entries = await Entry.find({ linkId }).lean();
-  res.json(entries);
+  // Fetch the link’s title
+  const linkDoc = await Link
+    .findById(linkId)            // Mongoose will cast the string to ObjectId
+    .select('title')
+    .lean();
+  if (!linkDoc) return notFound(res, 'Link not found');
+
+  // Get all entries for that linkId (stored as string)
+  const entries = await Entry
+    .find({ linkId })
+    .lean();
+
+  // Return title separately
+  res.json({
+    title:   linkDoc.title,
+    entries
+  });
 });
 
-/* by employee ------------------------------------------------------ */
+// Get all entries for a given employee (type 0)
 exports.getEmployeeEntries = asyncHandler(async (req, res) => {
   const { employeeId } = req.body;
-  if (!employeeId) return badRequest(res, 'Invalid employeeId');
+  if (!employeeId) return badRequest(res, 'employeeId required');
 
-  const entries = await Entry.find({ employeeId }).lean();
+  const entries = await Entry.find({employeeId }).lean();
   res.json(entries);
 });
 
-// ------------------------------------------------------------------
-// Links for a single employee (paginated)
-// Body: { employeeId, page = 1, limit = 20 }
-// ------------------------------------------------------------------
+// Paginated distinct links for an employee
 exports.getLinksByEmployee = asyncHandler(async (req, res) => {
   const { employeeId, page = 1, limit = 20 } = req.body;
   if (!employeeId) return badRequest(res, 'employeeId required');
 
-  /* 1️⃣  collect distinct linkIds this employee has entries in */
-  const allIds = await Entry.distinct('linkId', { employeeId });
+  const allIds = await Entry.distinct('linkId', {employeeId });
   const total = allIds.length;
+  if (total === 0) return res.json({ links: [], total: 0, page: 1, pages: 0 });
 
-  if (total === 0) {
-    return res.json({ links: [], total: 0, page: 1, pages: 0 });
-  }
+  const start = (page - 1) * limit;
+  const pagedIds = allIds.slice(start, start + Number(limit));
 
-  /* 2️⃣  slice for pagination */
-  const skip = (page - 1) * limit;
-  const pagedIds = allIds
-    .sort()                             // ensures consistent order
-    .slice(skip, skip + Number(limit));
-
-  /* 3️⃣  fetch those links, newest first */
   const links = await Link.find({ _id: { $in: pagedIds } })
     .sort({ createdAt: -1 })
     .lean();
@@ -131,20 +138,14 @@ exports.getLinksByEmployee = asyncHandler(async (req, res) => {
     links,
     total,
     page: Number(page),
-    pages: Math.ceil(total / limit),
+    pages: Math.ceil(total / limit)
   });
 });
 
-
-// ------------------------------------------------------------------
-// Submissions for employee + link (paginated)
-// Body: { linkId, employeeId, page = 1, limit = 20 }
-// ------------------------------------------------------------------
+// Paginated entries for employee + link
 exports.getEntriesByEmployeeAndLink = asyncHandler(async (req, res) => {
   const { employeeId, linkId, page = 1, limit = 20 } = req.body;
-  if (!employeeId || !linkId) {
-    return badRequest(res, 'employeeId & linkId required');
-  }
+  if (!employeeId || !linkId) return badRequest(res, 'employeeId & linkId required');
 
   const filter = { employeeId, linkId };
 
@@ -154,154 +155,95 @@ exports.getEntriesByEmployeeAndLink = asyncHandler(async (req, res) => {
       .skip((page - 1) * limit)
       .limit(limit)
       .lean(),
-    Entry.countDocuments(filter),
+    Entry.countDocuments(filter)
   ]);
 
-  const totalAmount = await Entry.aggregate([
+  const grandTotal = await Entry.aggregate([
     { $match: filter },
-    { $group: { _id: null, sum: { $sum: '$amount' } } },
+    { $group: { _id: null, sum: { $sum: { $ifNull: ['$totalAmount', '$amount'] } } } }
   ]).then(r => (r[0]?.sum ?? 0));
 
   res.json({
     entries,
     total,
-    totalAmount,
+    grandTotal,
     page: Number(page),
-    pages: Math.ceil(total / limit),
+    pages: Math.ceil(total / limit)
   });
 });
 
-
-/* ------------------------------------------------------------------ */
-/*  link summary                                                      */
-/* ------------------------------------------------------------------ */
+// Link summary (totals per employee)
 exports.getLinkSummary = asyncHandler(async (req, res) => {
   const { linkId } = req.body;
   if (!linkId) return badRequest(res, 'linkId required');
 
-  // Fetch link with amount and title
-  const linkDoc = await Link.findById(linkId).select('title amount').lean();
+  let linkObjectId;
+  try {
+    linkObjectId = new mongoose.Types.ObjectId(linkId);
+  } catch {
+    return badRequest(res, 'Invalid linkId format');
+  }
+
+  // fetch title
+  const linkDoc = await Link
+    .findById(linkObjectId)
+    .select('title')
+    .lean();
   if (!linkDoc) return notFound(res, 'Link not found');
+  const amountPer = linkDoc.amount;
 
-  const amountPerPerson = linkDoc.amount || 25;
-
-  // Aggregate total amount per employee
+  // …after you’ve validated linkId…
   const rows = await Entry.aggregate([
-    { $match: { linkId } },
+    { $match: { linkId } },    // OK to match the string here
     {
       $group: {
         _id: '$employeeId',
-        employeeTotal: { $sum: '$amount' },
-      },
+        total: { $sum: { $ifNull: ['$amount', 0] } },
+        linkId: { $first: '$linkId' }   // carry the linkId forward
+      }
     },
     {
       $lookup: {
         from: 'employees',
         localField: '_id',
         foreignField: 'employeeId',
-        as: 'emp',
-      },
+        as: 'emp'
+      }
     },
     { $unwind: '$emp' },
     {
       $project: {
         _id: 0,
+        linkId: 1,              // now each row has linkId
         employeeId: '$_id',
         name: '$emp.name',
-        employeeTotal: 1,
+        employeeTotal: '$total',
         walletBalance: '$emp.balance',
-      },
-    },
+        entryCount: { $ceil: { $divide: ['$total', amountPer] } }
+      }
+    }
   ]);
 
-  // Calculate entryCount using employeeTotal / amountPerPerson
-  for (const row of rows) {
-    row.entryCount = Math.round(row.employeeTotal / amountPerPerson);
-  }
 
   const grandTotal = rows.reduce((sum, r) => sum + r.employeeTotal, 0);
 
-  res.json({ title: linkDoc.title, rows, grandTotal });
-});
-
-
-exports.deleteLink = asyncHandler(async (req, res) => {
-  const { linkId } = req.body;
-
-  if (!linkId) return badRequest(res, 'linkId required');
-
-  // Check if the link exists
-  const link = await Link.findById(linkId);
-  if (!link) return notFound(res, 'Link not found');
-
-  // Delete the link
-  await Link.findByIdAndDelete(linkId);
-
-  res.json({ message: 'Link deleted successfully' });
-});
-
-exports.addEmployeeBalance = asyncHandler(async (req, res) => {
-  const { employeeId, amount, adminId, note = '' } = req.body;
-
-  if (!employeeId || !amount || !adminId) {
-    return badRequest(res, 'employeeId, amount and adminId are required');
-  }
-
-  const employee = await Employee.findOne({ employeeId });
-  if (!employee) return notFound(res, 'Employee not found');
-
-  // Update employee balance
-  employee.balance = (employee.balance || 0) + amount;
-  await employee.save();
-
-  // Save history
-  await BalanceHistory.create({
-    employeeId,
-    amount,
-    addedBy: adminId,
-    note,
-  });
-
-  res.json({ message: 'Balance added successfully', newBalance: employee.balance });
-});
-
-// controllers/balanceController.js
-exports.updateEmployeeBalance = asyncHandler(async (req, res) => {
-  const { employeeId, newBalance, adminId, note = '' } = req.body;
-
-  if (!employeeId || newBalance === undefined || adminId === undefined) {
-    return badRequest(res, 'employeeId, newBalance and adminId are required');
-  }
-
-  const employee = await Employee.findOne({ employeeId });
-  if (!employee) return notFound(res, 'Employee not found');
-
-  const oldBalance = employee.balance || 0;
-  employee.balance = newBalance;
-  await employee.save();
-
-  // Save history
-  await BalanceHistory.create({
-    employeeId,
-    amount: newBalance - oldBalance, // delta
-    addedBy: adminId,
-    note: `Balance updated from ₹${oldBalance} to ₹${newBalance}. ${note}`,
-  });
-
+  // include linkId in your response if you want to echo it back
   res.json({
-    message: 'Balance updated successfully',
-    oldBalance,
-    newBalance,
+    linkId,         // ← echo the original string
+    title: linkDoc.title,
+    rows,
+    grandTotal
   });
 });
 
-
+/* ------------------------------------------------------------------ */
+/*  BALANCE MANAGEMENT                                                */
+/* ------------------------------------------------------------------ */
 exports.getBalanceHistory = asyncHandler(async (req, res) => {
   const { employeeId, page = 1, limit = 20 } = req.body;
-
   const filter = employeeId ? { employeeId } : {};
 
-  const [history, total, sumResult] = await Promise.all([
+  const [history, total, agg] = await Promise.all([
     BalanceHistory.find(filter)
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
@@ -310,90 +252,92 @@ exports.getBalanceHistory = asyncHandler(async (req, res) => {
     BalanceHistory.countDocuments(filter),
     BalanceHistory.aggregate([
       { $match: filter },
-      { $group: { _id: null, totalAmount: { $sum: "$amount" } } },
-    ]),
+      { $group: { _id: null, totalAmount: { $sum: '$amount' } } }
+    ])
   ]);
 
-  const totalAmount = sumResult[0]?.totalAmount || 0;
-
-  res.json({
-    history,
-    total,
-    totalAmount,
-    page: Number(page),
-    pages: Math.ceil(total / limit),
-  });
+  const totalAmount = agg[0]?.totalAmount || 0;
+  res.json({ history, total, totalAmount, page: Number(page), pages: Math.ceil(total / limit) });
 });
 
-// Bulk add the same amount to multiple employees
+exports.addEmployeeBalance = asyncHandler(async (req, res) => {
+  const { employeeId, amount, adminId, note = '' } = req.body;
+  if (!employeeId || amount == null || !adminId) {
+    return badRequest(res, 'employeeId, amount and adminId are required');
+  }
+  const emp = await Employee.findOne({ employeeId });
+  if (!emp) return notFound(res, 'Employee not found');
+
+  emp.balance += amount;
+  await emp.save();
+
+  await BalanceHistory.create({ employeeId, amount, addedBy: adminId, note });
+  res.json({ message: 'Balance added successfully', newBalance: emp.balance });
+});
+
+exports.updateEmployeeBalance = asyncHandler(async (req, res) => {
+  const { employeeId, newBalance, adminId, note = '' } = req.body;
+  if (!employeeId || newBalance == null || !adminId) {
+    return badRequest(res, 'employeeId, newBalance and adminId are required');
+  }
+  const emp = await Employee.findOne({ employeeId });
+  if (!emp) return notFound(res, 'Employee not found');
+
+  const oldBalance = emp.balance;
+  emp.balance = newBalance;
+  await emp.save();
+
+  await BalanceHistory.create({
+    employeeId,
+    amount: newBalance - oldBalance,
+    addedBy: adminId,
+    note: `Updated from ₹${oldBalance} to ₹${newBalance}. ${note}`
+  });
+  res.json({ message: 'Balance updated successfully', oldBalance, newBalance });
+});
+
 exports.bulkAddEmployeeBalance = asyncHandler(async (req, res) => {
   const { employeeIds, amount, adminId, note = '' } = req.body;
-  if (
-    !Array.isArray(employeeIds) ||
-    employeeIds.length === 0 ||
-    typeof amount !== 'number' ||
-    !adminId
-  ) {
-    return badRequest(res, 'employeeIds (non-empty array), amount (number) and adminId are required');
+  if (!Array.isArray(employeeIds) || !employeeIds.length || amount == null || !adminId) {
+    return badRequest(res, 'employeeIds, amount and adminId are required');
   }
 
-  // Process all in parallel
-  const results = await Promise.all(employeeIds.map(async (eid) => {
-    const emp = await Employee.findOne({ employeeId: eid });
-    if (!emp) return { employeeId: eid, error: 'Not found' };
+  const results = await Promise.all(employeeIds.map(async id => {
+    const emp = await Employee.findOne({ employeeId: id });
+    if (!emp) return { employeeId: id, error: 'Not found' };
 
-    emp.balance = (emp.balance || 0) + amount;
+    emp.balance += amount;
     await emp.save();
 
-    await BalanceHistory.create({
-      employeeId: eid,
-      amount,
-      addedBy: adminId,
-      note: note || 'Bulk add',
-    });
-
-    return { employeeId: eid, newBalance: emp.balance };
+    await BalanceHistory.create({ employeeId: id, amount, addedBy: adminId, note });
+    return { employeeId: id, newBalance: emp.balance };
   }));
 
-  res.json({
-    message: 'Bulk add complete',
-    results
-  });
+  res.json({ message: 'Bulk add complete', results });
 });
 
-// Bulk overwrite balance for multiple employees
 exports.bulkUpdateEmployeeBalance = asyncHandler(async (req, res) => {
   const { employeeIds, newBalance, adminId, note = '' } = req.body;
-  if (
-    !Array.isArray(employeeIds) ||
-    employeeIds.length === 0 ||
-    typeof newBalance !== 'number' ||
-    newBalance < 0 ||
-    !adminId
-  ) {
-    return badRequest(res, 'employeeIds (non-empty array), newBalance (non-negative number) and adminId are required');
+  if (!Array.isArray(employeeIds) || !employeeIds.length || newBalance == null || newBalance < 0 || !adminId) {
+    return badRequest(res, 'employeeIds, newBalance and adminId are required');
   }
 
-  const results = await Promise.all(employeeIds.map(async (eid) => {
-    const emp = await Employee.findOne({ employeeId: eid });
-    if (!emp) return { employeeId: eid, error: 'Not found' };
+  const results = await Promise.all(employeeIds.map(async id => {
+    const emp = await Employee.findOne({ employeeId: id });
+    if (!emp) return { employeeId: id, error: 'Not found' };
 
-    const oldBal = emp.balance || 0;
+    const oldBalance = emp.balance;
     emp.balance = newBalance;
     await emp.save();
 
     await BalanceHistory.create({
-      employeeId: eid,
-      amount: newBalance - oldBal,  // record the delta
+      employeeId: id,
+      amount: newBalance - oldBalance,
       addedBy: adminId,
-      note: `Bulk update from ₹${oldBal} to ₹${newBalance}. ` + note,
+      note: `Bulk update from ₹${oldBalance} to ₹${newBalance}. ${note}`
     });
-
-    return { employeeId: eid, oldBalance: oldBal, newBalance };
+    return { employeeId: id, oldBalance, newBalance };
   }));
 
-  res.json({
-    message: 'Bulk update complete',
-    results
-  });
+  res.json({ message: 'Bulk update complete', results });
 });
