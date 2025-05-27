@@ -212,22 +212,94 @@ exports.updateEntry = asyncHandler(async (req, res) => {
 /* ------------------------------------------------------------------ */
 exports.setEntryStatus = asyncHandler(async (req, res) => {
   const { entryId, approve } = req.body;
-  if (!entryId)                 return badRequest(res, 'entryId required');
-  if (![0, 1].includes(Number(approve)))
+  if (!entryId) 
+    return badRequest(res, 'entryId required');
+  const newStatus = Number(approve);
+  if (![0,1].includes(newStatus))
     return badRequest(res, 'approve must be 0 or 1');
 
-  const entry = await Entry.findOneAndUpdate(
-    { entryId },
-    { status: Number(approve) },
+  // 1) Load the entry once
+  const entry = await Entry.findOne({ entryId });
+  if (!entry) 
+    return notFound(res, 'Entry not found');
+
+  // 2) If it already has that status, bail out immediately
+  if (entry.status === newStatus) {
+    return res.json({
+      message: newStatus
+        ? 'Already approved'
+        : 'Already rejected',
+      entry: { entryId, status: entry.status }
+    });
+  }
+
+  // 3) If approving, handle deduction first
+  if (newStatus === 1) {
+    let deduction, targetEmpId;
+
+    if (entry.type === 0 && entry.employeeId) {
+      deduction   = entry.amount;
+      targetEmpId = entry.employeeId;
+    }
+    else if (entry.type === 1 && entry.worksUnder) {
+      deduction   = entry.totalAmount;
+      targetEmpId = entry.worksUnder;
+    }
+
+    if (typeof deduction !== 'number' || !targetEmpId) {
+      return badRequest(res, 'Cannot determine deduction or employee');
+    }
+
+    // 3a) Load employee and check balance
+    const employee = await Employee.findOne({ employeeId: targetEmpId });
+    if (!employee) 
+      return notFound(res, 'Employee to debit not found');
+    if (employee.balance < deduction) {
+      return badRequest(res, 'Insufficient balance. Please add funds before approval.');
+    }
+
+    // 3b) Deduct
+    await Employee.updateOne(
+      { employeeId: targetEmpId },
+      { $inc: { balance: -deduction } }
+    );
+  }
+
+  // 4) Now flip the entry’s status exactly once
+  const updatedEntry = await Entry.findOneAndUpdate(
+    { entryId, status: { $ne: newStatus } },    // only update if status is different
+    { status: newStatus },
     { new: true }
   );
-  if (!entry) return notFound(res, 'Entry not found');
+  // should never be null, because we already checked above, but just in case:
+  if (!updatedEntry) {
+    return res.json({
+      message: newStatus
+        ? 'Already approved'
+        : 'Already rejected',
+      entry: { entryId, status: newStatus }
+    });
+  }
 
-  res.json({
-    message: approve ? 'Approved' : 'Rejected',
-    entry: { entryId: entry.entryId, status: entry.status }
-  });
+  // 5) Respond
+  const payload = {
+    message: newStatus ? 'Approved' : 'Rejected',
+    entry:   { entryId, status: newStatus }
+  };
+
+  // If we did an approval deduction, fetch the fresh balance:
+  if (newStatus === 1) {
+    const emp = await Employee.findOne({ employeeId:
+      entry.type === 0 ? entry.employeeId : entry.worksUnder
+    }).select('balance');
+    payload.newBalance = emp.balance;
+  }
+
+  res.json(payload);
 });
+
+
+
 
 /* ------------------------------------------------------------------ */
 /*  LIST – employee + specific link, POST /entries/listByLink         */
