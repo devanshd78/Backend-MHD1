@@ -1,12 +1,12 @@
 // controllers/employee.js
 const { v4: uuidv4 } = require('uuid');
-const bcrypt         = require('bcrypt');
-const Employee       = require('../models/Employee');
-const Link           = require('../models/Link');
+const bcrypt = require('bcrypt');
+const Employee = require('../models/Employee');
+const Link = require('../models/Link');
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
-const badRequest   = (res, msg) => res.status(400).json({ error: msg });
-const notFound     = (res, msg) => res.status(404).json({ error: msg });
+const badRequest = (res, msg) => res.status(400).json({ error: msg });
+const notFound = (res, msg) => res.status(404).json({ error: msg });
 
 /* ------------------------------------------------------------------ */
 /*  AUTH – register / login                                           */
@@ -27,7 +27,7 @@ exports.register = asyncHandler(async (req, res) => {
   });
 
   res.json({
-    message: 'Registration successful',
+    message: 'Registration successful – pending admin approval',
     employeeId: employee.employeeId
   });
 });
@@ -38,6 +38,9 @@ exports.login = asyncHandler(async (req, res) => {
   const employee = await Employee.findOne({ email }).select('+password');
   if (!employee || !(await bcrypt.compare(password, employee.password)))
     return res.status(401).json({ error: 'Invalid credentials' });
+
+  if (employee.isApproved === 0)
+    return res.status(403).json({ error: 'Account not approved yet' });
 
   res.json({
     message: 'Login successful',
@@ -55,7 +58,7 @@ exports.getBalance = asyncHandler(async (req, res) => {
   if (!employeeId) return badRequest(res, 'Employee ID is required');
 
   const employee = await Employee.findOne({ employeeId });
-  if (!employee)   return notFound(res, 'Employee not found');
+  if (!employee) return notFound(res, 'Employee not found');
 
   res.json({ balance: employee.balance });
 });
