@@ -4,13 +4,15 @@ const bcrypt = require('bcrypt')
 const { v4: uuidv4 } = require('uuid')
 
 const employeeSchema = new mongoose.Schema({
-  email: { type: String, required: true, unique: true },
+  email:    { type: String, required: true, unique: true },
   password: { type: String, required: true },
   employeeId: { type: String, required: true, unique: true, default: uuidv4 },
-  name: { type: String, required: true },
-  balance: { type: Number, default: 0 },
-  createdAt: { type: Date, default: Date.now }
-})
+  name:     { type: String, required: true },
+  balance:  { type: Number, default: 0 },
+  isApproved: { type: Number, default: 0 },   // ← new
+  createdAt:{ type: Date, default: Date.now }
+});
+
 
 // Hash password before saving (only if it's new or changed)
 employeeSchema.pre('save', async function (next) {
