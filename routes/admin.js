@@ -20,6 +20,9 @@ router.post('/employees/links', ctrl.getLinksByEmployee);
 // Get entries for employee + link (paginated)
 router.post('/employees/links/entries', ctrl.getEntriesByEmployeeAndLink);
 
+router.post('/employees/approve', ctrl.approveEmployee);
+router.post('/employees/reject', ctrl.rejectEmployee);
+router.get('/employees/pending', ctrl.listPendingEmployees);
 /* ------------------------------------------------------------------ */
 /*  Links routes                                                      */
 /* ------------------------------------------------------------------ */
