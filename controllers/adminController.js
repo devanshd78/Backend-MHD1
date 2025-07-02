@@ -24,6 +24,51 @@ exports.login = asyncHandler(async (req, res) => {
   res.json({ message: 'Admin login successful', adminId: admin.adminId });
 });
 
+// Approve a newly registered employee
+exports.approveEmployee = asyncHandler(async (req, res) => {
+  const { employeeId } = req.body;
+  if (!employeeId) return badRequest(res, 'employeeId required');
+
+  const emp = await Employee.findOne({ employeeId });
+  if (!emp) return notFound(res, 'Employee not found');
+
+  if (emp.isApproved === 1) 
+    return res.status(400).json({ error: 'Already approved' });
+
+  emp.isApproved = 1;
+  await emp.save();
+
+  res.json({ message: 'Employee approved successfully' });
+});
+
+// Reject (delete) a pending employee
+exports.rejectEmployee = asyncHandler(async (req, res) => {
+  const { employeeId } = req.body;
+  if (!employeeId) return badRequest(res, 'employeeId required');
+
+  const emp = await Employee.findOne({ employeeId });
+  if (!emp) return notFound(res, 'Employee not found');
+
+  if (emp.isApproved === 1) 
+    return res
+      .status(400)
+      .json({ error: 'Cannot reject an already approved employee' });
+
+  // Remove the record so they no longer appear in “pending”
+  await Employee.deleteOne({ employeeId });
+
+  res.json({ message: 'Employee registration rejected and removed' });
+});
+
+
+exports.listPendingEmployees = asyncHandler(async (_req, res) => {
+  const pending = await Employee.find({ isApproved: false })
+    .select('name email employeeId createdAt')
+    .lean();
+  res.json(pending);
+});
+
+
 /* ------------------------------------------------------------------ */
 /*  LINKS                                                             */
 /* ------------------------------------------------------------------ */
@@ -77,7 +122,7 @@ exports.deleteLink = asyncHandler(async (req, res) => {
 /* ------------------------------------------------------------------ */
 exports.getEmployees = asyncHandler(async (_req, res) => {
   const employees = await Employee.find()
-    .select('name email employeeId balance')
+    .select('name email employeeId balance isApproved')
     .lean();
   res.json(employees);
 });
