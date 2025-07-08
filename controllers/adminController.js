@@ -4,6 +4,7 @@ const Admin = require('../models/Admin');
 const Link = require('../models/Link');
 const Entry = require('../models/Entry');
 const Employee = require('../models/Employee');
+const User = require('../models/User');
 const BalanceHistory = require('../models/BalanceHistory');
 const { default: mongoose } = require('mongoose');
 const { ObjectId } = require('mongodb');
@@ -163,29 +164,80 @@ exports.getEmployeeEntries = asyncHandler(async (req, res) => {
   res.json(entries);
 });
 
-// Paginated distinct links for an employee
+// controllers/admin.js (or wherever getLinksByEmployee lives)
 exports.getLinksByEmployee = asyncHandler(async (req, res) => {
   const { employeeId, page = 1, limit = 20 } = req.body;
   if (!employeeId) return badRequest(res, 'employeeId required');
 
-  const allIds = await Entry.distinct('linkId', {employeeId });
+  // 1️⃣ Find all distinct linkIds for entries either by the employee or by users under them
+  const allIds = await Entry.distinct('linkId', {
+    $or: [
+      { employeeId },           // employee’s own submissions (type 0 or missing)
+      { worksUnder: employeeId } // user submissions under this employee (type 1)
+    ]
+  });
+
   const total = allIds.length;
-  if (total === 0) return res.json({ links: [], total: 0, page: 1, pages: 0 });
+  if (total === 0) {
+    return res.json({ links: [], total: 0, page: 1, pages: 0 });
+  }
+
+  // 2️⃣ Sort those links by createdAt, then page
+  const allSorted = await Link.find({ _id: { $in: allIds } })
+    .sort({ createdAt: -1 })
+    .select('_id createdAt')
+    .lean();
+  const sortedIds = allSorted.map(l => l._id.toString());
 
   const start = (page - 1) * limit;
-  const pagedIds = allIds.slice(start, start + Number(limit));
+  const pagedIds = sortedIds.slice(start, start + Number(limit));
 
+  // 3️⃣ Fetch full Link docs in that order
   const links = await Link.find({ _id: { $in: pagedIds } })
+    .lean()
+    .then(docs => {
+      const map = docs.reduce((m, d) => (m[d._id.toString()] = d, m), {});
+      return pagedIds.map(id => map[id]);
+    });
+
+  // 4️⃣ Fetch all matching entries for these links
+  const entries = await Entry.find({
+    linkId: { $in: pagedIds },
+    $or: [
+      { employeeId },           
+      { worksUnder: employeeId } 
+    ]
+  })
     .sort({ createdAt: -1 })
     .lean();
 
+  // 5️⃣ Group and split entries per link
+  const byLink = entries.reduce((acc, e) => {
+    const lid = e.linkId.toString();
+    if (!acc[lid]) acc[lid] = { employeeEntries: [], userEntries: [] };
+    // any entry with employeeId set is an “employee entry”
+    if (e.employeeId) acc[lid].employeeEntries.push(e);
+    // any entry with worksUnder set is a “user entry” under this employee
+    if (e.worksUnder)    acc[lid].userEntries.push(e);
+    return acc;
+  }, {});
+
+  // 6️⃣ Attach them to each link
+  const linksWithEntries = links.map(link => ({
+    ...link,
+    employeeEntries: byLink[link._id]?.employeeEntries || [],
+    userEntries:     byLink[link._id]?.userEntries     || []
+  }));
+
+  // 7️⃣ Send back the paginated result
   res.json({
-    links,
+    links: linksWithEntries,
     total,
     page: Number(page),
     pages: Math.ceil(total / limit)
   });
 });
+
 
 // Paginated entries for employee + link
 exports.getEntriesByEmployeeAndLink = asyncHandler(async (req, res) => {
@@ -385,4 +437,54 @@ exports.bulkUpdateEmployeeBalance = asyncHandler(async (req, res) => {
   }));
 
   res.json({ message: 'Bulk update complete', results });
+});
+
+// controllers/adminLinks.js
+
+exports.getUserEntriesByLinkAndEmployee = asyncHandler(async (req, res) => {
+  const { linkId, employeeId } = req.body;
+  if (!linkId || !employeeId) {
+    return badRequest(res, 'linkId and employeeId required');
+  }
+
+  // fetch user‐type entries
+  const entries = await Entry.find({
+    linkId,
+    type: 1,
+    worksUnder: employeeId
+  })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  // fetch associated users
+  const userIds = entries.map(e => e.userId).filter(Boolean);
+  const users = await User.find({ userId: { $in: userIds } })
+    .select('userId name email phone upiId')
+    .lean();
+  const userMap = users.reduce((m, u) => (m[u.userId] = u, m), {});
+
+  // attach user info
+  const entriesWithUser = entries.map(e => ({
+    ...e,
+    user: userMap[e.userId] || null
+  }));
+
+  // fetch link title
+  const link = await Link.findById(linkId).select('title').lean();
+  const title = link?.title || '';
+
+  // compute totals
+  const totalUsers      = entriesWithUser.length;
+  const totalPersons    = entriesWithUser.reduce((sum, e) => sum + (e.noOfPersons || 0), 0);
+  const totalAmountPaid = entriesWithUser.reduce((sum, e) => sum + (e.totalAmount || 0), 0);
+
+  return res.json({
+    title,
+    entries: entriesWithUser,
+    totals: {
+      totalUsers,
+      totalPersons,
+      totalAmountPaid
+    }
+  });
 });
