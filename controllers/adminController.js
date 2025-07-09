@@ -8,10 +8,27 @@ const User = require('../models/User');
 const BalanceHistory = require('../models/BalanceHistory');
 const { default: mongoose } = require('mongoose');
 const { ObjectId } = require('mongodb');
+const nodemailer = require('nodemailer');
+const AdminOTP = require('../models/AdminOTP');
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
 const notFound = (res, msg) => res.status(404).json({ error: msg });
+
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// configure your SMTP via env
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: +process.env.SMTP_PORT,
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
 
 /* ------------------------------------------------------------------ */
 /*  AUTH                                                              */
@@ -487,4 +504,153 @@ exports.getUserEntriesByLinkAndEmployee = asyncHandler(async (req, res) => {
       totalAmountPaid
     }
   });
+});
+
+// 1️⃣ Request email change → send OTP to both old + new email
+exports.requestEmailChange = asyncHandler(async (req, res) => {
+  const { adminId, newEmail } = req.body;
+  if (!adminId || !newEmail) return badRequest(res, 'adminId and newEmail required');
+
+  // look up the Admin document to get its _id
+  const admin = await Admin.findOne({ adminId });
+  if (!admin) return notFound(res, 'Admin not found');
+
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+  // OTP → old email
+  const otpOld = generateOTP();
+  await AdminOTP.create({
+    admin:     admin._id,
+    type:      'email-change-old',
+    otp:       otpOld,
+    payload:   { newEmail },
+    expiresAt,
+  });
+  await transporter.sendMail({
+    to: admin.email,
+    subject: 'OTP for Email Change (Current Email)',
+    text:    `Your OTP to confirm your email change is: ${otpOld} (expires in 15 minutes).`
+  });
+
+  // OTP → new email
+  const otpNew = generateOTP();
+  await AdminOTP.create({
+    admin:     admin._id,
+    type:      'email-change-new',
+    otp:       otpNew,
+    payload:   { newEmail },
+    expiresAt,
+  });
+  await transporter.sendMail({
+    to: newEmail,
+    subject: 'OTP for Email Change (New Email)',
+    text:    `Your OTP to confirm your email change is: ${otpNew} (expires in 15 minutes).`
+  });
+
+  res.json({ message: 'OTPs sent to both current and new email addresses' });
+});
+
+
+// 2️⃣ Confirm email change → verify both codes, then update email
+exports.confirmEmailChange = asyncHandler(async (req, res) => {
+  const { adminId, otpOld, otpNew } = req.body;
+  if (!adminId || !otpOld || !otpNew)
+    return badRequest(res, 'adminId, otpOld and otpNew required');
+
+  const admin = await Admin.findOne({ adminId });
+  if (!admin) return notFound(res, 'Admin not found');
+
+  const now = new Date();
+  const oldRec = await AdminOTP.findOne({
+    admin:      admin._id,
+    type:       'email-change-old',
+    otp:        otpOld,
+    expiresAt: { $gt: now }
+  });
+  const newRec = await AdminOTP.findOne({
+    admin:      admin._id,
+    type:       'email-change-new',
+    otp:        otpNew,
+    expiresAt: { $gt: now }
+  });
+
+  if (!oldRec || !newRec) {
+    return res.status(400).json({ error: 'Invalid or expired OTP' });
+  }
+
+  // apply the change
+  admin.email = oldRec.payload.newEmail;
+  await admin.save();
+
+  // clean up both OTP records
+  await AdminOTP.deleteMany({
+    admin: admin._id,
+    type:  { $in: ['email-change-old', 'email-change-new'] }
+  });
+
+  res.json({ message: 'Email updated successfully' });
+});
+
+
+// 3️⃣ Request password reset → send OTP to current email
+exports.requestPasswordReset = asyncHandler(async (req, res) => {
+  const { adminId } = req.body;
+  if (!adminId) return badRequest(res, 'adminId required');
+
+  const admin = await Admin.findOne({ adminId });
+  if (!admin) return notFound(res, 'Admin not found');
+
+  const otp       = generateOTP();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+  await AdminOTP.create({
+    admin:     admin._id,
+    type:      'password-reset',
+    otp,
+    expiresAt,
+  });
+
+  await transporter.sendMail({
+    to: admin.email,
+    subject: 'OTP for Password Reset',
+    text:    `Your OTP to reset your password is: ${otp} (expires in 15 minutes).`
+  });
+
+  res.json({ message: 'OTP sent to admin email address' });
+});
+
+
+// 4️⃣ Confirm password reset → verify OTP + update password
+exports.confirmPasswordReset = asyncHandler(async (req, res) => {
+  const { adminId, otp, newPassword } = req.body;
+  if (!adminId || !otp || !newPassword)
+    return badRequest(res, 'adminId, otp and newPassword required');
+
+  // fetch the Admin (with password field)
+  const admin = await Admin.findOne({ adminId }).select('+password');
+  if (!admin) return notFound(res, 'Admin not found');
+
+  const now = new Date();
+  const record = await AdminOTP.findOne({
+    admin:     admin._id,
+    type:      'password-reset',
+    otp,
+    expiresAt: { $gt: now }
+  });
+  if (!record) {
+    return res.status(400).json({ error: 'Invalid or expired OTP' });
+  }
+
+  // hash & save new password
+  const salt = await bcrypt.genSalt(10);
+  admin.password = await bcrypt.hash(newPassword, salt);
+  await admin.save();
+
+  // clean up the OTP
+  await AdminOTP.deleteMany({
+    admin: admin._id,
+    type:  'password-reset'
+  });
+
+  res.json({ message: 'Password reset successfully' });
 });
