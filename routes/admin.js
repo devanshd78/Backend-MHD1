@@ -53,4 +53,12 @@ router.post('/employees/bulk-add', ctrl.bulkAddEmployeeBalance);
 // Bulk update balance
 router.post('/employees/bulk-update', ctrl.bulkUpdateEmployeeBalance);
 
+// Email‐change
+router.post('/request-email-change',  ctrl.requestEmailChange);
+router.post('/confirm-email-change',  ctrl.confirmEmailChange);
+
+// Password‐reset
+router.post('/request-password-reset', ctrl.requestPasswordReset);
+router.post('/confirm-password-reset', ctrl.confirmPasswordReset);
+
 module.exports = router;
