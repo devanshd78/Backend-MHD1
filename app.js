@@ -7,11 +7,11 @@ const mongoose = require('mongoose');
 
 const employeeRoutes = require('./routes/employee');
 const adminRoutes    = require('./routes/admin');
-const userRoutes = require('./routes/user')
-const entryRoutes = require('./routes/entry');
+const userRoutes     = require('./routes/user');
+const entryRoutes    = require('./routes/entry');
 
 const app  = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8080;
 
 // ─── MIDDLEWARE ──────────────────────────────────────────────────────────────
 // CORS (allow credentials)
@@ -27,17 +27,17 @@ app.use(express.urlencoded({ extended: true }));
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 app.use('/employee', employeeRoutes);
 app.use('/admin',    adminRoutes);
-app.use('/user',userRoutes)
-app.use('/entry',entryRoutes);
+app.use('/user',     userRoutes);
+app.use('/entry',    entryRoutes);
 
 // ─── DB + SERVER START ───────────────────────────────────────────────────────
 mongoose
-  .connect(process.env.MONGODB_URI)  // no need for useNewUrlParser/useUnifiedTopology
+  .connect(process.env.MONGODB_URI)
   .then(() => {
     console.log('✅ Connected to MongoDB');
-    app.listen(PORT, () => {
-      console.log(`🚀 Server listening on port ${PORT}`);
-    });
+    app.listen(PORT, () =>
+      console.log(`🚀 Server listening on port ${PORT}`)
+    );
   })
   .catch(err => {
     console.error('❌ MongoDB connection error:', err);

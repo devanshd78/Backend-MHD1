@@ -5,11 +5,13 @@
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
-    "dev": "nodemon app.js"
+    "start-flask": "flask-api/.venv/bin/python flask-api/image_comment_like_extract.py",
+    "dev": "concurrently \"npm run start-flask\" \"npm start\""
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "axios": "^1.11.0",
     "bcrypt": "^5.1.1",
     "bcryptjs": "^3.0.2",
     "body-parser": "^2.2.0",
@@ -17,6 +19,9 @@
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
     "express-session": "^1.18.1",
+    "form-data": "^4.0.4",
+    "image-hash": "^5.3.2",
+    "imghash": "^1.1.0",
     "jimp": "^1.6.0",
     "jsonwebtoken": "^9.0.2",
     "mongodb": "^6.16.0",
@@ -24,8 +29,15 @@
     "multer": "^1.4.5-lts.2",
     "nodemailer": "^7.0.5",
     "nodemon": "^3.1.10",
+    "openai": "^5.10.1",
+    "python-shell": "^5.0.0",
     "qrcode-reader": "^1.0.4",
     "querystring": "^0.2.1",
+    "sharp": "^0.34.3",
+    "tesseract.js": "^6.0.1",
     "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
   }
 }

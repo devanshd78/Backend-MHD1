@@ -61,4 +61,8 @@ router.post('/confirm-email-change',  ctrl.confirmEmailChange);
 router.post('/request-password-reset', ctrl.requestPasswordReset);
 router.post('/confirm-password-reset', ctrl.confirmPasswordReset);
 
+router.post('/screenshots', ctrl.getScreenshotList);
+router.post('/ssUser', ctrl.getScreenshotsByUserId);
+router.post('/ssLink', ctrl.getScreenshotsByLinkId);
+
 module.exports = router;

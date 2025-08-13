@@ -4,16 +4,34 @@ const Admin = require('../models/Admin');
 const Link = require('../models/Link');
 const Entry = require('../models/Entry');
 const Employee = require('../models/Employee');
-const User = require('../models/User');
 const BalanceHistory = require('../models/BalanceHistory');
-const { default: mongoose } = require('mongoose');
-const { ObjectId } = require('mongodb');
+const Screenshot = require('../models/Screenshot'); // ← ADD THIS
 const nodemailer = require('nodemailer');
 const AdminOTP = require('../models/AdminOTP');
+const { default: mongoose } = require('mongoose');
+const { ObjectId } = require('mongodb');
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
 const notFound = (res, msg) => res.status(404).json({ error: msg });
+
+/* ------------------------------------------------------------ */
+/* Helpers for pagination + sorting                             */
+/* ------------------------------------------------------------ */
+const ALLOWED_SORT = new Set(['createdAt', 'verified', 'userId', 'linkId']);
+
+function parseSort(sortBy = 'createdAt', sortOrder = 'desc') {
+  const field = ALLOWED_SORT.has(sortBy) ? sortBy : 'createdAt';
+  const order = String(sortOrder).toLowerCase() === 'asc' ? 1 : -1;
+  return { [field]: order };
+}
+
+function parsePageLimit(page = 1, limit = 20, maxLimit = 100) {
+  const p = Math.max(1, Number(page) || 1);
+  const l = Math.min(maxLimit, Math.max(1, Number(limit) || 20));
+  const skip = (p - 1) * l;
+  return { p, l, skip };
+}
 
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -653,4 +671,102 @@ exports.confirmPasswordReset = asyncHandler(async (req, res) => {
   });
 
   res.json({ message: 'Password reset successfully' });
+});
+
+exports.getScreenshotList = asyncHandler(async (req, res) => {
+  const { page = 1, limit = 20, sortBy = 'createdAt', sortOrder = 'desc', verified } = req.body;
+
+  const { p, l, skip } = parsePageLimit(page, limit);
+  const sort = parseSort(sortBy, sortOrder);
+
+  const filter = {};
+  if (typeof verified === 'boolean') filter.verified = verified;
+
+  const [rows, total] = await Promise.all([
+    Screenshot.find(filter)
+      .sort(sort)
+      .skip(skip)
+      .limit(l)
+      .select('screenshotId userId linkId verified phashes bundleSig analysis createdAt files.role files.phash files.sha256 files.size files.mime')
+      .lean(),
+    Screenshot.countDocuments(filter)
+  ]);
+
+  res.json({
+    screenshots: rows,
+    total,
+    page: p,
+    pages: Math.ceil(total / l)
+  });
+});
+
+/**
+ * POST /admin/screenshots/byUser
+ * Body: { userId, page?, limit?, sortBy?, sortOrder?, verified? }
+ * - Get screenshots for a specific userId
+ */
+exports.getScreenshotsByUserId = asyncHandler(async (req, res) => {
+  const { userId, page = 1, limit = 20, sortBy = 'createdAt', sortOrder = 'desc', verified } = req.body;
+  if (!userId) return badRequest(res, 'userId required');
+
+  const { p, l, skip } = parsePageLimit(page, limit);
+  const sort = parseSort(sortBy, sortOrder);
+
+  const filter = { userId };
+  if (typeof verified === 'boolean') filter.verified = verified;
+
+  const [rows, total] = await Promise.all([
+    Screenshot.find(filter)
+      .sort(sort)
+      .skip(skip)
+      .limit(l)
+      .select('screenshotId userId linkId verified phashes bundleSig analysis createdAt files.role files.phash files.sha256 files.size files.mime')
+      .lean(),
+    Screenshot.countDocuments(filter)
+  ]);
+
+  res.json({
+    screenshots: rows,
+    total,
+    page: p,
+    pages: Math.ceil(total / l)
+  });
+});
+
+/**
+ * POST /admin/screenshots/byLink
+ * Body: { linkId, page?, limit?, sortBy?, sortOrder?, verified? }
+ * - Get screenshots for a specific linkId
+ */
+exports.getScreenshotsByLinkId = asyncHandler(async (req, res) => {
+  const { linkId, page = 1, limit = 20, sortBy = 'createdAt', sortOrder = 'desc', verified } = req.body;
+  if (!linkId) return badRequest(res, 'linkId required');
+
+  // Validate ObjectId if Screenshot.linkId is an ObjectId
+  if (!mongoose.Types.ObjectId.isValid(linkId)) {
+    return badRequest(res, 'Invalid linkId format');
+  }
+
+  const { p, l, skip } = parsePageLimit(page, limit);
+  const sort = parseSort(sortBy, sortOrder);
+
+  const filter = { linkId: new mongoose.Types.ObjectId(linkId) };
+  if (typeof verified === 'boolean') filter.verified = verified;
+
+  const [rows, total] = await Promise.all([
+    Screenshot.find(filter)
+      .sort(sort)
+      .skip(skip)
+      .limit(l)
+      .select('screenshotId userId linkId verified phashes bundleSig analysis createdAt files.role files.phash files.sha256 files.size files.mime')
+      .lean(),
+    Screenshot.countDocuments(filter)
+  ]);
+
+  res.json({
+    screenshots: rows,
+    total,
+    page: p,
+    pages: Math.ceil(total / l)
+  });
 });

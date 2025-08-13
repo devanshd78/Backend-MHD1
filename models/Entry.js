@@ -15,34 +15,40 @@ const entrySchema = new mongoose.Schema({
     match:    /^[a-zA-Z0-9_.-]+@[a-zA-Z0-9.-]+$/
   },
   type:      { type: Number, enum: [0, 1], required: true },   // 0=employee, 1=user
-  status:    { type: Number, enum: [0, 1], default: null },     // null=pending
+  status:    { type: Number, enum: [0, 1], default: null },    // null=pending
 
   /* employee only */
   employeeId:{ type: String, ref: 'Employee' },
   amount:    { type: Number },
   notes:     { type: String },
 
-  /* user only */
+  /* user only (updated) */
   userId:     { type: String, ref: 'User' },
-  noOfPersons:{ type: Number, min: 1 },
   worksUnder: { type: String, ref: 'Employee' },   // who created this entry
   linkAmount: { type: Number },
   totalAmount:{ type: Number },
-  telegramLink:{ type: String },
-  isUpdated: { type: Number, default: 0 }, // true if updated by user
+  screenshotId: { type: String, ref: 'Screenshot' },
 
+  isUpdated:  { type: Number, default: 0 }, // true if updated by user (for employee flow)
   createdAt:  { type: Date, default: Date.now },
 
   // —— audit trail for updates ——
   history: [{
-    field:     { type: String, required: true },            // e.g. 'amount'
-    from:      { type: mongoose.Schema.Types.Mixed },       // old value
-    to:        { type: mongoose.Schema.Types.Mixed },       // new value
+    field:     { type: String, required: true },
+    from:      { type: mongoose.Schema.Types.Mixed },
+    to:        { type: mongoose.Schema.Types.Mixed },
     updatedAt: { type: Date, default: Date.now, required: true }
   }]
 });
 
-// ensure unique per-link + upi + type
-entrySchema.index({ linkId: 1, upiId: 1, type: 1 }, { unique: true });
+/**
+ * Unique rule change:
+ * - keep uniqueness for employee entries (type: 0)
+ * - allow duplicates for user entries (type: 1)
+ */
+entrySchema.index(
+  { linkId: 1, upiId: 1 },
+  { unique: true, partialFilterExpression: { type: 0 } }
+);
 
 module.exports = mongoose.model('Entry', entrySchema);
