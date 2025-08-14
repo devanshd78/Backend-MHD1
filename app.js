@@ -11,12 +11,12 @@ const userRoutes     = require('./routes/user');
 const entryRoutes    = require('./routes/entry');
 
 const app  = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 5000;
 
 // ─── MIDDLEWARE ──────────────────────────────────────────────────────────────
 // CORS (allow credentials)
 app.use(cors({
-  origin:      process.env.FRONTEND_ORIGIN || 'http://localhost:3000',
+  origin:      process.env.FRONTEND_ORIGIN || 'https://mhd.sharemitra.com',
   credentials: true,
 }));
 
