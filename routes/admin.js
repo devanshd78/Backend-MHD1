@@ -64,5 +64,6 @@ router.post('/confirm-password-reset', ctrl.confirmPasswordReset);
 router.post('/screenshots', ctrl.getScreenshotList);
 router.post('/ssUser', ctrl.getScreenshotsByUserId);
 router.post('/ssLink', ctrl.getScreenshotsByLinkId);
+router.post('/byLinkAndEmployee', ctrl.getScreenshotsByLinkAndEmployee);
 
 module.exports = router;

@@ -2,6 +2,7 @@
 const bcrypt = require('bcrypt');
 const Admin = require('../models/Admin');
 const Link = require('../models/Link');
+const User = require('../models/User');
 const Entry = require('../models/Entry');
 const Employee = require('../models/Employee');
 const BalanceHistory = require('../models/BalanceHistory');
@@ -715,23 +716,34 @@ exports.getScreenshotsByUserId = asyncHandler(async (req, res) => {
   const filter = { userId };
   if (typeof verified === 'boolean') filter.verified = verified;
 
-  const [rows, total] = await Promise.all([
+  const [screenshots, total, entries] = await Promise.all([
     Screenshot.find(filter)
       .sort(sort)
       .skip(skip)
       .limit(l)
-      .select('screenshotId userId linkId verified phashes bundleSig analysis createdAt files.role files.phash files.sha256 files.size files.mime')
+      .select('screenshotId userId linkId verified analysis createdAt')
       .lean(),
-    Screenshot.countDocuments(filter)
+    Screenshot.countDocuments(filter),
+    Entry.find({ type: 1, userId }).lean()
   ]);
 
+  // Attach link titles to entries
+  const entriesWithTitles = await Promise.all(
+    entries.map(async e => {
+      const linkDoc = await Link.findById(e.linkId, 'title').lean();
+      return { ...e, linkTitle: linkDoc ? linkDoc.title : null };
+    })
+  );
+
   res.json({
-    screenshots: rows,
-    total,
+    screenshots,
+    totalScreenshots: total,
     page: p,
-    pages: Math.ceil(total / l)
+    pages: Math.ceil(total / l),
+    entries: entriesWithTitles
   });
 });
+
 
 /**
  * POST /admin/screenshots/byLink
@@ -742,31 +754,132 @@ exports.getScreenshotsByLinkId = asyncHandler(async (req, res) => {
   const { linkId, page = 1, limit = 20, sortBy = 'createdAt', sortOrder = 'desc', verified } = req.body;
   if (!linkId) return badRequest(res, 'linkId required');
 
-  // Validate ObjectId if Screenshot.linkId is an ObjectId
+  // Validate ObjectId if Screenshot/Entry.linkId are ObjectId
   if (!mongoose.Types.ObjectId.isValid(linkId)) {
     return badRequest(res, 'Invalid linkId format');
   }
+  const linkObjectId = new mongoose.Types.ObjectId(linkId);
 
   const { p, l, skip } = parsePageLimit(page, limit);
   const sort = parseSort(sortBy, sortOrder);
 
-  const filter = { linkId: new mongoose.Types.ObjectId(linkId) };
+  const filter = { linkId: linkObjectId };
   if (typeof verified === 'boolean') filter.verified = verified;
 
-  const [rows, total] = await Promise.all([
+  // fetch screenshots (paginated) + total count
+  const [screenshots, totalScreenshots, linkDoc] = await Promise.all([
     Screenshot.find(filter)
       .sort(sort)
       .skip(skip)
       .limit(l)
-      .select('screenshotId userId linkId verified phashes bundleSig analysis createdAt files.role files.phash files.sha256 files.size files.mime')
+      .select('screenshotId userId linkId verified analysis createdAt')
       .lean(),
-    Screenshot.countDocuments(filter)
+    Screenshot.countDocuments(filter),
+    Link.findById(linkObjectId, 'title').lean()
   ]);
 
+  // fetch ALL entries for this link (no pagination requested)
+  const entries = await Entry.find({ linkId: linkObjectId }).lean();
+
+  // (optional) attach linkTitle to each entry for convenience
+  const linkTitle = linkDoc ? linkDoc.title : null;
+  const entriesWithTitle = entries.map(e => ({ ...e, linkTitle }));
+
   res.json({
-    screenshots: rows,
-    total,
+    linkId,
+    linkTitle,
+    screenshots,
+    totalScreenshots,
     page: p,
-    pages: Math.ceil(total / l)
+    pages: Math.ceil(totalScreenshots / l),
+    entries: entriesWithTitle,
+    totalEntries: entries.length
+  });
+});
+
+exports.getScreenshotsByLinkAndEmployee = asyncHandler(async (req, res) => {
+  const {
+    linkId,
+    employeeId,
+    page = 1,
+    limit = 20,
+    sortBy = 'createdAt',
+    sortOrder = 'desc',
+    verified
+  } = req.body;
+
+  if (!linkId) return badRequest(res, 'linkId required');
+  if (!employeeId) return badRequest(res, 'employeeId required');
+
+  if (!mongoose.Types.ObjectId.isValid(linkId)) {
+    return badRequest(res, 'Invalid linkId format');
+  }
+  const linkObjectId = new mongoose.Types.ObjectId(linkId);
+
+  const { p, l, skip } = parsePageLimit(page, limit);
+  const sort = parseSort(sortBy, sortOrder);
+
+  // 1) Find all USER entries (type:1) for this link under this employee => gives us userIds
+  const userEntries = await Entry
+    .find({ type: 1, linkId: linkObjectId, worksUnder: employeeId })
+    .select('userId')
+    .lean();
+
+  const userIds = [...new Set(userEntries.map(e => e.userId).filter(Boolean))];
+
+  // 2) Build screenshot filter (by linkId AND userId in those under this employee)
+  const ssFilter = { linkId: linkObjectId };
+  if (userIds.length) {
+    ssFilter.userId = { $in: userIds };
+  } else {
+    // If no userIds belong to this employee for this link, quickly return empty screenshots
+    return res.json({
+      linkId,
+      linkTitle: (await Link.findById(linkObjectId, 'title').lean())?.title ?? null,
+      screenshots: [],
+      totalScreenshots: 0,
+      page: p,
+      pages: 0,
+      entries: [],
+      totalEntries: 0
+    });
+  }
+  if (typeof verified === 'boolean') ssFilter.verified = verified;
+
+  // 3) Fetch screenshots (paginated) + total
+  const [screenshots, totalScreenshots, linkDoc] = await Promise.all([
+    Screenshot.find(ssFilter)
+      .sort(sort)
+      .skip(skip)
+      .limit(l)
+      .select('screenshotId userId linkId verified analysis createdAt') // no phashes/bundles/hashes
+      .lean(),
+    Screenshot.countDocuments(ssFilter),
+    Link.findById(linkObjectId, 'title').lean()
+  ]);
+
+  // 4) Fetch ALL entries for this link that belong to the employee
+  //    (type 0 via employeeId, type 1 via `worksUnder`)
+  const entryFilter = {
+    linkId: linkObjectId,
+    $or: [
+      { employeeId },           // employee entries
+      { worksUnder: employeeId } // user entries created under this employee
+    ]
+  };
+  const entries = await Entry.find(entryFilter).lean();
+
+  const linkTitle = linkDoc ? linkDoc.title : null;
+  const entriesWithTitle = entries.map(e => ({ ...e, linkTitle }));
+
+  return res.json({
+    linkId,
+    linkTitle,
+    screenshots,
+    totalScreenshots,
+    page: p,
+    pages: Math.ceil(totalScreenshots / l),
+    entries: entriesWithTitle,
+    totalEntries: entries.length
   });
 });

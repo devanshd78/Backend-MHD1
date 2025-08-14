@@ -81,18 +81,29 @@ exports.getAllUsers = async (_req, res) => {
 exports.getUserById = async (req, res) => {
   try {
     const { userId } = req.params;
-    if (!userId) return res.status(400).json({ message: 'Please provide a userId.' });
+    if (!userId) {
+      return res.status(400).json({ message: 'Please provide a userId.' });
+    }
 
     /* base user */
     const user = await User.findOne({ userId }, '-password -__v').lean();
-    if (!user) return res.status(404).json({ message: 'User not found.' });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
 
     /* manager name */
     const mgr = await Employee.findOne({ employeeId: user.worksUnder }, 'name').lean();
     user.worksUnderName = mgr ? mgr.name : null;
 
-    /* pull entries from NEW collection --------------------------------*/
-    const entries = await Entry.find({ type: 1, userId }).lean();
+    /* pull entries from NEW collection, only those without screenshotId */
+    const entries = await Entry.find({
+      type: 1,
+      userId,
+      $or: [
+        { screenshotId: { $exists: false } },
+        { screenshotId: null }
+      ]
+    }).lean();
 
     /* attach link titles */
     user.entries = await Promise.all(

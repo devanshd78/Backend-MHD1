@@ -10,7 +10,7 @@ const { PNG } = require('pngjs');
 const { Jimp } = require('jimp');
 const QrCode = require('qrcode-reader');
 const { parse } = require('querystring');
-
+const { analyzeBundle } = require('./screenshotController'); // <— NEW
 const Entry = require('../models/Entry');
 const Link = require('../models/Link');
 const Employee = require('../models/Employee');
@@ -155,99 +155,206 @@ exports.createEmployeeEntry = asyncHandler(async (req, res) => {
 exports.createUserEntry = asyncHandler(async (req, res) => {
   const { userId, linkId, name, worksUnder, upiId } = req.body;
 
-  if (!userId || !linkId || !name || !worksUnder || !upiId)
-    return badRequest(res, 'userId, linkId, name, worksUnder, upiId required');
-
-  if (!Types.ObjectId.isValid(linkId)) {
-    return badRequest(res, 'Invalid linkId format (must be a 24-char hex ObjectId)');
+  // ---- basic body validation
+  if (!userId || !linkId || !name || !worksUnder || !upiId) {
+    return res.status(400).json({
+      code: 'VALIDATION_ERROR',
+      message: 'userId, linkId, name, worksUnder, upiId required'
+    });
   }
 
-  const link = await Link.findById(linkId).lean();
-  if (!link) return notFound(res, 'Invalid linkId');
+  // ---- linkId format
+  if (!Types.ObjectId.isValid(linkId)) {
+    return res.status(400).json({
+      code: 'INVALID_OBJECT_ID',
+      message: 'Invalid linkId format (must be a 24-char hex ObjectId)'
+    });
+  }
 
-  if (!isValidUpi(upiId.trim()))
-    return badRequest(res, 'Invalid UPI format');
+  // ---- link existence
+  const link = await Link.findById(linkId).lean();
+  if (!link) {
+    return res.status(404).json({
+      code: 'LINK_NOT_FOUND',
+      message: 'Invalid linkId'
+    });
+  }
+
+  // ---- UPI format and match (case-insensitive, trimmed)
+  const normalizedReqUpi = String(upiId).trim().toLowerCase();
+  if (!isValidUpi(normalizedReqUpi)) {
+    return res.status(400).json({
+      code: 'INVALID_UPI',
+      message: 'Invalid UPI format'
+    });
+  }
 
   const user = await User.findOne({ userId });
-  if (!user) return notFound(res, 'User not found');
-  if (user.upiId !== upiId.trim())
-    return badRequest(res, 'Provided UPI does not match your account');
-
-  // ensure exactly 5 uploads with required roles
-  const files = req.files || {};
-  const filesByRole = {
-    like:      files.like?.[0],
-    comment1:  files.comment1?.[0],
-    comment2:  files.comment2?.[0],
-    reply1:    files.reply1?.[0],
-    reply2:    files.reply2?.[0]
-  };
-  for (const k of ['like','comment1','comment2','reply1','reply2']) {
-    if (!filesByRole[k]) return badRequest(res, 'Upload exactly 5 images: like, comment1, comment2, reply1, reply2');
+  if (!user) {
+    return res.status(404).json({
+      code: 'USER_NOT_FOUND',
+      message: 'User not found'
+    });
+  }
+  const normalizedUserUpi = String(user.upiId || '').trim().toLowerCase();
+  if (normalizedUserUpi !== normalizedReqUpi) {
+    return res.status(400).json({
+      code: 'UPI_MISMATCH',
+      message: 'Provided UPI does not match your account'
+    });
   }
 
-  // pHash all 5 images
-  const hashed = await phashBundle(filesByRole);
+  // ---- files presence + type/size validation
+  const files = req.files || {};
+  const roles = ['like', 'comment1', 'comment2', 'reply1', 'reply2'];
+  const filesByRole = Object.fromEntries(roles.map(r => [r, files[r]?.[0]]));
+
+  const missing = roles.filter(r => !filesByRole[r]);
+  if (missing.length) {
+    return res.status(400).json({
+      code: 'MISSING_IMAGES',
+      message: 'Upload exactly 5 images: like, comment1, comment2, reply1, reply2',
+      missing
+    });
+  }
+
+  const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
+  const MAX_SIZE = 10 * 1024 * 1024; // 10MB
+  const typeErrors = [];
+  const sizeErrors = [];
+
+  for (const r of roles) {
+    const f = filesByRole[r];
+    if (!ALLOWED_MIME.includes(f.mimetype)) {
+      typeErrors.push({ role: r, mimetype: f.mimetype });
+    }
+    if (typeof f.size === 'number' && f.size > MAX_SIZE) {
+      sizeErrors.push({ role: r, size: f.size, max: MAX_SIZE });
+    }
+  }
+  if (typeErrors.length || sizeErrors.length) {
+    return res.status(400).json({
+      code: 'INVALID_IMAGE_FILES',
+      message: 'One or more images are of unsupported type or exceed size limit',
+      typeErrors,
+      sizeErrors,
+      allowed: ALLOWED_MIME,
+      maxBytes: MAX_SIZE
+    });
+  }
+
+  // ---- pHash the 5 images
+  let hashed;
+  try {
+    hashed = await phashBundle(filesByRole);
+  } catch (e) {
+    console.error('phashBundle error:', e);
+    return res.status(500).json({
+      code: 'PHASH_ERROR',
+      message: 'Image processing failed. Please try again.'
+    });
+  }
   const phashes = hashed.map(h => h.phash);
 
-  // reject re-uploads by same user (near-duplicate)
-  const isDup = await isDuplicateForUser(userId, phashes, 6);
-  if (isDup) {
-    return badRequest(res, 'Upload other screenshot — a duplicate/near-duplicate was detected for this user.');
+  // ---- reject near-duplicates for same user
+  try {
+    const isDup = await isDuplicateForUser(userId, phashes, 6);
+    if (isDup) {
+      return res.status(400).json({
+        code: 'NEAR_DUPLICATE',
+        message: 'Upload another screenshot — a duplicate/near-duplicate was detected for this user.'
+      });
+    }
+  } catch (e) {
+    console.error('Duplicate check error:', e);
+    return res.status(500).json({
+      code: 'DUP_CHECK_ERROR',
+      message: 'Duplicate check failed. Please try again.'
+    });
   }
 
-  // call Flask verifier
+  // ---- run Node analyzer (OCR + like)
   let analysis;
   try {
-    analysis = await verifyWithFlask(filesByRole);
+    analysis = await analyzeBundle(filesByRole);
   } catch (e) {
-    return badRequest(res, 'Verification service error. Please try again.');
+    console.error('Analyzer error:', e);
+    return res.status(502).json({
+      code: 'ANALYZER_ERROR',
+      message: 'Verification service error. Please try again.'
+    });
   }
 
-  // always show the verifier response back
+  // ---- echo verifier response in a stable schema
   const analysisPayload = {
-    liked:    !!analysis.liked,
-    user_id:  analysis.user_id ?? null,
-    comment:  analysis.comment ?? null,
-    replies:  analysis.replies ?? null,
+    liked: !!analysis.liked,
+    user_id: analysis.user_id ?? null,
+    comment: Array.isArray(analysis.comment) ? analysis.comment : [],
+    replies: Array.isArray(analysis.replies) ? analysis.replies : [],
     verified: !!analysis.verified
   };
 
   if (!analysisPayload.verified) {
-    return res.status(400).json({
-      message: 'Upload Other screenshot verification failed',
-      ...analysisPayload
+    return res.status(422).json({
+      code: 'VERIFICATION_FAILED',
+      message: 'Screenshot verification failed. Please upload clearer screenshots.',
+      details: {
+        liked: analysisPayload.liked,
+        user_id: analysisPayload.user_id,
+        commentCount: analysisPayload.comment.length,
+        replyCount: analysisPayload.replies.length,
+        needed: { minComments: 2, minReplies: 2, liked: true }
+      },
+      verification: analysisPayload
     });
   }
 
-  // store Screenshot bundle
-  const screenshotDoc = await Screenshot.create({
-    userId,
-    linkId,
-    verified: true,
-    analysis: analysisPayload,
-    phashes,
-    bundleSig: [...phashes].sort().join('|'),
-    files: hashed
-  });
+  // ---- store Screenshot bundle
+  let screenshotDoc;
+  try {
+    screenshotDoc = await Screenshot.create({
+      userId,
+      linkId,
+      verified: true,
+      analysis: analysisPayload,
+      phashes,
+      bundleSig: [...phashes].sort().join('|'),
+      files: hashed
+    });
+  } catch (e) {
+    console.error('Screenshot.create error:', e);
+    return res.status(500).json({
+      code: 'SCREENSHOT_PERSIST_ERROR',
+      message: 'Could not persist screenshots. Please try again.'
+    });
+  }
 
-  // compute amounts (single-unit now that noOfPersons is removed)
+  // ---- compute amounts
   const linkAmount = Number(link.amount) || 0;
   const totalAmount = linkAmount;
 
-  // save entry (allow multiple, no per-link/upi dup checks)
-  const entry = await Entry.create({
-    entryId: uuidv4(),
-    type: 1,
-    userId,
-    linkId,
-    name: name.trim(),
-    worksUnder: worksUnder.trim(),
-    upiId: upiId.trim(),
-    linkAmount,
-    totalAmount,
-    screenshotId: screenshotDoc.screenshotId
-  });
+  // ---- save Entry
+  let entry;
+  try {
+    entry = await Entry.create({
+      entryId: uuidv4(),
+      type: 1,
+      userId,
+      linkId,
+      name: String(name).trim(),
+      worksUnder: String(worksUnder).trim(),
+      upiId: normalizedReqUpi,
+      linkAmount,
+      totalAmount,
+      screenshotId: screenshotDoc.screenshotId
+    });
+  } catch (e) {
+    console.error('Entry.create error:', e);
+    return res.status(500).json({
+      code: 'ENTRY_PERSIST_ERROR',
+      message: 'Could not save your entry. Please try again.'
+    });
+  }
 
   return res.status(201).json({
     message: 'User entry submitted',
@@ -255,6 +362,7 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     entry
   });
 });
+
 
 /* ------------------------------------------------------------------ */
 /*  3) READ / LIST (type-aware, optional link filter)                  */
@@ -489,44 +597,61 @@ exports.listEntriesByLink = asyncHandler(async (req, res) => {
   if (!employeeId) return badRequest(res, 'employeeId required');
   if (!linkId)    return badRequest(res, 'linkId required');
 
-  // match either the old `worksUnder` field or the new `employeeId`
+  // match either the old worksUnder field or the new employeeId
   const filter = {
     linkId,
-    $or: [
-      { employeeId },
-      { worksUnder: employeeId }
-    ]
+    $or: [{ employeeId }, { worksUnder: employeeId }]
   };
 
   // 1) page of entries
   const [entries, total] = await Promise.all([
     Entry.find(filter)
-         .sort({ createdAt: -1 })
-         .skip((page - 1) * limit)
-         .limit(Number(limit))
-         .lean(),
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(Number(limit))
+      .lean(),
     Entry.countDocuments(filter)
   ]);
+
+  // 1a) fetch screenshots for entries that reference one
+  const screenshotIds = entries.map(e => e.screenshotId).filter(Boolean);
+  let screenshotsById = {};
+  if (screenshotIds.length) {
+    const screenshots = await Screenshot.find({ screenshotId: { $in: screenshotIds } })
+      // SAFE projection: no pHashes, no file hashes, no bundleSig
+      .select('screenshotId userId linkId verified analysis createdAt')
+      .lean();
+    screenshotsById = Object.fromEntries(
+      screenshots.map(s => [s.screenshotId, s])
+    );
+  }
+
+  // 1b) attach screenshot docs where available
+  const entriesWithScreenshots = entries.map(e => {
+    if (e.screenshotId && screenshotsById[e.screenshotId]) {
+      return { ...e, screenshot: screenshotsById[e.screenshotId] };
+    }
+    return e;
+  });
 
   // 2) compute grandTotal across all matching docs
   const agg = await Entry.aggregate([
     { $match: filter },
-    { $group: {
+    {
+      $group: {
         _id: null,
-        grandTotal: {
-          $sum: { $ifNull: ["$totalAmount", "$amount"] }
-        }
-    }}
+        grandTotal: { $sum: { $ifNull: ["$totalAmount", "$amount"] } }
+      }
+    }
   ]);
   const grandTotal = agg[0]?.grandTotal ?? 0;
 
   // 3) return results + pagination + grandTotal
   return res.json({
-    entries,          // array of entry docs
-    total,            // how many matched
+    entries: entriesWithScreenshots,
+    total,
     page: Number(page),
     pages: Math.ceil(total / limit),
-    grandTotal        // sum of totalAmount|amount across all matched entries
+    grandTotal
   });
 });
-
