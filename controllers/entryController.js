@@ -79,7 +79,7 @@ async function verifyWithFlask(filesByRole) {
     const f = filesByRole[role];
     form.append(role, f.buffer, { filename: f.originalname || `${role}.png`, contentType: f.mimetype });
   }
-  const url = (process.env.SS_ANALYZER_URL || 'https://api.sharemitra.com') + '/analyze';
+  const url = (process.env.SS_ANALYZER_URL || 'https://api.sharemitra.com/yt-analyzer') + '/analyze';
   const { data } = await axios.post(url, form, { headers: form.getHeaders(), timeout: 20000 });
   return data;
 }
