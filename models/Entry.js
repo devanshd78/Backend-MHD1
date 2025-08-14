@@ -47,7 +47,7 @@ const entrySchema = new mongoose.Schema({
  * - allow duplicates for user entries (type: 1)
  */
 entrySchema.index(
-  { linkId: 1, upiId: 1 },
+  { linkId: 1},
   { unique: true, partialFilterExpression: { type: 0 } }
 );
 

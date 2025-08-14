@@ -276,7 +276,7 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
   // ---- run Node analyzer (OCR + like)
   let analysis;
   try {
-    analysis = await analyzeBundle(filesByRole);
+    analysis = await verifyWithFlask(filesByRole);
   } catch (e) {
     console.error('Analyzer error:', e);
     return res.status(502).json({

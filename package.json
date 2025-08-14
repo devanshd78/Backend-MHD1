@@ -5,7 +5,9 @@
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
-    "dev": "nodemon app.js"
+    "start-flask": "flask-api/.venv/bin/python flask-api/image_comment_like_extract.py",
+    "dev": "concurrently \"npm run start-flask\" \"npm start\""
+
   },
   "author": "",
   "license": "ISC",

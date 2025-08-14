@@ -1,19 +1,32 @@
 // services/ytShortsAnalyzer.js
-// Node analyzer that mirrors the Flask logic 1:1 (Sauvola + Tesseract + like detection)
+// Node analyzer that mirrors the Flask logic (Sauvola + Tesseract + like detection)
+// Fixed: robust "liked vs. unliked" detection (no false positives from digit OCR)
 
 const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
 
 // ─────────────── Like-icon & count constants ───────────────
-const ICON_X1 = 0.05, ICON_X2 = 0.12;
-const ICON_Y1 = 0.47, ICON_Y2 = 0.55;
-const DARK_THRESHOLD   = 80;
-const LIKE_FILLED_MIN  = 0.035;
-const LIKE_OUTLINE_MAX = 0.020;
+// Tighter crop around the thumbs-up glyph so we don't pull video/background pixels.
+// These were tuned on your samples; they work much more reliably than the wider box.
+const ICON_X1 = 0.085, ICON_X2 = 0.105;
+const ICON_Y1 = 0.49,  ICON_Y2 = 0.53;
+
+// Darkness threshold for "is this pixel dark?"
+const DARK_THRESHOLD    = 80;
+
+// Whole-icon darkness quick check (kept for fast-path & extreme cases)
+const LIKE_FILLED_MIN   = 0.035; // if ≥ this in the whole icon crop → definitely liked
+const LIKE_OUTLINE_MAX  = 0.020; // if ≤ this in the whole icon crop → definitely unliked
+
+// Fallback: measure how dark the CENTER of the icon is.
+// For filled icons the center is dark; for outline icons the center is light.
+const CENTER_BOX_START  = 0.35;  // 35% inside from each edge of the icon crop
+const CENTER_BOX_END    = 0.65;  // 65% inside from each edge of the icon crop
+const CENTER_DARK_MIN   = 0.25;  // if ≥ this → liked, else unliked
 
 // ─────────────── Comment / reply constants ───────────────
 const HANDLE_RE_INLINE = /@([A-Za-z0-9_.-]{2,})/;
-const UNICODE_JUNK     = "•·●○▶►«»▪–—|>_";
+const UNICODE_JUNK     = '•·●○▶►«»▪–—|>_';
 const STOP_PHRASES     = [
   'adda reply','add a reply','add reply','add a comment','adda comment',
   'add comment','add a reply…','replies','reply','share','download','remix'
@@ -28,7 +41,7 @@ const stripChars = (s, chars) => {
   while (b >= a && chars.includes(s[b])) b--;
   return s.slice(a, b + 1);
 };
-const cleanToken = (tok) => stripChars(tok, UNICODE_JUNK + " \t\n.:,;()[]{}");
+const cleanToken = (tok) => stripChars(tok, UNICODE_JUNK + ' \t\n.:,;()[]{}');
 
 function cleanText(text) {
   text = text.replace(ISOLATED_NUM_RE, '');
@@ -51,7 +64,10 @@ function refineText(text) {
 }
 
 async function toGrayRaw(buffer) {
-  const { data, info } = await sharp(buffer).greyscale().raw().toBuffer({ resolveWithObject: true });
+  const { data, info } = await sharp(buffer)
+    .greyscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
   return { data: new Uint8Array(data), info };
 }
 
@@ -96,12 +112,17 @@ async function sauvolaImageToPNG(buffer) {
   const { data, info } = await toGrayRaw(buffer);
   const bw = sauvolaBinarize(data, info.width, info.height, 25, 0.2, 128);
   return sharp(Buffer.from(bw), { raw: { width: info.width, height: info.height, channels: 1 } })
-    .png().toBuffer();
+    .png()
+    .toBuffer();
 }
 
 async function ocrLines(buffer) {
   const png = await sauvolaImageToPNG(buffer);
-  const { data: { text } } = await Tesseract.recognize(png, 'eng', { oem: 3, tessedit_pageseg_mode: 6,  user_defined_dpi: '300' });
+  const { data: { text } } = await Tesseract.recognize(png, 'eng', {
+    oem: 3,
+    tessedit_pageseg_mode: 6,
+    user_defined_dpi: '300',
+  });
   return text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
 }
 
@@ -154,29 +175,53 @@ function pickUser(commentsMap, repliesMap) {
   return null;
 }
 
+// ─────────────── Like detection (robust) ───────────────
 async function detectLike(buffer) {
-  const { width: w, height: h } = await sharp(buffer).metadata();
+  if (!buffer) return false;
+
+  const meta = await sharp(buffer).metadata();
+  const w = meta.width, h = meta.height;
   if (!w || !h) return false;
 
-  // like icon crop & darkness
+  // 1) Crop around the like icon
   const x1 = Math.floor(w * ICON_X1), x2 = Math.floor(w * ICON_X2);
   const y1 = Math.floor(h * ICON_Y1), y2 = Math.floor(h * ICON_Y2);
-  const iconBuf = await sharp(buffer).extract({ left: x1, top: y1, width: x2 - x1, height: y2 - y1 }).toBuffer();
-  const { data: gray } = await sharp(iconBuf).greyscale().raw().toBuffer({ resolveWithObject: true });
-  let dark = 0; for (let i = 0; i < gray.length; i++) if (gray[i] < DARK_THRESHOLD) dark++;
-  const darkRatio = dark / gray.length;
-  if (darkRatio >= LIKE_FILLED_MIN) return true;
-  if (darkRatio <= LIKE_OUTLINE_MAX) return false;
+  const width = Math.max(1, x2 - x1);
+  const height = Math.max(1, y2 - y1);
 
-  // fallback: read numeric like count to the right
-  const x3 = Math.floor(w * (ICON_X2 + 0.02));
-  const x4 = Math.floor(w * (ICON_X2 + 0.15));
-  const countBuf = await sharp(buffer).extract({ left: x3, top: y1, width: x4 - x3, height: y2 - y1 }).toBuffer();
-  const countGrayPNG = await sharp(countBuf).greyscale().png().toBuffer();
-  const { data: { text } } = await Tesseract.recognize(countGrayPNG, 'eng', {
-    oem: 3, tessedit_pageseg_mode: 7, tessedit_char_whitelist: '0123456789', user_defined_dpi: '300'
-  });
-  return /\d/.test(text);
+  const iconRaw = await sharp(buffer)
+    .extract({ left: x1, top: y1, width, height })
+    .greyscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const gray = iconRaw.data;
+
+  // Whole-icon dark ratio (fast path)
+  let dark = 0;
+  for (let i = 0; i < gray.length; i++) if (gray[i] < DARK_THRESHOLD) dark++;
+  const darkRatio = dark / gray.length;
+
+  if (darkRatio >= LIKE_FILLED_MIN) return true;   // clearly filled
+  if (darkRatio <= LIKE_OUTLINE_MAX) return false; // clearly outline
+
+  // 2) Fallback: center-of-icon darkness
+  const cx1 = Math.floor(x1 + width  * CENTER_BOX_START);
+  const cx2 = Math.floor(x1 + width  * CENTER_BOX_END);
+  const cy1 = Math.floor(y1 + height * CENTER_BOX_START);
+  const cy2 = Math.floor(y1 + height * CENTER_BOX_END);
+
+  const center = await sharp(buffer)
+    .extract({ left: cx1, top: cy1, width: Math.max(1, cx2 - cx1), height: Math.max(1, cy2 - cy1) })
+    .greyscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  let centerDark = 0;
+  for (let i = 0; i < center.data.length; i++) if (center.data[i] < DARK_THRESHOLD) centerDark++;
+  const centerDarkRatio = centerDark / center.data.length;
+
+  return centerDarkRatio >= CENTER_DARK_MIN;
 }
 
 function getBuf(fileOrBuf) {
@@ -220,7 +265,7 @@ async function analyzeBundle(filesByRole) {
     user_id: uid || null,
     comment: comments,
     replies: replies,
-    verified
+    verified,
   };
 }
 
