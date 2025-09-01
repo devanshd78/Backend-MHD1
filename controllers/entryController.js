@@ -155,7 +155,7 @@ exports.createEmployeeEntry = asyncHandler(async (req, res) => {
 exports.createUserEntry = asyncHandler(async (req, res) => {
   const { userId, linkId, name, worksUnder, upiId } = req.body;
 
-  // ---- basic body validation
+  // ── basic body validation
   if (!userId || !linkId || !name || !worksUnder || !upiId) {
     return res.status(400).json({
       code: 'VALIDATION_ERROR',
@@ -163,7 +163,7 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     });
   }
 
-  // ---- linkId format
+  // ── linkId format
   if (!Types.ObjectId.isValid(linkId)) {
     return res.status(400).json({
       code: 'INVALID_OBJECT_ID',
@@ -171,7 +171,7 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     });
   }
 
-  // ---- link existence
+  // ── link existence
   const link = await Link.findById(linkId).lean();
   if (!link) {
     return res.status(404).json({
@@ -180,33 +180,24 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     });
   }
 
-  // ---- UPI format and match (case-insensitive, trimmed)
+  // ── UPI format & match (case-insensitive)
   const normalizedReqUpi = String(upiId).trim().toLowerCase();
   if (!isValidUpi(normalizedReqUpi)) {
-    return res.status(400).json({
-      code: 'INVALID_UPI',
-      message: 'Invalid UPI format'
-    });
+    return res.status(400).json({ code: 'INVALID_UPI', message: 'Invalid UPI format' });
   }
 
-  const user = await User.findOne({ userId });
+  const user = await User.findOne({ userId }).lean();
   if (!user) {
-    return res.status(404).json({
-      code: 'USER_NOT_FOUND',
-      message: 'User not found'
-    });
+    return res.status(404).json({ code: 'USER_NOT_FOUND', message: 'User not found' });
   }
   const normalizedUserUpi = String(user.upiId || '').trim().toLowerCase();
   if (normalizedUserUpi !== normalizedReqUpi) {
-    return res.status(400).json({
-      code: 'UPI_MISMATCH',
-      message: 'Provided UPI does not match your account'
-    });
+    return res.status(400).json({ code: 'UPI_MISMATCH', message: 'Provided UPI does not match your account' });
   }
 
-  // ---- files presence + type/size validation
-  const files = req.files || {};
+  // ── files presence + type/size validation
   const roles = ['like', 'comment1', 'comment2', 'reply1', 'reply2'];
+  const files = req.files || {};
   const filesByRole = Object.fromEntries(roles.map(r => [r, files[r]?.[0]]));
 
   const missing = roles.filter(r => !filesByRole[r]);
@@ -222,15 +213,10 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
   const MAX_SIZE = 10 * 1024 * 1024; // 10MB
   const typeErrors = [];
   const sizeErrors = [];
-
   for (const r of roles) {
     const f = filesByRole[r];
-    if (!ALLOWED_MIME.includes(f.mimetype)) {
-      typeErrors.push({ role: r, mimetype: f.mimetype });
-    }
-    if (typeof f.size === 'number' && f.size > MAX_SIZE) {
-      sizeErrors.push({ role: r, size: f.size, max: MAX_SIZE });
-    }
+    if (!ALLOWED_MIME.includes(f.mimetype)) typeErrors.push({ role: r, mimetype: f.mimetype });
+    if (typeof f.size === 'number' && f.size > MAX_SIZE) sizeErrors.push({ role: r, size: f.size, max: MAX_SIZE });
   }
   if (typeErrors.length || sizeErrors.length) {
     return res.status(400).json({
@@ -243,52 +229,68 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     });
   }
 
-  // ---- pHash the 5 images
+  // ── pHash + sha256 for the 5 images
   let hashed;
   try {
+    // [{ role, phash, sha256, size, mime }]
     hashed = await phashBundle(filesByRole);
   } catch (e) {
     console.error('phashBundle error:', e);
-    return res.status(500).json({
-      code: 'PHASH_ERROR',
-      message: 'Image processing failed. Please try again.'
-    });
+    return res.status(500).json({ code: 'PHASH_ERROR', message: 'Image processing failed. Please try again.' });
   }
-  const phashes = hashed.map(h => h.phash);
+  const phashes  = hashed.map(h => h.phash);
+  const sha256s  = hashed.map(h => h.sha256);
+  const bundleSig = [...phashes].sort().join('|'); // perceptual signature
+  const bundleSha = [...sha256s].sort().join('|'); // exact-file signature
 
-  // ---- reject near-duplicates for same user
+  // ── near-duplicate (Hamming) guard for same user (t = 6)
   try {
     const isDup = await isDuplicateForUser(userId, phashes, 6);
     if (isDup) {
-      return res.status(400).json({
+      return res.status(409).json({
         code: 'NEAR_DUPLICATE',
-        message: 'Upload another screenshot — a duplicate/near-duplicate was detected for this user.'
+        message: 'These screenshots are too similar to a previous upload. Please capture fresh screenshots.'
       });
     }
   } catch (e) {
     console.error('Duplicate check error:', e);
-    return res.status(500).json({
-      code: 'DUP_CHECK_ERROR',
-      message: 'Duplicate check failed. Please try again.'
-    });
+    return res.status(500).json({ code: 'DUP_CHECK_ERROR', message: 'Duplicate check failed. Please try again.' });
   }
 
-  // ---- run Node analyzer (OCR + like)
+  // ── quick “≥4/5 files reused” guard for same user+link
+  try {
+    const reuse = await Screenshot.aggregate([
+      { $match: { userId, linkId } },
+      { $unwind: '$files' },
+      { $match: { 'files.sha256': { $in: sha256s } } },
+      { $count: 'n' }
+    ]);
+    const reusedCount = reuse?.[0]?.n || 0;
+    if (reusedCount >= 4) {
+      return res.status(409).json({
+        code: 'NEAR_DUPLICATE',
+        message: 'These screenshots largely match a previous submission. Please capture fresh screenshots.',
+        details: { reusedCount }
+      });
+    }
+  } catch (e) {
+    console.error('Reuse-count check error:', e);
+    // non-fatal → continue
+  }
+
+  // ── run Python analyzer (OCR + like) → already normalized + deduped
   let analysis;
   try {
     analysis = await verifyWithFlask(filesByRole);
   } catch (e) {
     console.error('Analyzer error:', e);
-    return res.status(502).json({
-      code: 'ANALYZER_ERROR',
-      message: 'Verification service error. Please try again.'
-    });
+    return res.status(502).json({ code: 'ANALYZER_ERROR', message: 'Verification service error. Please try again.' });
   }
 
-  // ---- echo verifier response in a stable schema
+  // ── stable analysis payload
   const analysisPayload = {
     liked: !!analysis.liked,
-    user_id: analysis.user_id ?? null,
+    user_id: analysis.user_id ?? null, // Python returns normalized lowercased @handle or null
     comment: Array.isArray(analysis.comment) ? analysis.comment : [],
     replies: Array.isArray(analysis.replies) ? analysis.replies : [],
     verified: !!analysis.verified
@@ -309,31 +311,60 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     });
   }
 
-  // ---- store Screenshot bundle
+  // ── persist Screenshot bundle
   let screenshotDoc;
   try {
     screenshotDoc = await Screenshot.create({
       userId,
       linkId,
       verified: true,
-      analysis: analysisPayload,
+      analysis: analysisPayload,              // raw audit payload
+      handle: analysisPayload.user_id || null,
+      comments: analysisPayload.comment,
+      replies: analysisPayload.replies,
       phashes,
-      bundleSig: [...phashes].sort().join('|'),
-      files: hashed
+      bundleSig,
+      bundleSha,
+      files: hashed                           // [{ role, phash, sha256, size, mime }]
     });
   } catch (e) {
     console.error('Screenshot.create error:', e);
+    if (e && e.code === 11000) {
+      const msg = String(e.message || '');
+      if (msg.includes('bundleSig')) {
+        return res.status(409).json({
+          code: 'DUPLICATE_BUNDLE_SIG',
+          message: 'A matching screenshot bundle (perceptual) already exists for this link.'
+        });
+      }
+      if (msg.includes('bundleSha')) {
+        return res.status(409).json({
+          code: 'DUPLICATE_BUNDLE_SHA',
+          message: 'This exact set of image files was already submitted for this link.'
+        });
+      }
+      if (msg.includes('handle') && msg.includes('linkId')) {
+        return res.status(409).json({
+          code: 'HANDLE_ALREADY_VERIFIED',
+          message: 'This handle has already been verified for this video.'
+        });
+      }
+      return res.status(409).json({
+        code: 'DUPLICATE_KEY',
+        message: 'A similar submission already exists.'
+      });
+    }
     return res.status(500).json({
       code: 'SCREENSHOT_PERSIST_ERROR',
       message: 'Could not persist screenshots. Please try again.'
     });
   }
 
-  // ---- compute amounts
-  const linkAmount = Number(link.amount) || 0;
+  // ── compute amounts
+  const linkAmount  = Number(link.amount) || 0;
   const totalAmount = linkAmount;
 
-  // ---- save Entry
+  // ── save Entry
   let entry;
   try {
     entry = await Entry.create({
@@ -362,7 +393,6 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     entry
   });
 });
-
 
 /* ------------------------------------------------------------------ */
 /*  3) READ / LIST (type-aware, optional link filter)                  */

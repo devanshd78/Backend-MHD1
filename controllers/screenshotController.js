@@ -1,28 +1,26 @@
 // services/ytShortsAnalyzer.js
-// Node analyzer that mirrors the Flask logic (Sauvola + Tesseract + like detection)
-// Fixed: robust "liked vs. unliked" detection (no false positives from digit OCR)
+// Node analyzer mirroring the Flask logic (Sauvola + Tesseract + like detection)
+// De-duplicates comments/replies and never counts duplicates toward verification.
 
 const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
 
 // ─────────────── Like-icon & count constants ───────────────
 // Tighter crop around the thumbs-up glyph so we don't pull video/background pixels.
-// These were tuned on your samples; they work much more reliably than the wider box.
 const ICON_X1 = 0.085, ICON_X2 = 0.105;
 const ICON_Y1 = 0.49,  ICON_Y2 = 0.53;
 
 // Darkness threshold for "is this pixel dark?"
 const DARK_THRESHOLD    = 80;
 
-// Whole-icon darkness quick check (kept for fast-path & extreme cases)
+// Whole-icon darkness quick check
 const LIKE_FILLED_MIN   = 0.035; // if ≥ this in the whole icon crop → definitely liked
 const LIKE_OUTLINE_MAX  = 0.020; // if ≤ this in the whole icon crop → definitely unliked
 
 // Fallback: measure how dark the CENTER of the icon is.
-// For filled icons the center is dark; for outline icons the center is light.
 const CENTER_BOX_START  = 0.35;  // 35% inside from each edge of the icon crop
 const CENTER_BOX_END    = 0.65;  // 65% inside from each edge of the icon crop
-const CENTER_DARK_MIN   = 0.25;  // if ≥ this → liked, else unliked
+const CENTER_DARK_MIN   = 0.25;  // if ≥ this → liked
 
 // ─────────────── Comment / reply constants ───────────────
 const HANDLE_RE_INLINE = /@([A-Za-z0-9_.-]{2,})/;
@@ -63,6 +61,26 @@ function refineText(text) {
   return toks.join(' ');
 }
 
+function normalizeHandle(h) {
+  if (!h) return null;
+  h = h.trim();
+  if (!h.startsWith('@')) h = '@' + h;
+  return h.toLowerCase();
+}
+
+function dedupeAndTrim(arr, minLen = 3) {
+  const out = [];
+  const seen = new Set();
+  for (const s of arr || []) {
+    const t = s.trim();
+    if (t.length >= minLen && !seen.has(t)) {
+      seen.add(t);
+      out.push(t);
+    }
+  }
+  return out;
+}
+
 async function toGrayRaw(buffer) {
   const { data, info } = await sharp(buffer)
     .greyscale()
@@ -71,7 +89,7 @@ async function toGrayRaw(buffer) {
   return { data: new Uint8Array(data), info };
 }
 
-// Sauvola threshold (window=25, k=0.2, R=128) ~ skimage.filters.threshold_sauvola
+// Sauvola threshold (window=25, k=0.2, R=128)
 function sauvolaBinarize(gray, width, height, windowSize = 25, k = 0.2, R = 128) {
   const r = Math.floor(windowSize / 2);
   const W = width, H = height, N = (W + 1) * (H + 1);
@@ -228,11 +246,6 @@ function getBuf(fileOrBuf) {
   return Buffer.isBuffer(fileOrBuf) ? fileOrBuf : (fileOrBuf?.buffer || null);
 }
 
-/**
- * Analyze the 5-image bundle and return the same shape the Flask service returns.
- * @param {{like:any, comment1:any, comment2:any, reply1:any, reply2:any}} filesByRole
- * @returns {Promise<{liked:boolean, user_id:string|null, comment:string[], replies:string[], verified:boolean}>}
- */
 async function analyzeBundle(filesByRole) {
   const likeBuf = getBuf(filesByRole.like);
   const c1Buf   = getBuf(filesByRole.comment1);
@@ -253,20 +266,24 @@ async function analyzeBundle(filesByRole) {
 
   const commentMap = extractUserTexts(commentsRaw);
   const replyMap   = extractUserTexts(repliesRaw);
-  const uid        = pickUser(commentMap, replyMap);
+  const uidPick    = pickUser(commentMap, replyMap);
+  const uid        = normalizeHandle(uidPick);
 
-  const comments = (uid && commentMap.get(uid) ? commentMap.get(uid) : []).map(refineText);
-  const replies  = (uid && replyMap.get(uid)   ? replyMap.get(uid)   : []).map(refineText);
+  const comments = (uidPick && commentMap.get(uidPick) ? commentMap.get(uidPick) : []).map(refineText);
+  const replies  = (uidPick && replyMap.get(uidPick)   ? replyMap.get(uidPick)   : []).map(refineText);
 
-  const verified = Boolean(liked && comments.length >= 2 && replies.length >= 2);
+  const commentsU = dedupeAndTrim(comments);
+  const repliesU  = dedupeAndTrim(replies);
+
+  const verified = Boolean(liked && commentsU.length >= 2 && repliesU.length >= 2);
 
   return {
     liked,
     user_id: uid || null,
-    comment: comments,
-    replies: replies,
+    comment: commentsU,
+    replies: repliesU,
     verified,
   };
 }
 
-module.exports = { analyzeBundle };
+module.exports = { analyzeBundle, detectLike };

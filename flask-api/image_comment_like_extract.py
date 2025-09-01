@@ -1,12 +1,13 @@
-"""Flask micro-service (YouTube Shorts screenshot analyser)
+"""
+Flask micro-service (YouTube Shorts screenshot analyser)
 
 Returns JSON:
 {
   "liked": true | false,                 # never null
-  "user_id": "@handle" | null,           # handle present in both layers
-  "comment": ["…", "…"] | null,          # *clean* top-level comments by that handle
-  "replies": ["…", "…"] | null,          # *clean* replies by same handle
-  "verified": true | false                # true if liked and ≥2 comments & ≥2 replies
+  "user_id": "@handle" | null,           # handle present in both layers (normalized lowercase)
+  "comment": ["…", "…"] | null,          # *clean* top-level comments by that handle (deduped)
+  "replies": ["…", "…"] | null,          # *clean* replies by same handle (deduped)
+  "verified": true | false                # true if liked and ≥2 DISTINCT comments & ≥2 DISTINCT replies
 }
 """
 import io
@@ -51,6 +52,14 @@ SINGLE_LETTER_RE = re.compile(r"\b[A-Za-z]\b")
 ISOLATED_NUM_RE  = re.compile(r"\b\d+\b")
 
 # ─────────────── Helpers ───────────────
+def normalize_handle(h: Optional[str]) -> Optional[str]:
+    if not h:
+        return None
+    h = h.strip()
+    if not h.startswith('@'):
+        h = '@' + h
+    return h.lower()
+
 def pil2gray(img: Image.Image) -> np.ndarray:
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
 
@@ -85,6 +94,15 @@ def refine_text(text: str) -> str:
     while toks and len(toks[-1]) <= 2:
         toks.pop()
     return " ".join(toks)
+
+def dedupe_and_trim(arr: List[str], min_len: int = 3) -> List[str]:
+    seen, out = set(), []
+    for s in arr or []:
+        t = s.strip()
+        if len(t) >= min_len and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 def join_handle(line_idx: int, lines: List[str]) -> Tuple[Optional[str], int]:
     line = lines[line_idx]
@@ -186,29 +204,30 @@ def analyze():
 
     comment_map  = extract_user_texts(comments_raw)
     reply_map    = extract_user_texts(replies_raw)
-    uid          = pick_user(comment_map, reply_map)
+    uid_pick     = pick_user(comment_map, reply_map)
+    uid_norm     = normalize_handle(uid_pick)
 
-    comments = [refine_text(t) for t in (comment_map.get(uid) or [])]
-    replies  = [refine_text(t) for t in (reply_map.get(uid)   or [])]
+    comments = [refine_text(t) for t in (comment_map.get(uid_pick) or [])]
+    replies  = [refine_text(t) for t in (reply_map.get(uid_pick)   or [])]
+
+    # De-duplicate (duplicates do NOT count toward verification)
+    comments = dedupe_and_trim(comments)
+    replies  = dedupe_and_trim(replies)
+
     verified = bool(liked and len(comments) >= 2 and len(replies) >= 2)
 
-    if not verified:
-        return jsonify({
-            'message': 'Verification Fails. Try to upload some other screenshot',
-            'liked': liked,
-            'user_id': uid,
-            'comment': comments,
-            'replies': replies,
-            'verified': verified,
-        }), 200
-
-    return jsonify({
+    payload = {
         'liked': liked,
-        'user_id': uid,
-        'comment': comments,
-        'replies': replies,
+        'user_id': uid_norm,
+        'comment': comments if comments else None,
+        'replies': replies if replies else None,
         'verified': verified,
-    }), 200
+    }
+
+    if not verified:
+        payload['message'] = 'Verification Fails. Try to upload some other screenshot'
+
+    return jsonify(payload), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT1', 6000)), debug=True)
