@@ -604,21 +604,24 @@ async function getUserSummariesByEmployee(req, res) {
   try {
     const body = req.body || {};
     const employeeId = (body.employeeId || '').trim();
-    if (!employeeId) return res.status(400).json({ status: 'error', message: 'employeeId is required.' });
+    if (!employeeId) {
+      return res.status(400).json({ status: 'error', message: 'employeeId is required.' });
+    }
 
+    // Pagination for the users list
     const page  = Math.max(1, parseInt(body.page ?? '1', 10));
     const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? '50', 10)));
-    const search = typeof body.search === 'string' ? body.search.trim() : ''; // username search
-    const detailUserId = typeof body.userId === 'string' ? body.userId.trim() : ''; // optional detail for one user
+
+    // Optional username search (User.name)
+    const search = typeof body.search === 'string' ? body.search.trim() : '';
+
+    // Optional cap on how many contact rows to include per user in influencerDetails
+    const detailsLimit = Math.min(5000, Math.max(1, parseInt(body.detailsLimit ?? '1000', 10)));
 
     // 1) Find users under this employee (with optional username search)
     const userQuery = { worksUnder: employeeId };
     if (search) {
       userQuery.name = { $regex: escapeRegex(search), $options: 'i' };
-    }
-    // If detailUserId provided, allow narrowing to just that user in list too (optional)
-    if (detailUserId) {
-      userQuery.userId = detailUserId;
     }
 
     const [totalUsers, users] = await Promise.all([
@@ -632,105 +635,63 @@ async function getUserSummariesByEmployee(req, res) {
     ]);
 
     const userIds = users.map(u => u.userId);
-    let perUserAgg = [];
+
+    // 2) Pull ALL contacts (email, handle, platform, createdAt) from EmailContact for these userIds
+    let contactsByUser = new Map();
     if (userIds.length) {
-      // 2) Aggregate contacts by userId (+ platform breakdown; first/last createdAt)
-      perUserAgg = await EmailContact.aggregate([
-        { $match: { userId: { $in: userIds } } },
-        { $group: {
-            _id: { userId: '$userId', platform: '$platform' },
-            count: { $sum: 1 },
-            firstSavedAt: { $min: '$createdAt' },
-            lastSavedAt:  { $max: '$createdAt' }
-        }},
-        { $group: {
-            _id: '$_id.userId',
-            total: { $sum: '$count' },
-            platforms: { $push: { k: '$_id.platform', v: '$count' } },
-            firstSavedAt: { $min: '$firstSavedAt' },
-            lastSavedAt:  { $max: '$lastSavedAt' }
-        }},
-        { $project: {
-            _id: 0,
-            userId: '$_id',
-            total: 1,
-            platforms: { $arrayToObject: '$platforms' },
-            firstSavedAt: 1,
-            lastSavedAt: 1
-        }}
-      ]);
+      const contacts = await EmailContact.find({ userId: { $in: userIds } })
+        .select({ userId: 1, email: 1, handle: 1, platform: 1, createdAt: 1, _id: 0 })
+        .sort({ createdAt: -1 }) // newest first
+        .lean();
+
+      // group by userId and optionally limit per user
+      contactsByUser = contacts.reduce((map, c) => {
+        const list = map.get(c.userId) || [];
+        if (list.length < detailsLimit) {
+          list.push({
+            email: c.email,
+            handle: c.handle,
+            platform: c.platform,
+            createdAt: c.createdAt
+          });
+        }
+        map.set(c.userId, list);
+        return map;
+      }, new Map());
     }
 
-    // Map aggregations by userId for quick lookup
-    const statsByUser = new Map();
-    for (const row of perUserAgg) statsByUser.set(row.userId, row);
-
-    // Build response items
+    // 3) Build response per user with influencerDetails (replaces previous "platforms" counts)
     const items = users.map(u => {
-      const s = statsByUser.get(u.userId) || { total: 0, platforms: {}, firstSavedAt: null, lastSavedAt: null };
+      const list = contactsByUser.get(u.userId) || [];
+
+      // compute first/last based on the full (unlimited) set if needed
+      // here we only have the limited list; still provide min/max from that list
+      let firstSavedAt = null;
+      let lastSavedAt  = null;
+      if (list.length) {
+        // list is newest-first sorted
+        lastSavedAt  = list[list.length - 1].createdAt || null; // oldest in the limited slice
+        firstSavedAt = list[0].createdAt || null;               // newest in the limited slice
+      }
+
       return {
         userId: u.userId,
         name: u.name,
-        total: s.total,
-        platforms: s.platforms,
-        firstSavedAt: s.firstSavedAt,
-        lastSavedAt: s.lastSavedAt
+        total: list.length,            // number of contacts included in influencerDetails (capped by detailsLimit)
+        firstSavedAt,
+        lastSavedAt,
+        influencerDetails: list        // [{ email, handle, platform, createdAt }, ...]
       };
     });
 
-    const resp = {
+    return res.json({
       employeeId,
       page,
       limit,
       totalUsers,
       hasNext: page * limit < totalUsers,
       data: items
-    };
-
-    // 3) Optional: include details for specific userId
-    if (detailUserId) {
-      // contacts pagination for details
-      const cPage  = Math.max(1, parseInt(body.contactsPage ?? '1', 10));
-      const cLimit = Math.min(200, Math.max(1, parseInt(body.contactsLimit ?? '50', 10)));
-      const contactSearch = typeof body.contactsSearch === 'string' ? body.contactsSearch.trim() : '';
-
-      const contactQuery = { userId: detailUserId };
-      if (contactSearch) {
-        const needleRaw  = contactSearch;
-        const needleNoAt = contactSearch.startsWith('@') ? contactSearch.slice(1) : contactSearch;
-        const rxRaw  = escapeRegex(needleRaw);
-        const rxNoAt = escapeRegex(needleNoAt);
-        contactQuery.$or = [
-          { email:    { $regex: rxNoAt, $options: 'i' } },
-          { handle:   { $regex: rxRaw.startsWith('@') ? rxRaw : `@${rxNoAt}`, $options: 'i' } },
-          { platform: { $regex: rxNoAt, $options: 'i' } }
-        ];
-      }
-
-      const [detailUser, contacts, contactsTotal] = await Promise.all([
-        User.findOne({ userId: detailUserId }).select({ userId: 1, name: 1, _id: 0 }).lean(),
-        EmailContact.find(contactQuery)
-          .sort({ createdAt: -1 })
-          .skip((cPage - 1) * cLimit)
-          .limit(cLimit)
-          .select({ email: 1, handle: 1, platform: 1, createdAt: 1, _id: 0 })
-          .lean(),
-        EmailContact.countDocuments(contactQuery)
-      ]);
-
-      resp.detail = {
-        user: detailUser || { userId: detailUserId, name: null },
-        contacts: {
-          page: cPage,
-          limit: cLimit,
-          total: contactsTotal,
-          hasNext: cPage * cLimit < contactsTotal,
-          items: contacts
-        }
-      };
-    }
-
-    return res.json(resp);
+    });
   } catch (err) {
     console.error('getUserSummariesByEmployee error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch employee summaries.' });
