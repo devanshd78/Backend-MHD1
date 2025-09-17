@@ -35,11 +35,6 @@ router.post('/user/extract', acceptAnyUpload, capToFive, extractEmailsAndHandles
 router.post('/getbyuserId', getContactsByUser);
 router.post('/getByemployeeId', getUserSummariesByEmployee);
 
-
-
-
-
-
 router.post('/collabglam/all', getAllEmailContacts);
 
 
