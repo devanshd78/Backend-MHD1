@@ -30,10 +30,10 @@ function capToFive(req, _res, next) {
   next();
 }
 
-router.post('/user/extract-batch', acceptAnyUpload, capToFive, extractEmailsAndHandlesBatch);
+router.post('/user/extract', acceptAnyUpload, capToFive, extractEmailsAndHandlesBatch);
 
-router.post('/by-user', getContactsByUser);
-router.post('/list-by-employee', getUserSummariesByEmployee);
+router.post('/getbyuserId', getContactsByUser);
+router.post('/getByemployeeId', getUserSummariesByEmployee);
 
 
 
