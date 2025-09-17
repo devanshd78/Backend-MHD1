@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { fetch, Agent } = require('undici');
-
+const Employee = require('../models/Employee');
 const EmailContact = require('../models/email');
 const User = require('../models/User');
 
@@ -501,17 +501,30 @@ async function getAllEmailContacts(req, res) {
   try {
     const body = req.body || {};
 
+    // --- Pagination (50/page default) ---
     const page  = Math.max(1, parseInt(body.page ?? '1', 10));
-    const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? '50', 10)));
+    // hard-cap to 50 per your request (change Math.min(50, ...) to Math.min(200, ...) if needed)
+    const limit = Math.min(50, Math.max(1, parseInt(body.limit ?? '50', 10)));
 
+    // --- Filters ---
     const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
     const search = typeof body.search === 'string' ? body.search.trim() : '';
 
+    // --- Export knobs ---
+    const exportType = (body.exportType || '').toLowerCase();         // 'csv' | 'xlsx' | ''
+    const exportAll  = String(body.exportAll ?? 'false').toLowerCase() === 'true';
+
+    // Which fields to export (and also return for JSON list)
+    const defaultFields = ['email', 'handle', 'platform', 'userId', 'createdAt'];
+    const fields = Array.isArray(body.fields) && body.fields.length
+      ? body.fields.filter(f => defaultFields.includes(f))
+      : defaultFields;
+
+    // --- Query ---
     const query = {};
-    if (userId) query.userId = userId; // optional filter by collector
+    if (userId) query.userId = userId;
 
     if (search) {
-      // Single search across email, handle (with or without @), and platform
       const needleRaw  = search;
       const needleNoAt = search.startsWith('@') ? search.slice(1) : search;
 
@@ -525,28 +538,107 @@ async function getAllEmailContacts(req, res) {
       ];
     }
 
-    const [items, total] = await Promise.all([
-      EmailContact.find(query)
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .select({ email: 1, handle: 1, platform: 1, _id: 0 }) // ONLY these fields
-        .lean(),
-      EmailContact.countDocuments(query)
-    ]);
+    // --- Common selects ---
+    const projection = fields.reduce((acc, f) => (acc[f] = 1, acc), { _id: 0 });
+
+    // If exporting ALL, pull more rows (set a safety cap)
+    const EXPORT_CAP = 100_000;
+
+    // --- Count for pagination / export metadata ---
+    const total = await EmailContact.countDocuments(query);
+
+    // --- Export CSV/XLSX path ---
+    if (exportType === 'csv' || exportType === 'xlsx') {
+      // Determine slice to export
+      let docs = [];
+      if (exportAll) {
+        const toFetch = Math.min(total, EXPORT_CAP);
+        // fetch all matches up to cap
+        docs = await EmailContact.find(query)
+          .sort({ createdAt: -1 })
+          .limit(toFetch)
+          .select(projection)
+          .lean();
+      } else {
+        // export current page only
+        docs = await EmailContact.find(query)
+          .sort({ createdAt: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .select(projection)
+          .lean();
+      }
+
+      // Normalize rows (ensure field order)
+      const rows = docs.map(d => {
+        const out = {};
+        for (const f of fields) out[f] = d[f] ?? '';
+        return out;
+      });
+
+      const ts = new Date();
+      const y = String(ts.getFullYear());
+      const m = String(ts.getMonth() + 1).padStart(2, '0');
+      const dd = String(ts.getDate()).padStart(2, '0');
+      const hh = String(ts.getHours()).padStart(2, '0');
+      const mm = String(ts.getMinutes()).padStart(2, '0');
+      const ss = String(ts.getSeconds()).padStart(2, '0');
+      const stamp = `${y}${m}${dd}_${hh}${mm}${ss}`;
+
+      if (exportType === 'csv') {
+        // Build CSV manually (no extra deps)
+        const esc = (v) => {
+          const s = String(v ?? '');
+          // quote if contains delimiter, quote, or newline
+          if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+          return s;
+        };
+        const header = fields.map(esc).join(',');
+        const lines = rows.map(r => fields.map(f => esc(r[f])).join(','));
+        const csv = [header, ...lines].join('\n');
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="contacts_${stamp}.csv"`);
+        return res.status(200).send(csv);
+      }
+
+      if (exportType === 'xlsx') {
+        // Use exceljs (install: npm i exceljs)
+        const ExcelJS = require('exceljs');
+        const wb = new ExcelJS.Workbook();
+        const ws = wb.addWorksheet('Contacts');
+
+        ws.columns = fields.map(f => ({ header: f, key: f, width: Math.max(10, f.length + 2) }));
+        ws.addRows(rows);
+
+        const buffer = await wb.xlsx.writeBuffer();
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename="contacts_${stamp}.xlsx"`);
+        return res.status(200).send(Buffer.from(buffer));
+      }
+    }
+
+    // --- Regular JSON listing (paginated) ---
+    const items = await EmailContact.find(query)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .select(projection)
+      .lean();
 
     return res.json({
       page,
-      limit,
+      limit,                     // 50 default per page
       total,
       hasNext: page * limit < total,
       data: items
     });
   } catch (err) {
-    console.error('getAllEmailContactsPost error:', err);
+    console.error('getAllEmailContacts error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch contacts.' });
   }
 }
+
 
 // ---------- NEW: POST /email/by-user  (list contacts by userId) ----------
 async function getContactsByUser(req, res) {
@@ -698,6 +790,140 @@ async function getUserSummariesByEmployee(req, res) {
   }
 }
 
+
+// ---------- NEW (ADMIN): POST /admin/employee-overview (search employees by name; include team + collected data) ----------
+// ---------- UPDATED (ADMIN): POST /admin/employee-overview ----------
+async function getEmployeeOverviewAdmin(req, res) {
+  try {
+    const body = req.body || {};
+
+    // Search by employee name (empty = all)
+    const search = typeof body.search === 'string' ? body.search.trim() : '';
+
+    // Pagination over employees
+    const page  = Math.max(1, parseInt(body.page ?? '1', 10));
+    const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? '50', 10)));
+
+    // Per-collector cap
+    const detailsLimit = Math.min(5000, Math.max(1, parseInt(body.detailsLimit ?? '1000', 10)));
+
+    // 1) Find employees by name (with pagination)
+    const employeeQuery = {};
+    if (search) {
+      employeeQuery.name = { $regex: escapeRegex(search), $options: 'i' };
+    }
+
+    const [totalEmployees, employees] = await Promise.all([
+      Employee.countDocuments(employeeQuery),
+      Employee.find(employeeQuery)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .select({ employeeId: 1, name: 1, email: 1, createdAt: 1, _id: 0 })
+        .lean()
+    ]);
+
+    if (!employees.length) {
+      return res.json({
+        page, limit, totalEmployees, hasNext: false,
+        detailsLimit,
+        data: []
+      });
+    }
+
+    // 2) Get all users who work under any of these employees
+    const employeeIds = employees.map(e => e.employeeId);
+    const users = await User.find({ worksUnder: { $in: employeeIds } })
+      .select({ userId: 1, name: 1, worksUnder: 1, createdAt: 1, _id: 0 })
+      .lean();
+
+    // Group users by the employee they work under
+    const usersByEmployee = users.reduce((map, u) => {
+      const list = map.get(u.worksUnder) || [];
+      list.push(u);
+      map.set(u.worksUnder, list);
+      return map;
+    }, new Map());
+
+    // 3) Pull all EmailContact rows for all these users in one query
+    const collectorUserIds = users.map(u => u.userId);
+    let contacts = [];
+    if (collectorUserIds.length) {
+      contacts = await EmailContact.find({ userId: { $in: collectorUserIds } })
+        .select({ userId: 1, email: 1, handle: 1, platform: 1, createdAt: 1, _id: 0 })
+        .sort({ createdAt: -1 }) // newest first
+        .lean();
+    }
+
+    // 4) Group contacts by collector (userId), keep total + limited slice
+    const contactsByUser = new Map();     // userId -> limited items
+    const countsByUser   = new Map();     // userId -> total count
+    if (contacts.length) {
+      const grouped = contacts.reduce((m, c) => {
+        const list = m.get(c.userId) || [];
+        list.push(c);
+        m.set(c.userId, list);
+        return m;
+      }, new Map());
+
+      for (const [uid, list] of grouped.entries()) {
+        countsByUser.set(uid, list.length);
+        const limited = list.slice(0, detailsLimit).map(row => ({
+          email: row.email,
+          handle: row.handle,
+          platform: row.platform,
+          createdAt: row.createdAt
+        }));
+        contactsByUser.set(uid, limited);
+      }
+    }
+
+    // 5) Build response: employee -> collectors[] -> dataCollected[]
+    //    - hide collectors with empty dataCollected
+    //    - drop employees with no collectors after the filter
+    const items = employees.map(emp => {
+      const team = usersByEmployee.get(emp.employeeId) || [];
+
+      // Build & filter collectors (only with non-empty dataCollected)
+      const collectorsAll = team.map(u => ({
+        username: u.name,
+        userId: u.userId,
+        totalCollected: countsByUser.get(u.userId) || 0,
+        dataCollected: contactsByUser.get(u.userId) || []
+      }));
+
+      const collectors = collectorsAll.filter(c => Array.isArray(c.dataCollected) && c.dataCollected.length > 0);
+
+      // Roll-up metrics using only visible collectors
+      const contactsTotal = collectors.reduce((a, c) => a + (c.totalCollected || 0), 0);
+
+      return {
+        employeeName: emp.name,
+        employeeId: emp.employeeId,
+        employeeEmail: emp.email,
+        teamCounts: { members: collectors.length, contactsTotal },
+        collectors
+      };
+    })
+    // remove employees with no visible collectors
+    .filter(empBlock => empBlock.collectors && empBlock.collectors.length > 0);
+
+    return res.json({
+      page,
+      limit,
+      totalEmployees, // total employees *before* filtering; keep for UI context
+      hasNext: page * limit < totalEmployees,
+      detailsLimit,
+      search,
+      data: items
+    });
+  } catch (err) {
+    console.error('getEmployeeOverviewAdmin error:', err);
+    return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch admin employee overview.' });
+  }
+}
+
+
 module.exports = {
   // existing
   extractEmailsAndHandlesBatch,
@@ -705,5 +931,6 @@ module.exports = {
 
   // new
   getContactsByUser,           
-  getUserSummariesByEmployee   // POST /email/list-by-employee
+  getUserSummariesByEmployee,
+  getEmployeeOverviewAdmin
 };

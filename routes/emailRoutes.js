@@ -4,7 +4,11 @@
 require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
-const { extractEmailsAndHandlesBatch ,getAllEmailContacts,getContactsByUser,getUserSummariesByEmployee} = require('../controllers/emailController');
+const { extractEmailsAndHandlesBatch ,
+  getAllEmailContacts,getContactsByUser,
+  getUserSummariesByEmployee,
+  getEmployeeOverviewAdmin
+} = require('../controllers/emailController');
 
 const router = express.Router();
 
@@ -36,6 +40,8 @@ router.post('/getbyuserId', getContactsByUser);
 router.post('/getByemployeeId', getUserSummariesByEmployee);
 
 router.post('/collabglam/all', getAllEmailContacts);
+
+router.post('/admin/all', getEmployeeOverviewAdmin);
 
 
 // Optional: health
