@@ -9,6 +9,7 @@ const employeeRoutes = require('./routes/employee');
 const adminRoutes    = require('./routes/admin');
 const userRoutes     = require('./routes/user');
 const entryRoutes    = require('./routes/entry');
+const emailRoutes         = require('./routes/emailRoutes');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -29,6 +30,7 @@ app.use('/employee', employeeRoutes);
 app.use('/admin',    adminRoutes);
 app.use('/user',     userRoutes);
 app.use('/entry',    entryRoutes);
+app.use('/email',    emailRoutes);
 
 // ─── DB + SERVER START ───────────────────────────────────────────────────────
 mongoose
