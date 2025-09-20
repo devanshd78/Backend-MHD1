@@ -5,6 +5,7 @@ require('dotenv').config();
 
 const fs = require('node:fs');
 const path = require('node:path');
+const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const crypto = require('node:crypto');
 const { fetch, Agent } = require('undici');
 const Employee = require('../models/Employee');
@@ -507,7 +508,7 @@ async function persistMoreInfo(normalized, platform, userId) {
 }
 
 // ---------- Batch ONLY (up to 5 images) ----------
-async function extractEmailsAndHandlesBatch(req, res) {
+exports.extractEmailsAndHandlesBatch=asyncHandler(async (req, res)=> {
   try {
     if (!OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY');
 
@@ -722,11 +723,11 @@ async function extractEmailsAndHandlesBatch(req, res) {
     console.error('extractEmailsAndHandlesBatch error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Batch processing failed.' });
   }
-}
+});
 
 
 // ---------- POST /email/all (single search; returns only email, handle, platform) ----------
-async function getAllEmailContacts(req, res) {
+exports.getAllEmailContacts=asyncHandler(async (req, res)=> {
   try {
     const body = req.body || {};
 
@@ -942,11 +943,11 @@ async function getAllEmailContacts(req, res) {
     console.error('getAllEmailContacts error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch contacts.' });
   }
-}
+});
 
 
 // ---------- NEW: POST /email/by-user  (list contacts by userId) ----------
-async function getContactsByUser(req, res) {
+exports.getContactsByUser=asyncHandler(async (req, res)=> {
   try {
     const body = req.body || {};
     const userId = (body.userId || '').trim();
@@ -994,10 +995,10 @@ async function getContactsByUser(req, res) {
     console.error('getContactsByUser error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch user contacts.' });
   }
-}
+});
 
 // ---------- NEW: POST /email/list-by-employee (summaries per user; search by username; optional user detail) ----------
-async function getUserSummariesByEmployee(req, res) {
+exports.getUserSummariesByEmployee=asyncHandler(async (req, res)=> {
   try {
     const body = req.body || {};
     const employeeId = (body.employeeId || '').trim();
@@ -1093,12 +1094,11 @@ async function getUserSummariesByEmployee(req, res) {
     console.error('getUserSummariesByEmployee error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch employee summaries.' });
   }
-}
-
+});
 
 // ---------- NEW (ADMIN): POST /admin/employee-overview (search employees by name; include team + collected data) ----------
 // ---------- UPDATED (ADMIN): POST /admin/employee-overview ----------
-async function getEmployeeOverviewAdmin(req, res) {
+exports.getEmployeeOverviewAdmin=asyncHandler(async (req, res)=> {
   try {
     const body = req.body || {};
 
@@ -1260,15 +1260,49 @@ async function getEmployeeOverviewAdmin(req, res) {
     console.error('getEmployeeOverviewAdmin error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch admin employee overview.' });
   }
-}
+});
 
 
+// Controller
+exports.checkStatus = asyncHandler(async (req, res) => {
+  try {
+    const rawHandle   = (req.body?.handle ?? '').trim();
+    const rawPlatform = (req.body?.platform ?? '').trim();
 
-module.exports = {
-  extractEmailsAndHandlesBatch,
-  getAllEmailContacts,
+    if (!rawHandle)   return res.status(400).json({ status: 'error', message: 'handle is required' });
+    if (!rawPlatform) return res.status(400).json({ status: 'error', message: 'platform is required' });
 
-  getContactsByUser,
-  getUserSummariesByEmployee,
-  getEmployeeOverviewAdmin
-};
+    // normalize to lowercase @handle
+    const handle = (rawHandle.startsWith('@') ? rawHandle : `@${rawHandle}`).toLowerCase();
+
+    // same validation pattern as your schema
+    const HANDLE_RX = /^@[A-Za-z0-9._\-]+$/;
+    if (!HANDLE_RX.test(handle)) {
+      return res.status(400).json({ status: 'error', message: 'Invalid handle format' });
+    }
+
+    // normalize platform (accept common aliases)
+    const PLATFORM_MAP = new Map([
+      ['youtube', 'youtube'], ['yt', 'youtube'],
+      ['instagram', 'instagram'], ['ig', 'instagram'],
+      ['tiktok', 'tiktok'], ['tt', 'tiktok']
+    ]);
+    const platformKey = rawPlatform.toLowerCase();
+    const platform = PLATFORM_MAP.get(platformKey);
+
+    if (!platform) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Invalid platform. Use: youtube|instagram|twitter|tiktok|facebook|other (or aliases: yt, ig, x, tt, fb)'
+      });
+    }
+
+    // existence check for the (handle, platform) pair
+    const exists = await EmailContact.exists({ handle, platform });
+
+    return res.json({ status: exists ? 1 : 0 });
+  } catch (err) {
+    console.error('checkStatus error:', err);
+    return res.status(400).json({ status: 'error', message: err?.message || 'Failed to check handle.' });
+  }
+});

@@ -7,7 +7,8 @@ const multer = require('multer');
 const { extractEmailsAndHandlesBatch ,
   getAllEmailContacts,getContactsByUser,
   getUserSummariesByEmployee,
-  getEmployeeOverviewAdmin
+  getEmployeeOverviewAdmin,
+  checkStatus
 } = require('../controllers/emailController');
 
 const router = express.Router();
@@ -42,6 +43,7 @@ router.post('/getByemployeeId', getUserSummariesByEmployee);
 router.post('/collabglam/all', getAllEmailContacts);
 
 router.post('/admin/all', getEmployeeOverviewAdmin);
+router.post('/status', checkStatus);
 
 
 // Optional: health
