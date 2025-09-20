@@ -8,6 +8,23 @@ const HANDLE_RX = /^@[A-Za-z0-9._\-]+$/;
 
 const PLATFORM_ENUM = ['youtube', 'instagram', 'twitter', 'tiktok', 'facebook', 'other'];
 
+// --- YouTube subdocument (NEW) ---
+const YouTubeSchema = new mongoose.Schema({
+  channelId: { type: String, index: true },
+  title: { type: String },
+  handle: { type: String },               // normalized @handle
+  urlByHandle: { type: String },
+  urlById: { type: String },
+  description: { type: String },
+  country: { type: String },
+  subscriberCount: { type: Number, min: 0 },
+  videoCount: { type: Number, min: 0 },
+  viewCount: { type: Number, min: 0 },
+  topicCategories: [{ type: String }],
+  topicCategoryLabels: [{ type: String }],
+  fetchedAt: { type: Date }
+}, { _id: false });
+
 const EmailContactSchema = new mongoose.Schema({
   email: {
     type: String,
@@ -41,19 +58,25 @@ const EmailContactSchema = new mongoose.Schema({
       message: 'Platform must be one of: youtube, instagram, twitter, tiktok, facebook, other'
     }
   },
-  // NEW: who collected this entry (links to your User.userId string)
+  // who collected this entry (links to your User.userId string)
   userId: {
     type: String,
     required: [true, 'userId is required'],
     index: true,
     ref: 'User'
-  }
+  },
+
+  // --- NEW: cached YouTube channel data ---
+  youtube: { type: YouTubeSchema, default: undefined }
+
 }, { timestamps: true });
 
 // Helpful indexes (optional but good for scale)
 EmailContactSchema.index({ createdAt: -1 });
 EmailContactSchema.index({ platform: 1 });
 EmailContactSchema.index({ userId: 1 });
+// If you expect heavy YT lookups by channel:
+EmailContactSchema.index({ 'youtube.channelId': 1 });
 
 module.exports = mongoose.models.EmailContact
   || mongoose.model('EmailContact', EmailContactSchema);

@@ -46,10 +46,16 @@ const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
 const AGGRESSIVE_RACE = process.env.AGGRESSIVE_RACE === '1';
 const ENABLE_DARK_ENHANCE = process.env.ENABLE_DARK_ENHANCE !== '0'; // default ON
 
+// ---------- YouTube API (NEW) ----------
+const YT_API_KEY     = process.env.YOUTUBE_API_KEY;          // <-- set this in .env
+const YT_TIMEOUT_MS  = Number(process.env.YOUTUBE_TIMEOUT_MS || 12000);
+const YT_BASE        = 'https://www.googleapis.com/youtube/v3/channels';
+
 // ---------- Regex ----------
 const EMAIL_RX = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
 const HANDLE_IN_TEXT = /@[A-Za-z0-9._\-]+/g;
-const YT_HANDLE_RX = /\/@([A-Za-z0-9._\-]+)/i;
+const YT_HANDLE_RX = /\/@([A-Za-z0-9._\-]+)/i;     // used in deriveHandleFromMi
+const YT_HANDLE_RE = /@([A-Za-z0-9._\-]+)/i;       // used in YouTube helpers
 const IG_RX = /(?:instagram\.com|ig\.me)\/([A-Za-z0-9._\-]+)/i;
 const TW_RX = /(?:twitter\.com|x\.com)\/([A-Za-z0-9._\-]+)/i;
 
@@ -335,6 +341,131 @@ function shapeForClient(parsed) {
   };
 }
 
+// ---------- YouTube helpers (NEW) ----------
+function normalizeHandle(h) {
+  if (!h) return null;
+  const t = String(h).trim();
+  return t.startsWith('@') ? t : `@${t}`;
+}
+function handleFromYouTubeUrl(urlOrHost) {
+  if (!urlOrHost) return null;
+  const m = String(urlOrHost).match(YT_HANDLE_RE);
+  return m ? `@${m[1]}` : null;
+}
+function pickYouTubeHandle(more_info) {
+  // Prefer explicit YouTube link; else take the first '@handle' found.
+  const fromUrl = handleFromYouTubeUrl(more_info?.YouTube);
+  if (fromUrl) return fromUrl;
+  const arr = Array.isArray(more_info?.handles) ? more_info.handles : [];
+  for (const h of arr) {
+    if (typeof h === 'string' && h.trim().startsWith('@')) return h.trim();
+  }
+  return null;
+}
+function labelFromWikiUrl(url) {
+  try {
+    const last = decodeURIComponent(String(url).split('/').pop() || '');
+    return last.replace(/_/g, ' ');
+  } catch { return url; }
+}
+
+async function fetchYouTubeChannelByHandle(ytHandle) {
+  if (!YT_API_KEY) throw new Error('Missing YOUTUBE_API_KEY');
+  if (!ytHandle) throw new Error('Missing YouTube handle');
+
+  const forHandle = normalizeHandle(ytHandle);
+  const params = new URLSearchParams({
+    part: 'snippet,statistics,topicDetails',
+    forHandle,
+    key: YT_API_KEY
+  });
+
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(new Error('YouTube API timeout')), YT_TIMEOUT_MS);
+  try {
+    const r = await fetch(`${YT_BASE}?${params.toString()}`, { dispatcher: httpAgent, signal: ac.signal });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`YouTube API ${r.status}: ${txt || r.statusText}`);
+    }
+    const data = await r.json();
+    const item = data?.items?.[0];
+    if (!item) return null;
+
+    const { id: channelId, snippet = {}, statistics = {}, topicDetails = {} } = item;
+    const hidden = !!statistics.hiddenSubscriberCount;
+    const topicCategories = Array.isArray(topicDetails.topicCategories) ? topicDetails.topicCategories : [];
+
+    return {
+      channelId,
+      title: snippet.title || '',
+      handle: forHandle,
+      urlByHandle: `https://www.youtube.com/${forHandle}`,
+      urlById: channelId ? `https://www.youtube.com/channel/${channelId}` : null,
+      description: snippet.description || '',
+      country: snippet.country || null, // "channel location" (country)
+      subscriberCount: hidden ? null : Number(statistics.subscriberCount ?? 0),
+      videoCount: Number(statistics.videoCount ?? 0),
+      viewCount: Number(statistics.viewCount ?? 0),
+      topicCategories,
+      topicCategoryLabels: topicCategories.map(labelFromWikiUrl),
+      fetchedAt: new Date()
+    };
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+async function enrichYouTubeForContact(more_info, persistResult) {
+  // If no API key, skip quietly (non-fatal)
+  if (!YT_API_KEY) return { saved: false, message: 'YouTube enrichment skipped: Missing YOUTUBE_API_KEY.' };
+
+  // Decide which doc to update
+  const email  = persistResult?.email  ?? (Array.isArray(more_info?.emails)  ? more_info.emails[0]?.toLowerCase()?.trim()  : null);
+  const handle = persistResult?.handle ?? (Array.isArray(more_info?.handles) ? more_info.handles[0]?.toLowerCase()?.trim() : null);
+
+  const ytHandle = pickYouTubeHandle(more_info);
+  if (!ytHandle) return { saved: false, message: 'No YouTube handle found.' };
+
+  const cacheKey = `yt1|${ytHandle}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const yt = await fetchYouTubeChannelByHandle(ytHandle);
+  if (!yt) {
+    const out = { saved: false, message: `No YouTube channel found for ${ytHandle}.` };
+    cacheSet(cacheKey, out);
+    return out;
+  }
+
+  // Determine target doc _id
+  const id = persistResult?.id || persistResult?.emailId || persistResult?.handleId;
+  let targetId = id;
+  if (!targetId) {
+    const q = email && handle ? { email, handle: normalizeHandle(handle) } : (email ? { email } : (handle ? { handle: normalizeHandle(handle) } : null));
+    if (q) {
+      const doc = await EmailContact.findOne(q, { _id: 1 }).lean();
+      if (doc?._id) targetId = doc._id;
+    }
+  }
+  if (!targetId) {
+    const out = { saved: false, message: 'Could not locate a single record to update with YouTube data.', youtube: yt };
+    cacheSet(cacheKey, out);
+    return out;
+  }
+
+  // Save YouTube under youtube subdocument
+  await EmailContact.updateOne(
+    { _id: targetId },
+    { $set: { youtube: yt } },
+    { upsert: false }
+  );
+
+  const out = { saved: true, id: String(targetId), youtube: yt };
+  cacheSet(cacheKey, out);
+  return out;
+}
+
 // ---------- Persistence (returns outcome so caller can mark errors) ----------
 async function persistMoreInfo(normalized, platform, userId) {
   const email = normalized?.email ? normalized.email.toLowerCase().trim() : null;
@@ -407,8 +538,32 @@ async function extractEmailsAndHandlesBatch(req, res) {
           }
 
           const dbRes = await persistMoreInfo(shaped.normalized, platform, userId);
+
+          // Attempt YouTube enrichment for both 'saved' and 'duplicate' outcomes
+          let ytRes = null;
+          try {
+            const persistCtx = {
+              id: dbRes?.id,
+              emailId: dbRes?.emailId,
+              handleId: dbRes?.handleId,
+              email: shaped?.normalized?.email || null,
+              handle: shaped?.normalized?.handle || null
+            };
+            ytRes = await enrichYouTubeForContact(shaped.more_info, persistCtx);
+          } catch (e) {
+            ytRes = { saved: false, message: e?.message || 'YouTube enrichment failed.' };
+          }
+
           if (dbRes.outcome === 'saved') {
-            return { has_captcha: false, platform, more_info: shaped.more_info, db: { saved: true, id: dbRes.id } };
+            return {
+              has_captcha: false,
+              platform,
+              more_info: shaped.more_info,
+              db: { saved: true, id: dbRes.id },
+              youtube: ytRes?.youtube || null,
+              youtubeSaved: !!ytRes?.saved,
+              youtubeMessage: ytRes?.message || null
+            };
           } else {
             return {
               error: dbRes.message,
@@ -416,7 +571,10 @@ async function extractEmailsAndHandlesBatch(req, res) {
               platform,
               more_info: shaped.more_info,
               normalized: shaped.normalized,
-              details: dbRes
+              details: dbRes,
+              youtube: ytRes?.youtube || null,
+              youtubeSaved: !!ytRes?.saved,
+              youtubeMessage: ytRes?.message || null
             };
           }
         } catch (e) {
@@ -443,10 +601,44 @@ async function extractEmailsAndHandlesBatch(req, res) {
               return { error: 'Captcha detected. Skipping database save.', has_captcha: true };
             }
             const dbRes = await persistMoreInfo(shaped.normalized, platform, userId);
+
+            // YouTube enrichment
+            let ytRes = null;
+            try {
+              const persistCtx = {
+                id: dbRes?.id,
+                emailId: dbRes?.emailId,
+                handleId: dbRes?.handleId,
+                email: shaped?.normalized?.email || null,
+                handle: shaped?.normalized?.handle || null
+              };
+              ytRes = await enrichYouTubeForContact(shaped.more_info, persistCtx);
+            } catch (e) {
+              ytRes = { saved: false, message: e?.message || 'YouTube enrichment failed.' };
+            }
+
             if (dbRes.outcome === 'saved') {
-              return { has_captcha: false, platform, more_info: shaped.more_info, db: { saved: true, id: dbRes.id } };
+              return {
+                has_captcha: false,
+                platform,
+                more_info: shaped.more_info,
+                db: { saved: true, id: dbRes.id },
+                youtube: ytRes?.youtube || null,
+                youtubeSaved: !!ytRes?.saved,
+                youtubeMessage: ytRes?.message || null
+              };
             } else {
-              return { error: dbRes.message, has_captcha: false, platform, more_info: shaped.more_info, normalized: shaped.normalized, details: dbRes };
+              return {
+                error: dbRes.message,
+                has_captcha: false,
+                platform,
+                more_info: shaped.more_info,
+                normalized: shaped.normalized,
+                details: dbRes,
+                youtube: ytRes?.youtube || null,
+                youtubeSaved: !!ytRes?.saved,
+                youtubeMessage: ytRes?.message || null
+              };
             }
           } catch (e) {
             return { error: e?.message || 'Failed to process this image URL.' };
@@ -473,10 +665,44 @@ async function extractEmailsAndHandlesBatch(req, res) {
               return { error: 'Captcha detected. Skipping database save.', has_captcha: true };
             }
             const dbRes = await persistMoreInfo(shaped.normalized, platform, userId);
+
+            // YouTube enrichment
+            let ytRes = null;
+            try {
+              const persistCtx = {
+                id: dbRes?.id,
+                emailId: dbRes?.emailId,
+                handleId: dbRes?.handleId,
+                email: shaped?.normalized?.email || null,
+                handle: shaped?.normalized?.handle || null
+              };
+              ytRes = await enrichYouTubeForContact(shaped.more_info, persistCtx);
+            } catch (e) {
+              ytRes = { saved: false, message: e?.message || 'YouTube enrichment failed.' };
+            }
+
             if (dbRes.outcome === 'saved') {
-              return { has_captcha: false, platform, more_info: shaped.more_info, db: { saved: true, id: dbRes.id } };
+              return {
+                has_captcha: false,
+                platform,
+                more_info: shaped.more_info,
+                db: { saved: true, id: dbRes.id },
+                youtube: ytRes?.youtube || null,
+                youtubeSaved: !!ytRes?.saved,
+                youtubeMessage: ytRes?.message || null
+              };
             } else {
-              return { error: dbRes.message, has_captcha: false, platform, more_info: shaped.more_info, normalized: shaped.normalized, details: dbRes };
+              return {
+                error: dbRes.message,
+                has_captcha: false,
+                platform,
+                more_info: shaped.more_info,
+                normalized: shaped.normalized,
+                details: dbRes,
+                youtube: ytRes?.youtube || null,
+                youtubeSaved: !!ytRes?.saved,
+                youtubeMessage: ytRes?.message || null
+              };
             }
           } catch (e) {
             return { error: e?.message || 'Failed to process this image path.' };
@@ -497,6 +723,7 @@ async function extractEmailsAndHandlesBatch(req, res) {
     return res.status(400).json({ status: 'error', message: err?.message || 'Batch processing failed.' });
   }
 }
+
 
 // ---------- POST /email/all (single search; returns only email, handle, platform) ----------
 async function getAllEmailContacts(req, res) {
@@ -924,7 +1151,6 @@ async function getEmployeeOverviewAdmin(req, res) {
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch admin employee overview.' });
   }
 }
-
 
 module.exports = {
   extractEmailsAndHandlesBatch,
