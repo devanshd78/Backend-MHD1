@@ -1166,14 +1166,14 @@ async function getEmployeeOverviewAdmin(req, res) {
           handle: 1,
           platform: 1,
           createdAt: 1,
-          youtube: 1,             // <--- include YouTube subdoc
+          youtube: 1,             // include full YouTube subdoc
           _id: 0
         })
         .sort({ createdAt: -1 }) // newest first
         .lean();
     }
 
-    // Helper: keep YouTube payload compact for admin view
+    // Helper: include description + categories for admin view
     const summarizeYouTube = (yt) => {
       if (!yt) return undefined;
       return {
@@ -1186,6 +1186,9 @@ async function getEmployeeOverviewAdmin(req, res) {
         subscriberCount: yt.subscriberCount ?? null,
         videoCount: yt.videoCount ?? null,
         viewCount: yt.viewCount ?? null,
+        description: yt.description || null, // <--- added
+        topicCategories: Array.isArray(yt.topicCategories) ? yt.topicCategories : [], // <--- added
+        topicCategoryLabels: Array.isArray(yt.topicCategoryLabels) ? yt.topicCategoryLabels : [], // <--- added
         fetchedAt: yt.fetchedAt || null
       };
     };
@@ -1208,7 +1211,7 @@ async function getEmployeeOverviewAdmin(req, res) {
           handle: row.handle,
           platform: row.platform,
           createdAt: row.createdAt,
-          youtube: summarizeYouTube(row.youtube)  // <--- add YouTube summary per contact
+          youtube: summarizeYouTube(row.youtube)  // includes desc + categories
         }));
         contactsByUser.set(uid, limited);
       }
@@ -1258,6 +1261,7 @@ async function getEmployeeOverviewAdmin(req, res) {
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch admin employee overview.' });
   }
 }
+
 
 
 module.exports = {
