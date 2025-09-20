@@ -730,9 +730,13 @@ async function getAllEmailContacts(req, res) {
   try {
     const body = req.body || {};
 
+    // --- tiny local fallback in case escapeRegex isn't in scope ---
+    const _escapeRegex = (typeof escapeRegex === 'function')
+      ? escapeRegex
+      : (str = '') => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
     // --- Pagination (50/page default) ---
     const page = Math.max(1, parseInt(body.page ?? '1', 10));
-    // hard-cap to 50 per your request (change Math.min(50, ...) to Math.min(200, ...) if needed)
     const limit = Math.min(50, Math.max(1, parseInt(body.limit ?? '50', 10)));
 
     // --- Filters ---
@@ -744,10 +748,49 @@ async function getAllEmailContacts(req, res) {
     const exportAll = String(body.exportAll ?? 'false').toLowerCase() === 'true';
 
     // Which fields to export (and also return for JSON list)
-    const defaultFields = ['email', 'handle', 'platform', 'userId', 'createdAt'];
-    const fields = Array.isArray(body.fields) && body.fields.length
-      ? body.fields.filter(f => defaultFields.includes(f))
-      : defaultFields;
+    // Add 'youtube' to the default visible fields
+    const defaultFields = ['email', 'handle', 'platform', 'userId', 'createdAt', 'youtube'];
+
+    // Allow explicit dot-path selection for YouTube subfields
+    const YT_ALLOWED_DOT_FIELDS = [
+      'youtube.channelId',
+      'youtube.title',
+      'youtube.handle',
+      'youtube.urlByHandle',
+      'youtube.urlById',
+      'youtube.description',
+      'youtube.country',
+      'youtube.subscriberCount',
+      'youtube.videoCount',
+      'youtube.viewCount',
+      'youtube.topicCategories',
+      'youtube.topicCategoryLabels',
+      'youtube.fetchedAt'
+    ];
+
+    // When user simply asks for "youtube", expand to these for CSV/XLSX
+    const YT_EXPORT_DEFAULTS = [
+      'youtube.channelId',
+      'youtube.title',
+      'youtube.handle',
+      'youtube.urlByHandle',
+      'youtube.urlById',
+      'youtube.country',
+      'youtube.subscriberCount',
+      'youtube.videoCount',
+      'youtube.viewCount',
+      'youtube.fetchedAt'
+    ];
+
+    const allowed = new Set([...defaultFields, ...YT_ALLOWED_DOT_FIELDS]);
+
+    // Parse requested fields
+    let fields = Array.isArray(body.fields) && body.fields.length
+      ? body.fields.filter(f => allowed.has(f))
+      : defaultFields.slice();
+
+    // If user passed only invalid fields, fall back to default
+    if (!fields.length) fields = defaultFields.slice();
 
     // --- Query ---
     const query = {};
@@ -757,8 +800,8 @@ async function getAllEmailContacts(req, res) {
       const needleRaw = search;
       const needleNoAt = search.startsWith('@') ? search.slice(1) : search;
 
-      const rxRaw = escapeRegex(needleRaw);
-      const rxNoAt = escapeRegex(needleNoAt);
+      const rxRaw = _escapeRegex(needleRaw);
+      const rxNoAt = _escapeRegex(needleNoAt);
 
       query.$or = [
         { email: { $regex: rxNoAt, $options: 'i' } },
@@ -767,8 +810,17 @@ async function getAllEmailContacts(req, res) {
       ];
     }
 
-    // --- Common selects ---
-    const projection = fields.reduce((acc, f) => (acc[f] = 1, acc), { _id: 0 });
+    // --- Projection (include youtube whenever needed) ---
+    const projection = { _id: 0 };
+    const needsYouTube =
+      fields.includes('youtube') || fields.some(f => f.startsWith('youtube.'));
+    for (const f of fields) {
+      if (f === 'youtube' || f.startsWith('youtube.')) {
+        projection.youtube = 1; // select whole subdocument (simpler & future-proof)
+      } else {
+        projection[f] = 1;
+      }
+    }
 
     // If exporting ALL, pull more rows (set a safety cap)
     const EXPORT_CAP = 100_000;
@@ -776,20 +828,42 @@ async function getAllEmailContacts(req, res) {
     // --- Count for pagination / export metadata ---
     const total = await EmailContact.countDocuments(query);
 
-    // --- Export CSV/XLSX path ---
+    // Helper to get deep value from doc (for export flattening)
+    const getDeep = (obj, path) => {
+      try {
+        return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+      } catch {
+        return undefined;
+      }
+    };
+    const asCell = (v) => {
+      if (v == null) return '';
+      if (Array.isArray(v)) return v.join('; ');
+      if (v instanceof Date) return v.toISOString();
+      return String(v);
+    };
+
+    // If exporting, prepare rows
     if (exportType === 'csv' || exportType === 'xlsx') {
-      // Determine slice to export
+      // Decide actual export fields: expand 'youtube' to defaults if no specific youtube.* present
+      const hasYoutubeWildcard = fields.includes('youtube');
+      const hasYoutubeDot = fields.some(f => f.startsWith('youtube.'));
+      const ytExpanded = hasYoutubeWildcard && !hasYoutubeDot ? YT_EXPORT_DEFAULTS : fields.filter(f => f.startsWith('youtube.'));
+
+      // Keep non-youtube fields in order, then append explicit/expanded youtube columns
+      const nonYTFields = fields.filter(f => f !== 'youtube' && !f.startsWith('youtube.'));
+      const exportFields = [...nonYTFields, ...ytExpanded];
+
+      // Fetch docs
       let docs = [];
       if (exportAll) {
         const toFetch = Math.min(total, EXPORT_CAP);
-        // fetch all matches up to cap
         docs = await EmailContact.find(query)
           .sort({ createdAt: -1 })
           .limit(toFetch)
           .select(projection)
           .lean();
       } else {
-        // export current page only
         docs = await EmailContact.find(query)
           .sort({ createdAt: -1 })
           .skip((page - 1) * limit)
@@ -798,13 +872,16 @@ async function getAllEmailContacts(req, res) {
           .lean();
       }
 
-      // Normalize rows (ensure field order)
+      // Normalize rows (ensure field order; flatten youtube)
       const rows = docs.map(d => {
         const out = {};
-        for (const f of fields) out[f] = d[f] ?? '';
+        for (const f of exportFields) {
+          out[f] = asCell(f.startsWith('youtube.') ? getDeep(d, f) : d[f]);
+        }
         return out;
       });
 
+      // filename stamp
       const ts = new Date();
       const y = String(ts.getFullYear());
       const m = String(ts.getMonth() + 1).padStart(2, '0');
@@ -818,12 +895,10 @@ async function getAllEmailContacts(req, res) {
         // Build CSV manually (no extra deps)
         const esc = (v) => {
           const s = String(v ?? '');
-          // quote if contains delimiter, quote, or newline
-          if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-          return s;
+          return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
         };
-        const header = fields.map(esc).join(',');
-        const lines = rows.map(r => fields.map(f => esc(r[f])).join(','));
+        const header = exportFields.map(esc).join(',');
+        const lines = rows.map(r => exportFields.map(f => esc(r[f])).join(','));
         const csv = [header, ...lines].join('\n');
 
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -832,12 +907,11 @@ async function getAllEmailContacts(req, res) {
       }
 
       if (exportType === 'xlsx') {
-        // Use exceljs (install: npm i exceljs)
-        const ExcelJS = require('exceljs');
+        const ExcelJS = require('exceljs'); // npm i exceljs
         const wb = new ExcelJS.Workbook();
         const ws = wb.addWorksheet('Contacts');
 
-        ws.columns = fields.map(f => ({ header: f, key: f, width: Math.max(10, f.length + 2) }));
+        ws.columns = exportFields.map(f => ({ header: f, key: f, width: Math.max(12, f.length + 2) }));
         ws.addRows(rows);
 
         const buffer = await wb.xlsx.writeBuffer();
@@ -855,9 +929,11 @@ async function getAllEmailContacts(req, res) {
       .select(projection)
       .lean();
 
+    // Result: keep structure as-is; youtube stays nested if selected
+    // (By default, 'youtube' is included via defaultFields.)
     return res.json({
       page,
-      limit,                     // 50 default per page
+      limit,
       total,
       hasNext: page * limit < total,
       data: items
@@ -1026,6 +1102,11 @@ async function getEmployeeOverviewAdmin(req, res) {
   try {
     const body = req.body || {};
 
+    // Local fallback if escapeRegex isn't globally available
+    const _escapeRegex = (typeof escapeRegex === 'function')
+      ? escapeRegex
+      : (str = '') => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
     // Search by employee name (empty = all)
     const search = typeof body.search === 'string' ? body.search.trim() : '';
 
@@ -1039,7 +1120,7 @@ async function getEmployeeOverviewAdmin(req, res) {
     // 1) Find employees by name (with pagination)
     const employeeQuery = {};
     if (search) {
-      employeeQuery.name = { $regex: escapeRegex(search), $options: 'i' };
+      employeeQuery.name = { $regex: _escapeRegex(search), $options: 'i' };
     }
 
     const [totalEmployees, employees] = await Promise.all([
@@ -1079,13 +1160,38 @@ async function getEmployeeOverviewAdmin(req, res) {
     let contacts = [];
     if (collectorUserIds.length) {
       contacts = await EmailContact.find({ userId: { $in: collectorUserIds } })
-        .select({ userId: 1, email: 1, handle: 1, platform: 1, createdAt: 1, _id: 0 })
+        .select({
+          userId: 1,
+          email: 1,
+          handle: 1,
+          platform: 1,
+          createdAt: 1,
+          youtube: 1,             // <--- include YouTube subdoc
+          _id: 0
+        })
         .sort({ createdAt: -1 }) // newest first
         .lean();
     }
 
+    // Helper: keep YouTube payload compact for admin view
+    const summarizeYouTube = (yt) => {
+      if (!yt) return undefined;
+      return {
+        channelId: yt.channelId || null,
+        title: yt.title || null,
+        handle: yt.handle || null,
+        urlByHandle: yt.urlByHandle || null,
+        urlById: yt.urlById || null,
+        country: yt.country || null,
+        subscriberCount: yt.subscriberCount ?? null,
+        videoCount: yt.videoCount ?? null,
+        viewCount: yt.viewCount ?? null,
+        fetchedAt: yt.fetchedAt || null
+      };
+    };
+
     // 4) Group contacts by collector (userId), keep total + limited slice
-    const contactsByUser = new Map();     // userId -> limited items
+    const contactsByUser = new Map();   // userId -> limited items
     const countsByUser = new Map();     // userId -> total count
     if (contacts.length) {
       const grouped = contacts.reduce((m, c) => {
@@ -1101,7 +1207,8 @@ async function getEmployeeOverviewAdmin(req, res) {
           email: row.email,
           handle: row.handle,
           platform: row.platform,
-          createdAt: row.createdAt
+          createdAt: row.createdAt,
+          youtube: summarizeYouTube(row.youtube)  // <--- add YouTube summary per contact
         }));
         contactsByUser.set(uid, limited);
       }
@@ -1134,8 +1241,8 @@ async function getEmployeeOverviewAdmin(req, res) {
         collectors
       };
     })
-      // remove employees with no visible collectors
-      .filter(empBlock => empBlock.collectors && empBlock.collectors.length > 0);
+    // remove employees with no visible collectors
+    .filter(empBlock => empBlock.collectors && empBlock.collectors.length > 0);
 
     return res.json({
       page,
@@ -1151,6 +1258,7 @@ async function getEmployeeOverviewAdmin(req, res) {
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch admin employee overview.' });
   }
 }
+
 
 module.exports = {
   extractEmailsAndHandlesBatch,
