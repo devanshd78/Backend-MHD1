@@ -21,46 +21,46 @@ const httpAgent = new Agent({
 const USE_SHARP = process.env.USE_SHARP !== '0';
 let sharp = null;
 if (USE_SHARP) {
-  try { sharp = require('sharp'); } catch {}
+  try { sharp = require('sharp'); } catch { }
 }
 
 // ---------- Optional JSON repair ----------
 let jsonrepairFn = null;
-try { jsonrepairFn = require('jsonrepair').jsonrepair || require('jsonrepair'); } catch {}
+try { jsonrepairFn = require('jsonrepair').jsonrepair || require('jsonrepair'); } catch { }
 
 // ---------- Models & perf knobs ----------
-const MODEL_PRIMARY   = process.env.OPENAI_VISION_MODEL     || process.env.OPENAI_VISION_PRIMARY  || 'gpt-4o-mini';
-const MODEL_FALLBACK  = process.env.OPENAI_VISION_FALLBACK  || 'gpt-4o';
-const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
+const MODEL_PRIMARY = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_VISION_PRIMARY || 'gpt-4o-mini';
+const MODEL_FALLBACK = process.env.OPENAI_VISION_FALLBACK || 'gpt-4o';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-const PRIMARY_TOKENS  = Number(process.env.PRIMARY_TOKENS || 320);
-const RETRY_TOKENS    = Number(process.env.RETRY_TOKENS   || 900);
+const PRIMARY_TOKENS = Number(process.env.PRIMARY_TOKENS || 320);
+const RETRY_TOKENS = Number(process.env.RETRY_TOKENS || 900);
 
-const TEMP            = Number(process.env.TEMPERATURE || 0);
-const TIMEOUT_MS      = Number(process.env.OPENAI_TIMEOUT_MS || 30000);
-const MAX_IMG_W       = Number(process.env.MAX_IMAGE_WIDTH || 1280);
-const MAX_IMG_H       = Number(process.env.MAX_IMAGE_HEIGHT || 1280);
-const IMAGE_DETAIL    = (process.env.IMAGE_DETAIL || 'low'); // 'low'|'auto'
-const ENABLE_CACHE    = process.env.ENABLE_CACHE !== '0';
-const CACHE_TTL_MS    = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
+const TEMP = Number(process.env.TEMPERATURE || 0);
+const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 30000);
+const MAX_IMG_W = Number(process.env.MAX_IMAGE_WIDTH || 1280);
+const MAX_IMG_H = Number(process.env.MAX_IMAGE_HEIGHT || 1280);
+const IMAGE_DETAIL = (process.env.IMAGE_DETAIL || 'low'); // 'low'|'auto'
+const ENABLE_CACHE = process.env.ENABLE_CACHE !== '0';
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
 const AGGRESSIVE_RACE = process.env.AGGRESSIVE_RACE === '1';
 const ENABLE_DARK_ENHANCE = process.env.ENABLE_DARK_ENHANCE !== '0'; // default ON
 
 // ---------- Regex ----------
-const EMAIL_RX       = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+const EMAIL_RX = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
 const HANDLE_IN_TEXT = /@[A-Za-z0-9._\-]+/g;
-const YT_HANDLE_RX   = /\/@([A-Za-z0-9._\-]+)/i;
-const IG_RX          = /(?:instagram\.com|ig\.me)\/([A-Za-z0-9._\-]+)/i;
-const TW_RX          = /(?:twitter\.com|x\.com)\/([A-Za-z0-9._\-]+)/i;
+const YT_HANDLE_RX = /\/@([A-Za-z0-9._\-]+)/i;
+const IG_RX = /(?:instagram\.com|ig\.me)\/([A-Za-z0-9._\-]+)/i;
+const TW_RX = /(?:twitter\.com|x\.com)\/([A-Za-z0-9._\-]+)/i;
 
 // ---------- JSON schema (More-info only) ----------
 const SECTION_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
-    emails:  { type: 'array', items: { type: 'string' } },
+    emails: { type: 'array', items: { type: 'string' } },
     handles: { type: 'array', items: { type: 'string' } },
-    fields:  {
+    fields: {
       type: 'array',
       items: {
         type: 'object',
@@ -78,9 +78,9 @@ const RESPONSE_SCHEMA = {
     type: 'object',
     additionalProperties: false,
     properties: {
-      has_captcha:      { type: 'boolean' },
+      has_captcha: { type: 'boolean' },
       rejection_reason: { type: ['string', 'null'] },
-      more_info:        SECTION_SCHEMA
+      more_info: SECTION_SCHEMA
     },
     required: ['has_captcha', 'rejection_reason', 'more_info']
   }
@@ -97,12 +97,12 @@ const USER_INSTRUCTIONS =
 
 // ---------- Helpers ----------
 const PLATFORM_MAP = new Map([
-  ['youtube','youtube'], ['yt','youtube'],
-  ['instagram','instagram'], ['ig','instagram'],
-  ['twitter','twitter'], ['x','twitter'],
-  ['tiktok','tiktok'], ['tt','tiktok'],
-  ['facebook','facebook'], ['fb','facebook'],
-  ['other','other']
+  ['youtube', 'youtube'], ['yt', 'youtube'],
+  ['instagram', 'instagram'], ['ig', 'instagram'],
+  ['twitter', 'twitter'], ['x', 'twitter'],
+  ['tiktok', 'tiktok'], ['tt', 'tiktok'],
+  ['facebook', 'facebook'], ['fb', 'facebook'],
+  ['other', 'other']
 ]);
 function normalizePlatform(p) {
   if (!p) return null;
@@ -116,7 +116,7 @@ function escapeRegex(str = '') {
 
 function guessMime(p) {
   const ext = (p && path.extname(p).toLowerCase()) || '';
-  if (ext === '.png')  return 'image/png';
+  if (ext === '.png') return 'image/png';
   if (ext === '.webp') return 'image/webp';
   return 'image/jpeg';
 }
@@ -155,7 +155,7 @@ async function enhanceIfDark(buffer) {
     const img = sharp(buffer, { failOn: 'none' });
     const stats = await img.stats();
     const means = stats.channels.slice(0, 3).map(c => c.mean || 0);
-    const avg = means.reduce((a,b)=>a+b,0)/(means.length||1);
+    const avg = means.reduce((a, b) => a + b, 0) / (means.length || 1);
     if (avg < 85) {
       return await sharp(buffer).modulate({ brightness: 1.35, saturation: 1.08 }).gamma(1.05).toBuffer();
     }
@@ -177,14 +177,14 @@ async function preprocessImage(buffer, mime) {
 }
 async function imagePartFromBuffer(buffer, mimetype) {
   const mime = mimetype || 'image/jpeg';
-  const buf  = await preprocessImage(buffer, mime);
+  const buf = await preprocessImage(buffer, mime);
   return { type: 'input_image', image_url: bufferToDataUrl(buf, mime) };
 }
 async function imagePartFromPath(absPath) {
   if (!fs.existsSync(absPath)) throw new Error(`File not found: ${absPath}`);
   const mime = guessMime(absPath);
   const buf0 = fs.readFileSync(absPath);
-  const buf  = await preprocessImage(buf0, mime);
+  const buf = await preprocessImage(buf0, mime);
   return { type: 'input_image', image_url: bufferToDataUrl(buf, mime) };
 }
 function imagePartFromUrl(url) {
@@ -231,7 +231,7 @@ function makeBody(imagePart, model, maxTokens) {
     model,
     input: [
       { role: 'system', content: [{ type: 'input_text', text: SYSTEM_MSG }] },
-      { role: 'user',   content: [{ type: 'input_text', text: USER_INSTRUCTIONS }, imagePart] }
+      { role: 'user', content: [{ type: 'input_text', text: USER_INSTRUCTIONS }, imagePart] }
     ],
     text: { format: { type: 'json_schema', name: 'YouTubeAboutExtraction', schema: RESPONSE_SCHEMA.schema, strict: true } },
     temperature: TEMP,
@@ -273,8 +273,10 @@ async function callVisionFast(imagePart) {
     return winner;
   } else {
     try { return await tryOnce(imagePart, MODEL_PRIMARY, PRIMARY_TOKENS); }
-    catch { try { return await tryOnce(imagePart, MODEL_PRIMARY, RETRY_TOKENS); }
-      catch { return await tryOnce(imagePart, MODEL_FALLBACK, RETRY_TOKENS); } }
+    catch {
+      try { return await tryOnce(imagePart, MODEL_PRIMARY, RETRY_TOKENS); }
+      catch { return await tryOnce(imagePart, MODEL_FALLBACK, RETRY_TOKENS); }
+    }
   }
 }
 
@@ -318,13 +320,13 @@ function shapeForClient(parsed) {
   const has_captcha = !!parsed?.has_captcha;
   const mi = parsed?.more_info || {};
   const cleaned = {
-    emails:  uniqueSorted(mi.emails || []),
+    emails: uniqueSorted(mi.emails || []),
     handles: uniqueSorted(mi.handles || []),
     YouTube: extractYouTube(mi.fields || [], mi.raw_text || '') || null,
     raw_text: mi.raw_text || '',
     fields: mi.fields || []
   };
-  const email  = firstValidEmail(cleaned.emails, cleaned.raw_text);
+  const email = firstValidEmail(cleaned.emails, cleaned.raw_text);
   const handle = deriveHandleFromMi({ ...cleaned });
   return {
     has_captcha,
@@ -335,7 +337,7 @@ function shapeForClient(parsed) {
 
 // ---------- Persistence (returns outcome so caller can mark errors) ----------
 async function persistMoreInfo(normalized, platform, userId) {
-  const email  = normalized?.email  ? normalized.email.toLowerCase().trim()  : null;
+  const email = normalized?.email ? normalized.email.toLowerCase().trim() : null;
   const handle = normalized?.handle ? normalized.handle.toLowerCase().trim() : null;
 
   if (!userId || typeof userId !== 'string' || !userId.trim()) {
@@ -366,7 +368,7 @@ async function persistMoreInfo(normalized, platform, userId) {
     }
     return { outcome: 'duplicate', message: 'Email and handle already exist (in different records).', emailId: byEmail._id, handleId: byHandle._id, emailUserId: byEmail.userId, handleUserId: byHandle.userId };
   }
-  if (byEmail)  return { outcome: 'duplicate', message: 'Email is already present in the database.', emailId: byEmail._id, emailUserId: byEmail.userId };
+  if (byEmail) return { outcome: 'duplicate', message: 'Email is already present in the database.', emailId: byEmail._id, emailUserId: byEmail.userId };
   if (byHandle) return { outcome: 'duplicate', message: 'User handle is already present in the database.', handleId: byHandle._id, handleUserId: byHandle.userId };
 
   const doc = await EmailContact.create({ email, handle, platform, userId: user.userId });
@@ -502,7 +504,7 @@ async function getAllEmailContacts(req, res) {
     const body = req.body || {};
 
     // --- Pagination (50/page default) ---
-    const page  = Math.max(1, parseInt(body.page ?? '1', 10));
+    const page = Math.max(1, parseInt(body.page ?? '1', 10));
     // hard-cap to 50 per your request (change Math.min(50, ...) to Math.min(200, ...) if needed)
     const limit = Math.min(50, Math.max(1, parseInt(body.limit ?? '50', 10)));
 
@@ -512,7 +514,7 @@ async function getAllEmailContacts(req, res) {
 
     // --- Export knobs ---
     const exportType = (body.exportType || '').toLowerCase();         // 'csv' | 'xlsx' | ''
-    const exportAll  = String(body.exportAll ?? 'false').toLowerCase() === 'true';
+    const exportAll = String(body.exportAll ?? 'false').toLowerCase() === 'true';
 
     // Which fields to export (and also return for JSON list)
     const defaultFields = ['email', 'handle', 'platform', 'userId', 'createdAt'];
@@ -525,15 +527,15 @@ async function getAllEmailContacts(req, res) {
     if (userId) query.userId = userId;
 
     if (search) {
-      const needleRaw  = search;
+      const needleRaw = search;
       const needleNoAt = search.startsWith('@') ? search.slice(1) : search;
 
-      const rxRaw  = escapeRegex(needleRaw);
+      const rxRaw = escapeRegex(needleRaw);
       const rxNoAt = escapeRegex(needleNoAt);
 
       query.$or = [
-        { email:    { $regex: rxNoAt, $options: 'i' } },
-        { handle:   { $regex: rxRaw.startsWith('@') ? rxRaw : `@${rxNoAt}`, $options: 'i' } },
+        { email: { $regex: rxNoAt, $options: 'i' } },
+        { handle: { $regex: rxRaw.startsWith('@') ? rxRaw : `@${rxNoAt}`, $options: 'i' } },
         { platform: { $regex: rxNoAt, $options: 'i' } }
       ];
     }
@@ -647,22 +649,22 @@ async function getContactsByUser(req, res) {
     const userId = (body.userId || '').trim();
     if (!userId) return res.status(400).json({ status: 'error', message: 'userId is required.' });
 
-    const page  = Math.max(1, parseInt(body.page ?? '1', 10));
+    const page = Math.max(1, parseInt(body.page ?? '1', 10));
     const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? '50', 10)));
     const search = typeof body.search === 'string' ? body.search.trim() : '';
 
     const query = { userId };
 
     if (search) {
-      const needleRaw  = search;
+      const needleRaw = search;
       const needleNoAt = search.startsWith('@') ? search.slice(1) : search;
 
-      const rxRaw  = escapeRegex(needleRaw);
+      const rxRaw = escapeRegex(needleRaw);
       const rxNoAt = escapeRegex(needleNoAt);
 
       query.$or = [
-        { email:    { $regex: rxNoAt, $options: 'i' } },
-        { handle:   { $regex: rxRaw.startsWith('@') ? rxRaw : `@${rxNoAt}`, $options: 'i' } },
+        { email: { $regex: rxNoAt, $options: 'i' } },
+        { handle: { $regex: rxRaw.startsWith('@') ? rxRaw : `@${rxNoAt}`, $options: 'i' } },
         { platform: { $regex: rxNoAt, $options: 'i' } }
       ];
     }
@@ -701,7 +703,7 @@ async function getUserSummariesByEmployee(req, res) {
     }
 
     // Pagination for the users list
-    const page  = Math.max(1, parseInt(body.page ?? '1', 10));
+    const page = Math.max(1, parseInt(body.page ?? '1', 10));
     const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? '50', 10)));
 
     // Optional username search (User.name)
@@ -759,10 +761,10 @@ async function getUserSummariesByEmployee(req, res) {
       // compute first/last based on the full (unlimited) set if needed
       // here we only have the limited list; still provide min/max from that list
       let firstSavedAt = null;
-      let lastSavedAt  = null;
+      let lastSavedAt = null;
       if (list.length) {
         // list is newest-first sorted
-        lastSavedAt  = list[list.length - 1].createdAt || null; // oldest in the limited slice
+        lastSavedAt = list[list.length - 1].createdAt || null; // oldest in the limited slice
         firstSavedAt = list[0].createdAt || null;               // newest in the limited slice
       }
 
@@ -801,7 +803,7 @@ async function getEmployeeOverviewAdmin(req, res) {
     const search = typeof body.search === 'string' ? body.search.trim() : '';
 
     // Pagination over employees
-    const page  = Math.max(1, parseInt(body.page ?? '1', 10));
+    const page = Math.max(1, parseInt(body.page ?? '1', 10));
     const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? '50', 10)));
 
     // Per-collector cap
@@ -857,7 +859,7 @@ async function getEmployeeOverviewAdmin(req, res) {
 
     // 4) Group contacts by collector (userId), keep total + limited slice
     const contactsByUser = new Map();     // userId -> limited items
-    const countsByUser   = new Map();     // userId -> total count
+    const countsByUser = new Map();     // userId -> total count
     if (contacts.length) {
       const grouped = contacts.reduce((m, c) => {
         const list = m.get(c.userId) || [];
@@ -905,8 +907,8 @@ async function getEmployeeOverviewAdmin(req, res) {
         collectors
       };
     })
-    // remove employees with no visible collectors
-    .filter(empBlock => empBlock.collectors && empBlock.collectors.length > 0);
+      // remove employees with no visible collectors
+      .filter(empBlock => empBlock.collectors && empBlock.collectors.length > 0);
 
     return res.json({
       page,
@@ -925,12 +927,10 @@ async function getEmployeeOverviewAdmin(req, res) {
 
 
 module.exports = {
-  // existing
   extractEmailsAndHandlesBatch,
   getAllEmailContacts,
 
-  // new
-  getContactsByUser,           
+  getContactsByUser,
   getUserSummariesByEmployee,
   getEmployeeOverviewAdmin
 };
