@@ -2,7 +2,7 @@
 'use strict';
 
 const asyncHandler = require('express-async-handler');
-const Missing = require('../models/missing');
+const Missing = require('../models/Missing');
 
 const HANDLE_RX = /^@[A-Za-z0-9._\-]+$/;
 const PLATFORM_MAP = new Map([
