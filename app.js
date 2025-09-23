@@ -1,4 +1,3 @@
-// app.js
 require('dotenv').config();
 
 const express  = require('express');
@@ -9,19 +8,39 @@ const employeeRoutes = require('./routes/employee');
 const adminRoutes    = require('./routes/admin');
 const userRoutes     = require('./routes/user');
 const entryRoutes    = require('./routes/entry');
-const emailRoutes         = require('./routes/emailRoutes');
-const missingRoutes       = require('./routes/missingRoutes');
+const emailRoutes    = require('./routes/emailRoutes');
+const missingRoutes  = require('./routes/missingRoutes');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
-// ─── MIDDLEWARE ──────────────────────────────────────────────────────────────
+// ─── CORS CONFIG ─────────────────────────────────────────────────────────────
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+// If env not set, fallback to defaults
+if (!allowedOrigins.length) {
+  allowedOrigins.push('https://mhd.sharemitra.com', 'https://collabglam.com', 'http://localhost:3000');
+}
+
+console.log('✅ Allowed origins:', allowedOrigins);
+
 app.use(cors({
-  origin: process.env.FRONTEND_ORIGIN || ['https://mhd.sharemitra.com','https://collabglam.com'],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (e.g. Postman, mobile apps)
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error(`❌ Not allowed by CORS: ${origin}`));
+  },
   credentials: true,
 }));
 
-// Body parsers
+// ─── BODY PARSERS ────────────────────────────────────────────────────────────
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -31,7 +50,7 @@ app.use('/admin',    adminRoutes);
 app.use('/user',     userRoutes);
 app.use('/entry',    entryRoutes);
 app.use('/email',    emailRoutes);
-app.use('/missing',      missingRoutes);  // missing routes under /api prefix
+app.use('/missing',  missingRoutes);
 
 // ─── DB + SERVER START ───────────────────────────────────────────────────────
 mongoose
