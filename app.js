@@ -16,9 +16,8 @@ const app  = express();
 const PORT = process.env.PORT || 5000;
 
 // ─── MIDDLEWARE ──────────────────────────────────────────────────────────────
-// CORS (allow credentials)
 app.use(cors({
-  origin:      process.env.FRONTEND_ORIGIN || 'https://mhd.sharemitra.com',
+  origin: process.env.FRONTEND_ORIGIN || ['https://mhd.sharemitra.com','https://collabglam.com'],
   credentials: true,
 }));
 
