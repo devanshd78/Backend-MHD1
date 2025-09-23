@@ -37,7 +37,7 @@ function capToFive(req, _res, next) {
 
 router.post('/user/extract', acceptAnyUpload, capToFive, extractEmailsAndHandlesBatch);
 
-router.post('/getbyuserId', getContactsByUser);
+router.post('/by-user', getContactsByUser);
 router.post('/getByemployeeId', getUserSummariesByEmployee);
 
 router.post('/collabglam/all', getAllEmailContacts);
