@@ -8,6 +8,7 @@ const {
     getUsersByEmployeeId,
     listLinksForUser,
     updateUser,
+    listActiveEmailTasks
 } = require('../controllers/userController');
 
 // Register endpoint
@@ -20,5 +21,6 @@ router.get('/getbyuserId/:userId', getUserById);
 router.get('/getbyemployeeid/:employeeId', getUsersByEmployeeId);
 router.post('/link', listLinksForUser);
 router.post('/update', updateUser);
+router.get('/emailtasks', listActiveEmailTasks);
 
 module.exports = router;

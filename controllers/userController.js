@@ -4,6 +4,17 @@ const User     = require('../models/User');
 const Employee = require('../models/Employee');
 const Link     = require('../models/Link');
 const Entry    = require('../models/Entry');      // ⬅️ new – for look-ups only
+const EmailTask = require('../models/EmailTask');
+
+const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
+const badRequest = (res, msg) => res.status(400).json({ error: msg });
+
+function parsePageLimit(page = 1, limit = 20, maxLimit = 100) {
+  const p = Math.max(1, Number(page) || 1);
+  const l = Math.min(maxLimit, Math.max(1, Number(limit) || 20));
+  const skip = (p - 1) * l;
+  return { p, l, skip };
+}
 
 /* ------------------------------------------------------------------ */
 /*  auth – register / login                                           */
@@ -197,3 +208,37 @@ exports.updateUser = async (req, res) => {
   }
 };
 /* ------------------------------------------------------------------ */
+
+exports.listActiveEmailTasks = asyncHandler(async (req, res) => {
+  const { page = 1, limit = 20 } = req.query;
+  const { p, l, skip } = parsePageLimit(page, limit);
+
+  const now = new Date();
+  const baseFilter = { expiresAt: { $gt: now } };
+
+  const [rows, total] = await Promise.all([
+    EmailTask.find(baseFilter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(l)
+      .select(
+        'createdBy platform targetUser targetPerEmployee amountPerPerson maxEmails expireIn expiresAt createdAt'
+      )
+      .lean(),
+    EmailTask.countDocuments(baseFilter)
+  ]);
+
+  // Mark status + newest item on the very first page
+  const tasks = rows.map((t, idx) => ({
+    ...t,
+    status: 'active',
+    isLatest: skip === 0 && idx === 0
+  }));
+
+  res.json({
+    tasks,
+    total,
+    page: p,
+    pages: Math.ceil(total / l)
+  });
+});

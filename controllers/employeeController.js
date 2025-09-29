@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcrypt');
 const Employee = require('../models/Employee');
 const Link = require('../models/Link');
+const EmailTask = require('../models/EmailTask');
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
@@ -82,4 +83,22 @@ exports.getLink = asyncHandler(async (req, res) => {
   const link = await Link.findById(req.params.linkId);
   if (!link) return notFound(res, 'Link not found');
   res.json(link);
+});
+
+exports.listEmailTasks = asyncHandler(async (_req, res) => {
+  const tasks = await EmailTask.find().lean();
+  if (tasks.length === 0) return res.json([]);
+
+  // find the newest by createdAt
+  const latestId = tasks.reduce((a, b) =>
+    a.createdAt > b.createdAt ? a : b
+  )._id.toString();
+
+  const annotated = tasks.map(t => ({
+    ...t,
+    isLatest: t._id.toString() === latestId
+  }));
+
+  // keep response consistent with your link listing (newest first)
+  res.json(annotated.reverse());
 });
