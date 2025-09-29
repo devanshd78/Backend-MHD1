@@ -958,3 +958,94 @@ exports.createEmailTask = asyncHandler(async (req, res) => {
     task
   });
 });
+
+
+
+
+exports.getEmailTaskList = asyncHandler(async (req, res) => {
+  const {
+    page = 1,
+    limit = 20,
+    sortBy = 'createdAt',
+    sortOrder = 'desc',
+    search,
+    adminId,
+    platform,
+    active
+  } = req.body;
+
+  const { p, l, skip } = parsePageLimit(page, limit);
+  const sort = parseSort(sortBy, sortOrder);
+
+  const filter = {};
+
+  // exact creator filter
+  if (adminId) filter.createdBy = adminId;
+
+  // platform contains filter (case-insensitive)
+  if (platform) {
+    const esc = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    filter.platform = { $regex: esc(platform), $options: 'i' };
+  }
+
+  // active/expired filter using expiresAt computed by schema
+  if (typeof active === 'boolean') {
+    const now = new Date();
+    filter.expiresAt = active ? { $gt: now } : { $lte: now };
+  }
+
+  // generic search across platform, createdBy, _id, and numeric equal matches
+  if (search != null && String(search).trim() !== '') {
+    const term = String(search).trim();
+    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const or = [
+      { platform:  { $regex: esc(term), $options: 'i' } },
+      { createdBy: { $regex: esc(term), $options: 'i' } }
+    ];
+
+    // attempt _id match
+    try {
+      const { ObjectId } = require('mongodb');
+      if (ObjectId.isValid(term)) {
+        or.push({ _id: new ObjectId(term) });
+      }
+    } catch {}
+
+    // numeric equality on numeric fields
+    const num = Number(term);
+    if (Number.isFinite(num)) {
+      or.push({ targetUser: num });
+      or.push({ targetPerEmployee: num });
+      or.push({ amountPerPerson: num });
+      or.push({ maxEmails: num });
+      or.push({ expireIn: num });
+    }
+
+    filter.$or = or;
+  }
+
+  const [rows, total] = await Promise.all([
+    EmailTask.find(filter)
+      .sort(sort)
+      .skip(skip)
+      .limit(l)
+      .select(
+        'createdBy platform targetUser targetPerEmployee amountPerPerson maxEmails expireIn expiresAt createdAt'
+      )
+      .lean(),
+    EmailTask.countDocuments(filter)
+  ]);
+
+  const now = new Date();
+  const tasks = rows.map(t => ({
+    ...t,
+    status: now < t.expiresAt ? 'active' : 'expired'
+  }));
+
+  res.json({
+    tasks,
+    total,
+    page: p,
+    pages: Math.ceil(total / l)
+  });
+});

@@ -68,5 +68,7 @@ router.post('/byLinkAndEmployee', ctrl.getScreenshotsByLinkAndEmployee);
 
 
 router.post('/emailtasks', ctrl.createEmailTask);
+router.post('/emailtasks/list', ctrl.getEmailTaskList);
+
 
 module.exports = router;
