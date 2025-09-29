@@ -66,4 +66,7 @@ router.post('/ssUser', ctrl.getScreenshotsByUserId);
 router.post('/ssLink', ctrl.getScreenshotsByLinkId);
 router.post('/byLinkAndEmployee', ctrl.getScreenshotsByLinkAndEmployee);
 
+
+router.post('/emailtasks', ctrl.createEmailTask);
+
 module.exports = router;

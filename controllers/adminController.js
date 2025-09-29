@@ -11,6 +11,8 @@ const nodemailer = require('nodemailer');
 const AdminOTP = require('../models/AdminOTP');
 const { default: mongoose } = require('mongoose');
 const { ObjectId } = require('mongodb');
+const EmailTask = require('../models/EmailTask');
+
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
@@ -881,5 +883,78 @@ exports.getScreenshotsByLinkAndEmployee = asyncHandler(async (req, res) => {
     pages: Math.ceil(totalScreenshots / l),
     entries: entriesWithTitle,
     totalEntries: entries.length
+  });
+});
+
+
+exports.createEmailTask = asyncHandler(async (req, res) => {
+  const {
+    adminId,
+    targetUser,
+    targetPerEmployee,
+    platform,
+    amountPerPerson,
+    maxEmails,
+    expireIn
+  } = req.body;
+
+  // presence checks
+  if (
+    !adminId ||
+    targetPerEmployee == null ||
+    !platform ||
+    amountPerPerson == null ||
+    maxEmails == null ||
+    expireIn == null
+  ) {
+    return badRequest(
+      res,
+      'adminId,targetPerEmployee, platform, amountPerPerson, maxEmails, expireIn are required'
+    );
+  }
+
+  // validate adminId exists (same pattern as createLink)
+  if (!(await Admin.exists({ adminId }))) {
+    return badRequest(res, 'Invalid adminId');
+  }
+
+  // numeric coercion + sanity
+  const payload = {
+    createdBy: adminId,
+    platform: String(platform).trim(),
+    targetUser: String(targetUser),
+    targetPerEmployee: Number(targetPerEmployee),
+    amountPerPerson: Number(amountPerPerson),
+    maxEmails: Number(maxEmails),
+    expireIn: Number(expireIn)
+  };
+
+  const nums = [
+    ['targetPerEmployee', payload.targetPerEmployee],
+    ['amountPerPerson', payload.amountPerPerson],
+    ['maxEmails', payload.maxEmails],
+    ['expireIn', payload.expireIn],
+  ];
+
+  for (const [name, val] of nums) {
+    if (!Number.isFinite(val) || val < 0) {
+      return badRequest(res, `Field "${name}" must be a non-negative number`);
+    }
+  }
+  if (payload.expireIn < 1) {
+    return badRequest(res, 'expireIn must be at least 1 hour');
+  }
+
+  const task = await EmailTask.create(payload);
+
+  // echo a minimal success with id + computed expiry for convenience
+  const expireAt = new Date(task.createdAt);
+  expireAt.setHours(expireAt.getHours() + task.expireIn);
+
+  res.json({
+    message: 'Email task created',
+    emailTaskId: task._id,
+    expireAt,
+    task
   });
 });
