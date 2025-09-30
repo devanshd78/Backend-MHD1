@@ -899,7 +899,6 @@ exports.createEmailTask = asyncHandler(async (req, res) => {
     expireIn
   } = req.body;
 
-  // presence checks
   if (
     !adminId ||
     targetPerEmployee == null ||
@@ -914,21 +913,20 @@ exports.createEmailTask = asyncHandler(async (req, res) => {
     );
   }
 
-  // validate adminId exists (same pattern as createLink)
   if (!(await Admin.exists({ adminId }))) {
     return badRequest(res, 'Invalid adminId');
   }
 
-  // numeric coercion + sanity
   const payload = {
     createdBy: adminId,
     platform: String(platform).trim(),
-    targetUser: String(targetUser),
     targetPerEmployee: Number(targetPerEmployee),
     amountPerPerson: Number(amountPerPerson),
     maxEmails: Number(maxEmails),
-    expireIn: Number(expireIn)
+    expireIn: Number(expireIn),
+    status: 'active' // optional (model already defaults to 'active')
   };
+  if (typeof targetUser !== 'undefined') payload.targetUser = String(targetUser);
 
   const nums = [
     ['targetPerEmployee', payload.targetPerEmployee],
@@ -936,7 +934,6 @@ exports.createEmailTask = asyncHandler(async (req, res) => {
     ['maxEmails', payload.maxEmails],
     ['expireIn', payload.expireIn],
   ];
-
   for (const [name, val] of nums) {
     if (!Number.isFinite(val) || val < 0) {
       return badRequest(res, `Field "${name}" must be a non-negative number`);
@@ -948,17 +945,16 @@ exports.createEmailTask = asyncHandler(async (req, res) => {
 
   const task = await EmailTask.create(payload);
 
-  // echo a minimal success with id + computed expiry for convenience
-  const expireAt = new Date(task.createdAt);
-  expireAt.setHours(expireAt.getHours() + task.expireIn);
-
+  // Use the model-computed expiry + include status
   res.json({
     message: 'Email task created',
     emailTaskId: task._id,
-    expireAt,
+    expiresAt: task.expiresAt,
+    status: task.status,
     task
   });
 });
+
 
 
 
