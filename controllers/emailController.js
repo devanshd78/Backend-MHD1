@@ -11,6 +11,8 @@ const { fetch, Agent } = require('undici');
 const Employee = require('../models/Employee');
 const EmailContact = require('../models/email');
 const User = require('../models/User');
+const mongoose = require('mongoose');                 
+const EmailTask = require('../models/EmailTask'); 
 
 // ---------- HTTP agent ----------
 const httpAgent = new Agent({
@@ -111,6 +113,7 @@ const PLATFORM_MAP = new Map([
   ['facebook', 'facebook'], ['fb', 'facebook'],
   ['other', 'other']
 ]);
+const SERVER_MAX_IMAGES = Number(process.env.MAX_BATCH_IMAGES || 50);
 function normalizePlatform(p) {
   if (!p) return null;
   const key = String(p).trim().toLowerCase();
@@ -506,24 +509,83 @@ async function persistMoreInfo(normalized, platform, userId) {
   const doc = await EmailContact.create({ email, handle, platform, userId: user.userId });
   return { outcome: 'saved', id: doc._id };
 }
-
-// ---------- Batch ONLY (up to 5 images) ----------
-exports.extractEmailsAndHandlesBatch=asyncHandler(async (req, res)=> {
+// ---------- Batch via EmailTask (maxEmails) ----------
+// ---------- Batch via EmailTask (maxEmails) ----------
+exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
   try {
     if (!OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY');
 
-    // platform + userId apply to ALL screenshots in this request
-    const platform = normalizePlatform(req.body?.platform) || 'other';
+    // You provide the EmailTask _id in body as: _id OR emailTaskId OR taskId
+    const taskId = (req.body?._id || req.body?.emailTaskId || req.body?.taskId || '').trim();
+    if (!taskId) {
+      return res.status(400).json({ status: 'error', message: 'EmailTask _id (or emailTaskId/taskId) is required.' });
+    }
+    if (!mongoose.Types.ObjectId.isValid(taskId)) {
+      return res.status(400).json({ status: 'error', message: 'Invalid EmailTask _id format.' });
+    }
+
+    // Fetch task & validate
+    const task = await EmailTask.findById(taskId).lean();
+    if (!task) {
+      return res.status(404).json({ status: 'error', message: 'EmailTask not found.' });
+    }
+
+    if (task.expiresAt && task.expiresAt.getTime() <= Date.now()) {
+      return res.status(400).json({ status: 'error', message: 'EmailTask has expired.' });
+    }
+
+    // Use ONLY task.maxEmails as the cap
+    const maxImages = Number(task.maxEmails);
+    if (!Number.isFinite(maxImages) || maxImages < 1) {
+      return res.status(400).json({ status: 'error', message: 'EmailTask.maxEmails must be a positive number.' });
+    }
+
+    // Prefer platform from task; fallback to request; then 'other'
+    const platform = normalizePlatform(task.platform) ||
+                     normalizePlatform(req.body?.platform) ||
+                     'other';
     const userId = (req.body?.userId || '').trim();
 
-    const tasks = [];
+    // ---------- Gather inputs ----------
+    const allFiles   = Array.isArray(req.files) ? req.files : [];
+    const validFiles = allFiles.filter(f => /^image\/(png|jpe?g|webp)$/i.test(f.mimetype || ''));
 
-    // 1) multipart files
-    const files = Array.isArray(req.files) ? req.files : [];
-    const selectedFiles = files.filter(f => /^image\/(png|jpe?g|webp)$/i.test(f.mimetype || '')).slice(0, 5);
+    const urls = Array.isArray(req.body?.imageUrl) ? req.body.imageUrl
+               : (Array.isArray(req.body?.imageUrls) ? req.body.imageUrls : []);
 
-    for (const f of selectedFiles) {
-      tasks.push((async () => {
+    const paths = Array.isArray(req.body?.imagePath) ? req.body.imagePath
+                : (Array.isArray(req.body?.imagePaths) ? req.body.imagePaths : []);
+
+    // Allow <= maxImages; reject only if >
+    const totalRequested = validFiles.length + urls.length + paths.length;
+
+    if (totalRequested === 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: `Provide up to ${maxImages} images via multipart (PNG/JPG/WEBP) or arrays imageUrls/imagePaths.`,
+        emailTaskId: task._id,
+        maxImages
+      });
+    }
+
+    if (totalRequested > maxImages) {
+      return res.status(400).json({
+        status: 'error',
+        message: `This task allows up to ${maxImages} screenshots; you provided ${totalRequested}.`,
+        emailTaskId: task._id,
+        maxImages
+      });
+    }
+
+    // Build tasks (files → urls → paths). Since totalRequested <= max, remaining is just a guard.
+    const jobs = [];
+    let remaining = maxImages;
+
+    // 1) files
+    for (const f of validFiles) {
+      if (remaining <= 0) break;
+      remaining--;
+      jobs.push((async () => {
         try {
           const imagePart = await imagePartFromBuffer(f.buffer, f.mimetype);
           const cacheKey = hashString(`p|${f.originalname}|${f.size}|${MODEL_PRIMARY}|${MODEL_FALLBACK}|${PRIMARY_TOKENS}|${RETRY_TOKENS}|${IMAGE_DETAIL}|darkenhance`);
@@ -531,7 +593,7 @@ exports.extractEmailsAndHandlesBatch=asyncHandler(async (req, res)=> {
           if (!shaped) {
             const parsed = await callVisionFast(imagePart);
             shaped = shapeForClient(parsed);
-            cacheSet(cacheKey, shaped); // cache ONLY parsed shape
+            cacheSet(cacheKey, shaped);
           }
 
           if (shaped.has_captcha) {
@@ -540,7 +602,7 @@ exports.extractEmailsAndHandlesBatch=asyncHandler(async (req, res)=> {
 
           const dbRes = await persistMoreInfo(shaped.normalized, platform, userId);
 
-          // Attempt YouTube enrichment for both 'saved' and 'duplicate' outcomes
+          // YouTube enrichment attempt
           let ytRes = null;
           try {
             const persistCtx = {
@@ -584,11 +646,12 @@ exports.extractEmailsAndHandlesBatch=asyncHandler(async (req, res)=> {
       })());
     }
 
-    // 2) JSON: imageUrl(s)
-    const urls = Array.isArray(req.body?.imageUrl) ? req.body.imageUrl : (req.body?.imageUrls || []);
-    if (Array.isArray(urls)) {
-      for (const u of urls.slice(0, Math.max(0, 5 - tasks.length))) {
-        tasks.push((async () => {
+    // 2) urls
+    if (remaining > 0) {
+      for (const u of urls) {
+        if (remaining <= 0) break;
+        remaining--;
+        jobs.push((async () => {
           try {
             const imagePart = imagePartFromUrl(u);
             const cacheKey = hashString(`purl|${u}|${MODEL_PRIMARY}|${MODEL_FALLBACK}|${PRIMARY_TOKENS}|${RETRY_TOKENS}|${IMAGE_DETAIL}|darkenhance`);
@@ -603,7 +666,6 @@ exports.extractEmailsAndHandlesBatch=asyncHandler(async (req, res)=> {
             }
             const dbRes = await persistMoreInfo(shaped.normalized, platform, userId);
 
-            // YouTube enrichment
             let ytRes = null;
             try {
               const persistCtx = {
@@ -648,11 +710,12 @@ exports.extractEmailsAndHandlesBatch=asyncHandler(async (req, res)=> {
       }
     }
 
-    // 3) JSON: imagePath(s)
-    const paths = Array.isArray(req.body?.imagePath) ? req.body.imagePath : (req.body?.imagePaths || []);
-    if (Array.isArray(paths)) {
-      for (const pth of paths.slice(0, Math.max(0, 5 - tasks.length))) {
-        tasks.push((async () => {
+    // 3) paths
+    if (remaining > 0) {
+      for (const pth of paths) {
+        if (remaining <= 0) break;
+        remaining--;
+        jobs.push((async () => {
           try {
             const imagePart = await imagePartFromPath(path.resolve(String(pth)));
             const cacheKey = hashString(`ppath|${pth}|${MODEL_PRIMARY}|${MODEL_FALLBACK}|${PRIMARY_TOKENS}|${RETRY_TOKENS}|${IMAGE_DETAIL}|darkenhance`);
@@ -667,7 +730,6 @@ exports.extractEmailsAndHandlesBatch=asyncHandler(async (req, res)=> {
             }
             const dbRes = await persistMoreInfo(shaped.normalized, platform, userId);
 
-            // YouTube enrichment
             let ytRes = null;
             try {
               const persistCtx = {
@@ -712,18 +774,31 @@ exports.extractEmailsAndHandlesBatch=asyncHandler(async (req, res)=> {
       }
     }
 
-    if (tasks.length === 0) {
-      return res.status(400).json({ status: 'error', message: 'Provide up to 5 images via multipart (PNG/JPG/WEBP) or arrays imageUrls/imagePaths.' });
+    if (jobs.length === 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: `Provide up to ${maxImages} images for this task via multipart (PNG/JPG/WEBP) or arrays imageUrls/imagePaths.`,
+        emailTaskId: task._id,
+        maxImages
+      });
     }
 
-    const results = await Promise.all(tasks);
-    return res.json({ results });
+    const results = await Promise.all(jobs);
+    return res.json({
+      emailTaskId: task._id,
+      platform,
+      maxImages,              // cap from EmailTask
+      accepted: jobs.length,  // number actually processed
+      results
+    });
 
   } catch (err) {
     console.error('extractEmailsAndHandlesBatch error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Batch processing failed.' });
   }
 });
+
+
 
 
 // ---------- POST /email/all (single search; returns only email, handle, platform) ----------
