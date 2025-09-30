@@ -663,7 +663,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
             return { error: 'Captcha detected. Skipping database save.', has_captcha: true };
           }
 
-          const dbRes = await persistMoreInfo(shaped.normalized, platform, userId);
+          const dbRes = await persistMoreInfo(shaped.normalized, platform, userId, task._id);
 
           // YouTube enrichment attempt
           let ytRes = null;
@@ -727,7 +727,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
             if (shaped.has_captcha) {
               return { error: 'Captcha detected. Skipping database save.', has_captcha: true };
             }
-            const dbRes = await persistMoreInfo(shaped.normalized, platform, userId);
+            const dbRes = await persistMoreInfo(shaped.normalized, platform, userId, task._id);
 
             let ytRes = null;
             try {
@@ -791,7 +791,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
             if (shaped.has_captcha) {
               return { error: 'Captcha detected. Skipping database save.', has_captcha: true };
             }
-            const dbRes = await persistMoreInfo(shaped.normalized, platform, userId);
+            const dbRes = await persistMoreInfo(shaped.normalized, platform, userId, task._id);
 
             let ytRes = null;
             try {

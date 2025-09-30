@@ -85,7 +85,6 @@ EmailContactSchema.index({ createdAt: -1 });
 EmailContactSchema.index({ platform: 1 });
 EmailContactSchema.index({ userId: 1 });
 EmailContactSchema.index({ taskId: 1 });
-EmailContactSchema.index({ taskId: 1, userId: 1 });
 EmailContactSchema.index({ 'youtube.channelId': 1 });
 
 module.exports = mongoose.models.EmailContact
