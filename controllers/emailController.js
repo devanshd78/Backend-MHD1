@@ -471,8 +471,8 @@ async function enrichYouTubeForContact(more_info, persistResult) {
 }
 
 // ---------- Persistence (returns outcome so caller can mark errors) ----------
-async function persistMoreInfo(normalized, platform, userId) {
-  const email = normalized?.email ? normalized.email.toLowerCase().trim() : null;
+async function persistMoreInfo(normalized, platform, userId, taskId) {
+  const email  = normalized?.email ? normalized.email.toLowerCase().trim() : null;
   const handle = normalized?.handle ? normalized.handle.toLowerCase().trim() : null;
 
   if (!userId || typeof userId !== 'string' || !userId.trim()) {
@@ -491,25 +491,88 @@ async function persistMoreInfo(normalized, platform, userId) {
     return { outcome: 'invalid', message: 'Invalid userId (no such user).' };
   }
 
+  // optional: normalize/cast taskId -> ObjectId (ignore if invalid)
+  let taskObjectId = null;
+  if (taskId) {
+    try { taskObjectId = new mongoose.Types.ObjectId(taskId); } catch { taskObjectId = null; }
+  }
+
   // Global duplicate checks
   const [byEmail, byHandle] = await Promise.all([
     EmailContact.findOne({ email }).lean(),
     EmailContact.findOne({ handle }).lean()
   ]);
 
-  if (byEmail && byHandle) {
-    if (byEmail._id?.toString() === byHandle._id?.toString()) {
-      return { outcome: 'duplicate', message: 'User handle and email are already present in the database.', id: byEmail._id, existingUserId: byEmail.userId };
+  // helper: ensure an existing doc carries taskId if it doesn't yet
+  async function attachTaskIdIfMissing(doc) {
+    if (!doc || !taskObjectId) return false;
+    if (!doc.taskId) {
+      await EmailContact.updateOne({ _id: doc._id }, { $set: { taskId: taskObjectId } });
+      return true;
     }
-    return { outcome: 'duplicate', message: 'Email and handle already exist (in different records).', emailId: byEmail._id, handleId: byHandle._id, emailUserId: byEmail.userId, handleUserId: byHandle.userId };
+    return false;
   }
-  if (byEmail) return { outcome: 'duplicate', message: 'Email is already present in the database.', emailId: byEmail._id, emailUserId: byEmail.userId };
-  if (byHandle) return { outcome: 'duplicate', message: 'User handle is already present in the database.', handleId: byHandle._id, handleUserId: byHandle.userId };
 
-  const doc = await EmailContact.create({ email, handle, platform, userId: user.userId });
+  if (byEmail && byHandle) {
+    // If both point to the same document
+    if (String(byEmail._id) === String(byHandle._id)) {
+      const updated = await attachTaskIdIfMissing(byEmail);
+      return {
+        outcome: 'duplicate',
+        message: 'User handle and email are already present in the database.',
+        id: byEmail._id,
+        existingUserId: byEmail.userId,
+        taskIdUpdated: updated
+      };
+    }
+    // Both exist but are different documents
+    const updEmail  = await attachTaskIdIfMissing(byEmail);
+    const updHandle = await attachTaskIdIfMissing(byHandle);
+    return {
+      outcome: 'duplicate',
+      message: 'Email and handle already exist (in different records).',
+      emailId: byEmail._id,
+      handleId: byHandle._id,
+      emailUserId: byEmail.userId,
+      handleUserId: byHandle.userId,
+      taskIdUpdatedEmail: updEmail,
+      taskIdUpdatedHandle: updHandle
+    };
+  }
+
+  if (byEmail) {
+    const updated = await attachTaskIdIfMissing(byEmail);
+    return {
+      outcome: 'duplicate',
+      message: 'Email is already present in the database.',
+      emailId: byEmail._id,
+      emailUserId: byEmail.userId,
+      taskIdUpdated: updated
+    };
+  }
+
+  if (byHandle) {
+    const updated = await attachTaskIdIfMissing(byHandle);
+    return {
+      outcome: 'duplicate',
+      message: 'User handle is already present in the database.',
+      handleId: byHandle._id,
+      handleUserId: byHandle.userId,
+      taskIdUpdated: updated
+    };
+  }
+
+  // Create new contact with taskId
+  const doc = await EmailContact.create({
+    email,
+    handle,
+    platform,
+    userId: user.userId,
+    taskId: taskObjectId // ← store the taskId on create
+  });
+
   return { outcome: 'saved', id: doc._id };
 }
-// ---------- Batch via EmailTask (maxEmails) ----------
 // ---------- Batch via EmailTask (maxEmails) ----------
 exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
   try {

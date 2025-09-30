@@ -45,7 +45,7 @@ const EmailContactSchema = new mongoose.Schema({
     unique: true,
     validate: {
       validator: (v) => HANDLE_RX.test(v || ''),
-      message: 'Handle must start with "@" and contain letters, numbers, ".", "_" or "-"'
+      message: 'Handle must start with \"@\" and contain letters, numbers, \".\", \"_\" or \"-\"'
     }
   },
   platform: {
@@ -58,6 +58,7 @@ const EmailContactSchema = new mongoose.Schema({
       message: 'Platform must be one of: youtube, instagram, twitter, tiktok, facebook, other'
     }
   },
+
   // who collected this entry (links to your User.userId string)
   userId: {
     type: String,
@@ -66,7 +67,15 @@ const EmailContactSchema = new mongoose.Schema({
     ref: 'User'
   },
 
-  // --- NEW: cached YouTube channel data ---
+  // NEW: link this contact to the EmailTask it came from
+  taskId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'EmailTask',
+    index: true,
+    default: null
+  },
+
+  // --- cached YouTube channel data (optional) ---
   youtube: { type: YouTubeSchema, default: undefined }
 
 }, { timestamps: true });
@@ -75,7 +84,8 @@ const EmailContactSchema = new mongoose.Schema({
 EmailContactSchema.index({ createdAt: -1 });
 EmailContactSchema.index({ platform: 1 });
 EmailContactSchema.index({ userId: 1 });
-// If you expect heavy YT lookups by channel:
+EmailContactSchema.index({ taskId: 1 });
+EmailContactSchema.index({ taskId: 1, userId: 1 });
 EmailContactSchema.index({ 'youtube.channelId': 1 });
 
 module.exports = mongoose.models.EmailContact
