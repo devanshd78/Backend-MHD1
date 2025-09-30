@@ -1,31 +1,32 @@
-// models/EmailTask.js
 const mongoose = require('mongoose');
 
 const EmailTaskSchema = new mongoose.Schema(
   {
-    // who created it (adminId string, consistent with Link.createdBy usage)
     createdBy: { type: String, required: true, index: true },
 
-    // payload you requested
-    targetUser:        { type: String},
+    targetUser:        { type: String },
     targetPerEmployee: { type: Number, required: true, min: 0 },
     platform:          { type: String, required: true, trim: true },
     amountPerPerson:   { type: Number, required: true, min: 0 },
     maxEmails:         { type: Number, required: true, min: 0 },
 
-    // expiry in HOURS (like Link.expireIn)
+    // expiry in HOURS (no TTL delete anymore)
     expireIn:  { type: Number, required: true, min: 1 },
+    expiresAt: { type: Date, index: true }, // ← removed "expires: 0" (TTL)
 
-    // optional: auto-delete after expiry (TTL). If you don't want auto-deletion,
-    // remove `expiresAt` and the `expires` option.
-    expiresAt: { type: Date, index: true, expires: 0 },
+    // NEW: keep tasks and mark as expired instead of deleting
+    status: {
+      type: String,
+      enum: ['active', 'expired', 'disabled'],
+      default: 'active',
+      index: true
+    }
   },
   { timestamps: true }
 );
 
-// derive expiresAt = createdAt + expireIn (hrs)
+// derive expiresAt = now + expireIn (hrs)
 EmailTaskSchema.pre('save', function (next) {
-  // use Date.now() since createdAt is only set after initial save
   const hours = Number(this.expireIn || 0);
   if (hours > 0) {
     this.expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);

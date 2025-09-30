@@ -17,6 +17,7 @@ const EmailTask = require('../models/EmailTask');
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
 const notFound = (res, msg) => res.status(404).json({ error: msg });
+const VALID_STATUS = new Set(['active', 'expired', 'disabled']);
 
 /* ------------------------------------------------------------ */
 /* Helpers for pagination + sorting                             */

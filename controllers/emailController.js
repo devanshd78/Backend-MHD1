@@ -61,6 +61,7 @@ const YT_HANDLE_RX = /\/@([A-Za-z0-9._\-]+)/i;     // used in deriveHandleFromMi
 const YT_HANDLE_RE = /@([A-Za-z0-9._\-]+)/i;       // used in YouTube helpers
 const IG_RX = /(?:instagram\.com|ig\.me)\/([A-Za-z0-9._\-]+)/i;
 const TW_RX = /(?:twitter\.com|x\.com)\/([A-Za-z0-9._\-]+)/i;
+const CONTACT_ALLOWED_SORT = new Set(['createdAt', 'email', 'handle', 'platform', 'userId']);
 
 // ---------- JSON schema (More-info only) ----------
 const SECTION_SCHEMA = {
@@ -134,6 +135,20 @@ function bufferToDataUrl(buf, mime = 'image/jpeg') {
   const b64 = Buffer.from(buf).toString('base64');
   return `data:${mime};base64,${b64}`;
 }
+
+function contactParseSort(sortBy = 'createdAt', sortOrder = 'desc') {
+  const field = CONTACT_ALLOWED_SORT.has(sortBy) ? sortBy : 'createdAt';
+  const order = String(sortOrder).toLowerCase() === 'asc' ? 1 : -1;
+  return { [field]: order };
+}
+function contactParsePageLimit(page = 1, limit = 20, maxLimit = 100) {
+  const p = Math.max(1, Number(page) || 1);
+  const l = Math.min(maxLimit, Math.max(1, Number(limit) || 20));
+  const skip = (p - 1) * l;
+  return { p, l, skip };
+}
+
+
 function uniqueSorted(arr = []) {
   const seen = new Set(); const out = [];
   for (const s of arr) {
@@ -1443,4 +1458,63 @@ exports.checkStatus = asyncHandler(async (req, res) => {
     console.error('checkStatus error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to check handle.' });
   }
+});
+
+
+exports.getEmailContactsByTask = asyncHandler(async (req, res) => {
+  const {
+    taskId,
+    page = 1,
+    limit = 20,
+    sortBy = 'createdAt',
+    sortOrder = 'desc',
+    search,
+    platform,
+    userId
+  } = req.body || {};
+
+  if (!taskId) return res.status(400).json({ error: 'taskId required' });
+  if (!mongoose.Types.ObjectId.isValid(taskId)) {
+    return res.status(400).json({ error: 'Invalid taskId format' });
+  }
+  const taskObjectId = new mongoose.Types.ObjectId(taskId);
+
+  const { p, l, skip } = contactParsePageLimit(page, limit);
+  const sort = contactParseSort(sortBy, sortOrder);
+
+  const filter = { taskId: taskObjectId };
+
+  // Optional filters
+  if (userId && typeof userId === 'string') filter.userId = userId.trim();
+  if (platform && typeof platform === 'string') {
+    // case-insensitive exact match
+    filter.platform = { $regex: `^${escapeRegex(platform.trim())}$`, $options: 'i' };
+  }
+
+  // Search across email/handle
+  if (search && String(search).trim() !== '') {
+    const term = String(search).trim();
+    const rx = new RegExp(escapeRegex(term), 'i');
+    filter.$or = [{ email: rx }, { handle: rx }];
+  }
+
+  // Query
+  const [rows, total] = await Promise.all([
+    EmailContact.find(filter)
+      .sort(sort)
+      .skip(skip)
+      .limit(l)
+      // select all fields except __v; keep youtube subdoc
+      .select('-__v')
+      .lean(),
+    EmailContact.countDocuments(filter)
+  ]);
+
+  res.json({
+    taskId,
+    contacts: rows,           // includes: email, handle, platform, userId, taskId, youtube, createdAt, updatedAt
+    total,
+    page: p,
+    pages: Math.ceil(total / l)
+  });
 });
