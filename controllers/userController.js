@@ -5,6 +5,7 @@ const Employee = require('../models/Employee');
 const Link     = require('../models/Link');
 const Entry    = require('../models/Entry');      // ⬅️ new – for look-ups only
 const EmailTask = require('../models/EmailTask');
+const Email = require('../models/email');
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
@@ -207,14 +208,24 @@ exports.updateUser = async (req, res) => {
     res.status(500).json({ message: 'Server error.' });
   }
 };
-/* ------------------------------------------------------------------ */
+
 
 exports.listActiveEmailTasks = asyncHandler(async (req, res) => {
-  const { page = 1, limit = 20 } = req.query;
+  const { page = 1, limit = 20, userId } = req.body || {};
   const { p, l, skip } = parsePageLimit(page, limit);
 
   const now = new Date();
-  const baseFilter = { expiresAt: { $gt: now } };
+  const msPerHour = 3600000;
+
+  // Active = createdAt + (expireIn hours) > now
+  const baseFilter = {
+    $expr: {
+      $gt: [
+        { $add: ['$createdAt', { $multiply: ['$expireIn', msPerHour] }] },
+        now
+      ]
+    }
+  };
 
   const [rows, total] = await Promise.all([
     EmailTask.find(baseFilter)
@@ -222,18 +233,57 @@ exports.listActiveEmailTasks = asyncHandler(async (req, res) => {
       .skip(skip)
       .limit(l)
       .select(
-        'createdBy platform targetUser targetPerEmployee amountPerPerson maxEmails expireIn expiresAt createdAt'
+        'createdBy platform targetUser targetPerEmployee amountPerPerson maxEmails expireIn createdAt updatedAt'
       )
       .lean(),
     EmailTask.countDocuments(baseFilter)
   ]);
 
-  // Mark status + newest item on the very first page
-  const tasks = rows.map((t, idx) => ({
-    ...t,
-    status: 'active',
-    isLatest: skip === 0 && idx === 0
-  }));
+  // Compute expiresAt and defaults
+  let tasks = rows.map((t, idx) => {
+    const expiresAt = new Date(new Date(t.createdAt).getTime() + t.expireIn * msPerHour);
+    return {
+      ...t,
+      expiresAt,
+      status: 'active',
+      isLatest: skip === 0 && idx === 0,
+      isCompleted: 0,
+      isPartial: 0
+    };
+  });
+
+  // ---- Progress check using EmailContact model ----
+  if (userId && tasks.length > 0) {
+
+    if (Email) {
+      const taskIds = tasks.map(t => t._id);
+
+      // A simple count of documents per { userId, taskId } pair.
+      const progress = await Email.aggregate([
+        { $match: { userId: String(userId), taskId: { $in: taskIds } } },
+        { $group: { _id: '$taskId', total: { $sum: 1 } } }
+      ]);
+
+      const progressMap = new Map(progress.map(p => [String(p._id), p.total]));
+
+      tasks = tasks.map(t => {
+        const done = Number(progressMap.get(String(t._id)) || 0);
+        const target = Number(t.maxEmails) || 0;
+
+        const isCompleted = done >= target ? 1 : 0;
+        const isPartial = done > 0 && done < target ? 1 : 0;
+
+        return {
+          ...t,
+          // Optional: expose doneCount to help the client display progress bars
+          doneCount: done,
+          isCompleted,
+          isPartial
+        };
+      });
+    }
+    // else: if model unavailable, leave flags at 0 without failing
+  }
 
   res.json({
     tasks,

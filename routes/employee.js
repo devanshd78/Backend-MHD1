@@ -13,6 +13,8 @@ router.get('/links/:linkId', employeeController.getLink);
 
 // balance check
 router.get('/balance',    employeeController.getBalance);
+
 router.get('/emailtasks', employeeController.listEmailTasks);
+router.post('/taskbyuser', employeeController.taskByUser);
 
 module.exports = router;

@@ -21,6 +21,6 @@ router.get('/getbyuserId/:userId', getUserById);
 router.get('/getbyemployeeid/:employeeId', getUsersByEmployeeId);
 router.post('/link', listLinksForUser);
 router.post('/update', updateUser);
-router.get('/emailtasks', listActiveEmailTasks);
+router.post('/emailtasks', listActiveEmailTasks);
 
 module.exports = router;
