@@ -210,79 +210,74 @@ exports.updateUser = async (req, res) => {
 };
 
 
+// Show tasks with optional status filter (default: all),
+// and include expired ones instead of filtering them out by time.
 exports.listActiveEmailTasks = asyncHandler(async (req, res) => {
-  const { page = 1, limit = 20, userId } = req.body || {};
+  const { page = 1, limit = 20, userId, status = 'all' } = req.body || {};
   const { p, l, skip } = parsePageLimit(page, limit);
 
   const now = new Date();
-  const msPerHour = 3600000;
 
-  // Active = createdAt + (expireIn hours) > now
-  const baseFilter = {
-    $expr: {
-      $gt: [
-        { $add: ['$createdAt', { $multiply: ['$expireIn', msPerHour] }] },
-        now
-      ]
-    }
-  };
+  // 1) Auto-mark overdue tasks as expired (so they persist, not deleted)
+  await EmailTask.updateMany(
+    { status: { $ne: 'expired' }, expiresAt: { $lte: now } },
+    { $set: { status: 'expired' } }
+  );
 
+  // 2) Build status filter
+  const filter = {};
+  const allowed = new Set(['all', 'active', 'expired', 'disabled']);
+  const s = String(status || 'all').toLowerCase();
+  if (!allowed.has(s)) return badRequest(res, 'status must be one of: all, active, expired, disabled');
+  if (s !== 'all') filter.status = s;
+
+  // 3) Query
   const [rows, total] = await Promise.all([
-    EmailTask.find(baseFilter)
+    EmailTask.find(filter)
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(l)
-      .select(
-        'createdBy platform targetUser targetPerEmployee amountPerPerson maxEmails expireIn createdAt updatedAt'
-      )
+      .select('createdBy platform targetUser targetPerEmployee amountPerPerson maxEmails expireIn expiresAt status createdAt updatedAt')
       .lean(),
-    EmailTask.countDocuments(baseFilter)
+    EmailTask.countDocuments(filter)
   ]);
 
-  // Compute expiresAt and defaults
+  // 4) Normalize computed fields
+  const msPerHour = 3600000;
   let tasks = rows.map((t, idx) => {
-    const expiresAt = new Date(new Date(t.createdAt).getTime() + t.expireIn * msPerHour);
+    const expiresAt = t.expiresAt || new Date(new Date(t.createdAt).getTime() + Number(t.expireIn || 0) * msPerHour);
+    const computedStatus = t.status || ((expiresAt && expiresAt <= now) ? 'expired' : 'active');
+
     return {
       ...t,
       expiresAt,
-      status: 'active',
+      status: computedStatus,
       isLatest: skip === 0 && idx === 0,
       isCompleted: 0,
       isPartial: 0
     };
   });
 
-  // ---- Progress check using EmailContact model ----
+  // 5) Progress by user (counts in EmailContact for this task)
   if (userId && tasks.length > 0) {
+    const taskIds = tasks.map(t => t._id);
+    const progress = await EmailContact.aggregate([
+      { $match: { userId: String(userId), taskId: { $in: taskIds } } },
+      { $group: { _id: '$taskId', total: { $sum: 1 } } }
+    ]);
 
-    if (Email) {
-      const taskIds = tasks.map(t => t._id);
+    const progressMap = new Map(progress.map(p => [String(p._id), p.total]));
 
-      // A simple count of documents per { userId, taskId } pair.
-      const progress = await Email.aggregate([
-        { $match: { userId: String(userId), taskId: { $in: taskIds } } },
-        { $group: { _id: '$taskId', total: { $sum: 1 } } }
-      ]);
-
-      const progressMap = new Map(progress.map(p => [String(p._id), p.total]));
-
-      tasks = tasks.map(t => {
-        const done = Number(progressMap.get(String(t._id)) || 0);
-        const target = Number(t.maxEmails) || 0;
-
-        const isCompleted = done >= target ? 1 : 0;
-        const isPartial = done > 0 && done < target ? 1 : 0;
-
-        return {
-          ...t,
-          // Optional: expose doneCount to help the client display progress bars
-          doneCount: done,
-          isCompleted,
-          isPartial
-        };
-      });
-    }
-    // else: if model unavailable, leave flags at 0 without failing
+    tasks = tasks.map(t => {
+      const done = Number(progressMap.get(String(t._id)) || 0);
+      const target = Number(t.maxEmails) || 0;
+      return {
+        ...t,
+        doneCount: done,
+        isCompleted: done >= target ? 1 : 0,
+        isPartial: done > 0 && done < target ? 1 : 0
+      };
+    });
   }
 
   res.json({
