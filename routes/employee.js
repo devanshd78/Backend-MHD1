@@ -16,5 +16,6 @@ router.get('/balance',    employeeController.getBalance);
 
 router.get('/emailtasks', employeeController.listEmailTasks);
 router.post('/taskbyuser', employeeController.taskByUser);
+router.post('/pay', employeeController.deductEmployeeBalanceForTask);
 
 module.exports = router;

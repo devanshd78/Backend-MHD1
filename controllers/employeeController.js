@@ -9,6 +9,7 @@ const User = require('../models/User');
 const Link = require('../models/Link');
 const EmailTask = require('../models/EmailTask');
 const EmailContact = require('../models/email');
+const BalanceHistory = require('../models/BalanceHistory');
 
 const asyncHandler = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
@@ -255,4 +256,98 @@ exports.taskByUser = asyncHandler(async (req, res) => {
     },
     users: performing.sort((a, b) => b.doneCount - a.doneCount),
   });
+});
+
+
+// POST /employee/task/deduct
+// Body: { employeeId, userId, taskId }
+exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
+  const { employeeId, userId, taskId } = req.body || {};
+  if (!employeeId || !userId || !taskId) {
+    return badRequest(res, 'employeeId, userId and taskId are required');
+  }
+  if (!isValidObjectId(taskId)) {
+    return badRequest(res, 'Invalid taskId');
+  }
+
+  // Ensure task exists
+  const task = await EmailTask.findById(taskId)
+    .select('amountPerPerson expireIn createdAt status expiresAt platform')
+    .lean();
+  if (!task) return notFound(res, 'Task not found');
+
+  // Compute/normalize expiry and active status
+  const expiresAt =
+    task.expiresAt ||
+    new Date(new Date(task.createdAt).getTime() + Number(task.expireIn || 0) * MS_PER_HOUR);
+
+  // Validate amount
+  const amount = Number(task.amountPerPerson);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return badRequest(res, 'Invalid task amountPerPerson');
+  }
+
+  // Ensure user exists (collector who triggered the deduction)
+  const user = await User.findOne({ userId: String(userId) })
+    .select('_id userId name')
+    .lean();
+  if (!user) return notFound(res, 'User not found');
+
+  // Transaction for atomicity
+  const session = await mongoose.startSession();
+  try {
+    let updatedEmp = null;
+
+    await session.withTransaction(async () => {
+      // Atomically decrement if and only if balance >= amount
+      const emp = await Employee.findOneAndUpdate(
+        { employeeId, balance: { $gte: amount } },
+        { $inc: { balance: -amount } },
+        { new: true, session }
+      );
+
+      if (!emp) {
+        // Either employee not found or insufficient funds
+        const exists = await Employee.exists({ employeeId }).session(session);
+        if (!exists) throw new Error('EMPLOYEE_NOT_FOUND');
+        throw new Error('INSUFFICIENT_FUNDS');
+      }
+
+      updatedEmp = emp;
+
+      // Record negative amount in history
+      await BalanceHistory.create(
+        [{
+          employeeId,
+          amount: -amount, // negative = deduction
+          addedBy: user.userId, // who triggered this charge
+          note: `Deducted ₹${amount} for task ${taskId} (${task.platform || 'task'})`
+        }],
+        { session }
+      );
+    });
+
+    session.endSession();
+
+    return res.json({
+      message: 'Amount deducted successfully',
+      employeeId,
+      userId: user.userId,
+      taskId,
+      amountDeducted: amount,
+      newBalance: updatedEmp.balance,
+      expiresAt,
+      taskStatus: 'active'
+    });
+  } catch (e) {
+    session.endSession();
+    if (e.message === 'EMPLOYEE_NOT_FOUND') {
+      return notFound(res, 'Employee not found');
+    }
+    if (e.message === 'INSUFFICIENT_FUNDS') {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+    // unexpected
+    throw e;
+  }
 });
