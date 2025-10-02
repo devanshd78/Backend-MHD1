@@ -12,12 +12,14 @@ const AdminOTP = require('../models/AdminOTP');
 const { default: mongoose } = require('mongoose');
 const { ObjectId } = require('mongodb');
 const EmailTask = require('../models/EmailTask');
-
+const EmailContact = require('../models/email');
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
 const notFound = (res, msg) => res.status(404).json({ error: msg });
 const VALID_STATUS = new Set(['active', 'expired', 'disabled']);
+
+const MS_PER_HOUR = 3600000;
 
 /* ------------------------------------------------------------ */
 /* Helpers for pagination + sorting                             */
@@ -889,7 +891,6 @@ exports.getScreenshotsByLinkAndEmployee = asyncHandler(async (req, res) => {
 
 
 // Helpers used below (assumes asyncHandler, badRequest, Admin, EmailTask, parsePageLimit, parseSort exist)
-
 exports.createEmailTask = asyncHandler(async (req, res) => {
   const {
     adminId,
@@ -1073,5 +1074,147 @@ exports.getEmailTaskList = asyncHandler(async (req, res) => {
     total,
     page: p,
     pages: Math.ceil(total / l)
+  });
+});
+
+exports.getEmailTaskDetails = asyncHandler(async (req, res) => {
+  const { taskId, employeeId } = req.body || {};
+  if (!taskId) return badRequest(res, 'taskId is required');
+  if (!ObjectId.isValid(taskId)) return badRequest(res, 'Invalid taskId');
+
+  // Load task & compute derived metadata
+  const task = await EmailTask.findById(taskId).lean();
+  if (!task) return notFound(res, 'Task not found');
+
+  const expiresAt = new Date(new Date(task.createdAt).getTime() + (Number(task.expireIn) || 0) * MS_PER_HOUR);
+  const status    = new Date() < expiresAt ? 'active' : 'expired';
+
+  // IMPORTANT: completion threshold is targetPerEmployee (not maxEmails)
+  const threshold = Number(task.maxEmails || 0);
+
+  // contacts -> join users -> (optional) filter by employee -> join employee -> group
+  const pipeline = [
+    { $match: { taskId: new ObjectId(taskId) } },
+
+    // Join User (collection: users) on userId (string)
+    {
+      $lookup: {
+        from: 'users',
+        localField: 'userId',
+        foreignField: 'userId',
+        as: 'user'
+      }
+    },
+    { $unwind: '$user' },
+
+    // Optional filter by employeeId (string) on User.worksUnder
+    ...(employeeId ? [{ $match: { 'user.worksUnder': String(employeeId) } }] : []),
+
+    // Join Employee (collection: employees) where user.worksUnder -> employee.employeeId (string)
+    {
+      $lookup: {
+        from: 'employees',
+        localField: 'user.worksUnder',
+        foreignField: 'employeeId',
+        as: 'employee'
+      }
+    },
+    { $unwind: '$employee' },
+
+    // Group per user (collect emails; include full youtube subdocument)
+    {
+      $group: {
+        _id: { employeeId: '$employee.employeeId', userId: '$user.userId' },
+        employeeName: { $first: '$employee.name' },
+        userName: { $first: '$user.name' },
+        emails: {
+          $push: {
+            email: '$email',
+            handle: '$handle',
+            platform: '$platform',
+            createdAt: '$createdAt',
+            // include the entire youtube subdoc (will be null when absent)
+            youtube: '$youtube'
+          }
+        },
+        count: { $sum: 1 }
+      }
+    },
+
+    // Mark user status (completed vs partial) using targetPerEmployee threshold
+    {
+      $addFields: {
+        status: {
+          $cond: [{ $gte: ['$count', threshold] }, 'completed', 'partial']
+        }
+      }
+    },
+
+    // Group per employee
+    {
+      $group: {
+        _id: '$_id.employeeId',
+        employeeName:  { $first: '$employeeName' },
+        users: {
+          $push: {
+            userId:   '$_id.userId',
+            name:     '$userName',
+            doneCount:'$count',
+            status:   '$status',
+            emails:   '$emails'
+          }
+        },
+        usersCount:     { $sum: 1 },
+        completedUsers: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
+        partialUsers:   { $sum: { $cond: [{ $eq: ['$status', 'partial'] },   1, 0] } },
+        totalEmails:    { $sum: '$count' }
+      }
+    },
+
+    // Final employee shape
+    {
+      $project: {
+        _id: 0,
+        employeeId: '$_id',
+        name: '$employeeName',
+        usersCount: 1,
+        completedUsers: 1,
+        partialUsers: 1,
+        totalEmails: 1,
+        users: 1
+      }
+    },
+    { $sort: { totalEmails: -1 } }
+  ];
+
+  const employees = await EmailContact.aggregate(pipeline);
+
+  // Top-level totals
+  const totals = employees.reduce(
+    (acc, e) => {
+      acc.employees     += 1;
+      acc.users         += e.usersCount || 0;
+      acc.completedUsers+= e.completedUsers || 0;
+      acc.partialUsers  += e.partialUsers || 0;
+      acc.totalEmails   += e.totalEmails || 0;
+      return acc;
+    },
+    { employees: 0, users: 0, completedUsers: 0, partialUsers: 0, totalEmails: 0 }
+  );
+
+  return res.json({
+    task: {
+      _id: task._id,
+      platform: task.platform,
+      targetPerEmployee: task.targetPerEmployee,
+      amountPerPerson: task.amountPerPerson,
+      maxEmails: task.maxEmails,
+      expireIn: task.expireIn,
+      createdAt: task.createdAt,
+      expiresAt,
+      status
+    },
+    totals,
+    employees
   });
 });

@@ -146,17 +146,6 @@ exports.listEmailTasks = asyncHandler(async (_req, res) => {
   res.json(tasks);
 });
 
-/* ====================== task roster (masked) ====================== */
-/**
- * POST /employee/taskbyuser
- * Body: { taskId: string, employeeId: string }
- * Response:
- * {
- *   task: {...},
- *   totals: { performing, completed, partial },
- *   users: [{ userId, name, doneCount, status, emails: [{ emailMasked, handle, platform, createdAt }] }]
- * }
- */
 exports.taskByUser = asyncHandler(async (req, res) => {
   const { taskId, employeeId } = req.body || {};
   if (!taskId || !employeeId) return badRequest(res, 'taskId and employeeId are required');

@@ -5,7 +5,7 @@ const Employee = require('../models/Employee');
 const Link     = require('../models/Link');
 const Entry    = require('../models/Entry');      // ⬅️ new – for look-ups only
 const EmailTask = require('../models/EmailTask');
-const Email = require('../models/email');
+const EmailContact = require('../models/email');
 
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
@@ -210,7 +210,6 @@ exports.updateUser = async (req, res) => {
 };
 
 
-// Show tasks with optional status filter (default: all),
 // and include expired ones instead of filtering them out by time.
 exports.listActiveEmailTasks = asyncHandler(async (req, res) => {
   const { page = 1, limit = 20, userId, status = 'all' } = req.body || {};
