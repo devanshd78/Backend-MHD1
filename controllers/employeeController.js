@@ -10,10 +10,11 @@ const Link = require('../models/Link');
 const EmailTask = require('../models/EmailTask');
 const EmailContact = require('../models/email');
 const BalanceHistory = require('../models/BalanceHistory');
+const Payout = require('../models/Payout');   // <— add this
 
 const asyncHandler = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
-const notFound  = (res, msg) => res.status(404).json({ error: msg });
+const notFound = (res, msg) => res.status(404).json({ error: msg });
 
 const MS_PER_HOUR = 3600000;
 
@@ -237,10 +238,22 @@ exports.taskByUser = asyncHandler(async (req, res) => {
     });
   }
 
+  // ...after building `performing` array
+
+  // Determine who is already paid for this (employeeId, taskId)
+  const paidRows = await Payout.find({
+    employeeId,
+    taskId,
+    userId: { $in: performing.map(u => u.userId) },
+  }).select('userId').lean();
+
+  const paidSet = new Set(paidRows.map(p => p.userId));
+  const performingWithPaid = performing.map(u => ({ ...u, paid: paidSet.has(u.userId) }));
+
   res.json({
     task: {
       _id: task._id,
-      platform: task.platform, // as stored (e.g., "YouTube")
+      platform: task.platform,
       targetPerEmployee: task.targetPerEmployee,
       amountPerPerson: task.amountPerPerson,
       maxEmails: task.maxEmails,
@@ -250,17 +263,16 @@ exports.taskByUser = asyncHandler(async (req, res) => {
       status: taskStatus,
     },
     totals: {
-      performing: performing.length,
+      performing: performingWithPaid.length,
       completed: completedCount,
       partial: partialCount,
     },
-    users: performing.sort((a, b) => b.doneCount - a.doneCount),
+    users: performingWithPaid.sort((a, b) => b.doneCount - a.doneCount),
   });
+
 });
 
 
-// POST /employee/task/deduct
-// Body: { employeeId, userId, taskId }
 exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
   const { employeeId, userId, taskId } = req.body || {};
   if (!employeeId || !userId || !taskId) {
@@ -276,30 +288,43 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
     .lean();
   if (!task) return notFound(res, 'Task not found');
 
-  // Compute/normalize expiry and active status
   const expiresAt =
     task.expiresAt ||
     new Date(new Date(task.createdAt).getTime() + Number(task.expireIn || 0) * MS_PER_HOUR);
 
-  // Validate amount
   const amount = Number(task.amountPerPerson);
   if (!Number.isFinite(amount) || amount <= 0) {
     return badRequest(res, 'Invalid task amountPerPerson');
   }
 
-  // Ensure user exists (collector who triggered the deduction)
+  // Ensure user exists
   const user = await User.findOne({ userId: String(userId) })
     .select('_id userId name')
     .lean();
   if (!user) return notFound(res, 'User not found');
 
-  // Transaction for atomicity
+  // Idempotency: if payout already exists, short-circuit
+  const existing = await Payout.findOne({ employeeId, userId: user.userId, taskId }).lean();
+  if (existing) {
+    return res.json({
+      message: 'Already paid',
+      employeeId,
+      userId: user.userId,
+      taskId,
+      paid: true,
+      alreadyPaid: true,
+      amountDeducted: existing.amount,
+      expiresAt,
+      taskStatus: 'active',
+    });
+  }
+
   const session = await mongoose.startSession();
   try {
     let updatedEmp = null;
 
     await session.withTransaction(async () => {
-      // Atomically decrement if and only if balance >= amount
+      // Decrement balance atomically if sufficient
       const emp = await Employee.findOneAndUpdate(
         { employeeId, balance: { $gte: amount } },
         { $inc: { balance: -amount } },
@@ -307,24 +332,27 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
       );
 
       if (!emp) {
-        // Either employee not found or insufficient funds
         const exists = await Employee.exists({ employeeId }).session(session);
         if (!exists) throw new Error('EMPLOYEE_NOT_FOUND');
         throw new Error('INSUFFICIENT_FUNDS');
       }
-
       updatedEmp = emp;
 
-      // Record negative amount in history
-      await BalanceHistory.create(
-        [{
-          employeeId,
-          amount: -amount, // negative = deduction
-          addedBy: user.userId, // who triggered this charge
-          note: `Deducted ₹${amount} for task ${taskId} (${task.platform || 'task'})`
-        }],
-        { session }
-      );
+      // Balance history
+      await BalanceHistory.create([{
+        employeeId,
+        amount: -amount,
+        addedBy: user.userId,
+        note: `Deducted ₹${amount} for task ${taskId} (${task.platform || 'task'})`
+      }], { session });
+
+      // Create payout (unique per employeeId+userId+taskId)
+      await Payout.create([{
+        employeeId,
+        userId: user.userId,
+        taskId,
+        amount,
+      }], { session });
     });
 
     session.endSession();
@@ -337,17 +365,27 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
       amountDeducted: amount,
       newBalance: updatedEmp.balance,
       expiresAt,
-      taskStatus: 'active'
+      taskStatus: 'active',
+      paid: true,
+      alreadyPaid: false,
     });
   } catch (e) {
     session.endSession();
+    // Handle double submit race (unique index)
+    if (e?.code === 11000) {
+      return res.json({
+        message: 'Already paid',
+        employeeId, userId, taskId,
+        paid: true, alreadyPaid: true,
+      });
+    }
     if (e.message === 'EMPLOYEE_NOT_FOUND') {
       return notFound(res, 'Employee not found');
     }
     if (e.message === 'INSUFFICIENT_FUNDS') {
       return res.status(400).json({ error: 'Insufficient balance' });
     }
-    // unexpected
     throw e;
   }
 });
+

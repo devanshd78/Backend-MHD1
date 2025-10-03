@@ -889,79 +889,81 @@ exports.getScreenshotsByLinkAndEmployee = asyncHandler(async (req, res) => {
   });
 });
 
-
-// Helpers used below (assumes asyncHandler, badRequest, Admin, EmailTask, parsePageLimit, parseSort exist)
 exports.createEmailTask = asyncHandler(async (req, res) => {
   const {
-    adminId,
-    targetUser,
-    targetPerEmployee,
-    platform,
-    amountPerPerson,
-    maxEmails,
-    expireIn
-  } = req.body;
+    items,                 // optional bulk: [{ platform, targetUser?, amountPerPerson, expireIn, targetPerEmployee?, maxEmails? }, ...]
+    platform,              // single
+    targetUser,            // single
+    amountPerPerson,       // single
+    expireIn,              // single
+    targetPerEmployee,     // single (optional)
+    maxEmails,             // single (optional)
+    adminId,               // REQUIRED now
+  } = req.body || {};
 
-  if (
-    !adminId ||
-    targetPerEmployee == null ||
-    !platform ||
-    amountPerPerson == null ||
-    maxEmails == null ||
-    expireIn == null
-  ) {
-    return badRequest(
-      res,
-      'adminId,targetPerEmployee, platform, amountPerPerson, maxEmails, expireIn are required'
-    );
-  }
+  if (!adminId) return badRequest(res, 'adminId required');
+  const exists = await Admin.exists({ adminId: String(adminId) });
+  if (!exists) return badRequest(res, 'Invalid adminId');
 
-  if (!(await Admin.exists({ adminId }))) {
-    return badRequest(res, 'Invalid adminId');
-  }
+  // Build normalized rows (supports single or bulk)
+  const rows = Array.isArray(items)
+    ? items
+    : [{ platform, targetUser, amountPerPerson, expireIn, targetPerEmployee, maxEmails }];
 
-  const payload = {
-    createdBy: String(adminId),
-    platform: String(platform).trim(),
-    targetPerEmployee: Number(targetPerEmployee),
-    amountPerPerson: Number(amountPerPerson),
-    maxEmails: Number(maxEmails),
-    expireIn: Number(expireIn)
+  // helpers
+  const toIntOrDefault = (val, def = 1) => {
+    const n = Number(val);
+    return Number.isFinite(n) && n >= 1 ? Math.floor(n) : def;
   };
-  if (typeof targetUser !== 'undefined') payload.targetUser = String(targetUser);
 
-  const nums = [
-    ['targetPerEmployee', payload.targetPerEmployee],
-    ['amountPerPerson', payload.amountPerPerson],
-    ['maxEmails', payload.maxEmails],
-    ['expireIn', payload.expireIn],
-  ];
-  for (const [name, val] of nums) {
-    if (!Number.isFinite(val) || val < 0) {
-      return badRequest(res, `Field "${name}" must be a non-negative number`);
-    }
+  const docs = [];
+  for (const r of rows) {
+    const p = String(r?.platform || '').trim();
+    const a = Number(r?.amountPerPerson);
+    const e = Number(r?.expireIn);
+
+    if (!p) return badRequest(res, 'platform is required for all items');
+    if (!Number.isFinite(a) || a < 0)
+      return badRequest(res, 'amountPerPerson must be a non-negative number');
+    if (!Number.isFinite(e) || e < 1)
+      return badRequest(res, 'expireIn must be at least 1 hour');
+
+    // If not value then 1, else use the value:
+    const tpe = toIntOrDefault(r?.targetPerEmployee, 1);
+    const me  = toIntOrDefault(r?.maxEmails, 1);
+
+    docs.push({
+      createdBy: String(adminId),
+      platform: p,
+      targetUser: typeof r?.targetUser === 'string' ? String(r.targetUser) : undefined,
+      amountPerPerson: a,
+      expireIn: e,
+      targetPerEmployee: tpe,
+      maxEmails: me,
+    });
   }
-  if (payload.expireIn < 1) {
-    return badRequest(res, 'expireIn must be at least 1 hour');
-  }
 
-  const task = await EmailTask.create(payload);
+  const inserted = await EmailTask.insertMany(docs, { ordered: true });
 
-  // Compute derived fields from schema values
-  const msPerHour = 3600000;
-  const expiresAt = new Date(task.createdAt.getTime() + task.expireIn * msPerHour);
-  const status = new Date() < expiresAt ? 'active' : 'expired';
-
-  res.json({
-    message: 'Email task created',
-    emailTaskId: task._id,
-    expiresAt,
-    status,
-    task
+  const MS = 3600000;
+  const now = new Date();
+  const tasks = inserted.map(t => {
+    const expiresAt = new Date(t.createdAt.getTime() + t.expireIn * MS);
+    return {
+      _id: t._id,
+      createdBy: t.createdBy,
+      platform: t.platform,
+      targetUser: t.targetUser ?? null,
+      amountPerPerson: t.amountPerPerson,
+      expireIn: t.expireIn,
+      createdAt: t.createdAt,
+      expiresAt,
+      status: now < expiresAt ? 'active' : 'expired',
+    };
   });
+
+  res.json({ message: `Created ${tasks.length} email task(s)`, tasks });
 });
-
-
 
 exports.getEmailTaskList = asyncHandler(async (req, res) => {
   const {
@@ -1082,19 +1084,21 @@ exports.getEmailTaskDetails = asyncHandler(async (req, res) => {
   if (!taskId) return badRequest(res, 'taskId is required');
   if (!ObjectId.isValid(taskId)) return badRequest(res, 'Invalid taskId');
 
-  // Load task & compute derived metadata
   const task = await EmailTask.findById(taskId).lean();
   if (!task) return notFound(res, 'Task not found');
 
   const expiresAt = new Date(new Date(task.createdAt).getTime() + (Number(task.expireIn) || 0) * MS_PER_HOUR);
   const status    = new Date() < expiresAt ? 'active' : 'expired';
 
-  // IMPORTANT: completion threshold is targetPerEmployee (not maxEmails)
+  // Completion threshold (use maxEmails per your comment)
   const threshold = Number(task.maxEmails || 0);
 
-  // contacts -> join users -> (optional) filter by employee -> join employee -> group
+  const taskIdObj = new ObjectId(taskId);
+
+  // contacts -> join users -> (optional) filter by employee -> join employee -> group (per user)
+  // -> mark completed/partial -> lookup payouts -> mark paid -> group (per employee)
   const pipeline = [
-    { $match: { taskId: new ObjectId(taskId) } },
+    { $match: { taskId: taskIdObj } },
 
     // Join User (collection: users) on userId (string)
     {
@@ -1126,22 +1130,21 @@ exports.getEmailTaskDetails = asyncHandler(async (req, res) => {
       $group: {
         _id: { employeeId: '$employee.employeeId', userId: '$user.userId' },
         employeeName: { $first: '$employee.name' },
-        userName: { $first: '$user.name' },
+        userName:     { $first: '$user.name' },
         emails: {
           $push: {
             email: '$email',
             handle: '$handle',
             platform: '$platform',
             createdAt: '$createdAt',
-            // include the entire youtube subdoc (will be null when absent)
-            youtube: '$youtube'
+            youtube: '$youtube' // may be null
           }
         },
         count: { $sum: 1 }
       }
     },
 
-    // Mark user status (completed vs partial) using targetPerEmployee threshold
+    // completed vs partial
     {
       $addFields: {
         status: {
@@ -1150,23 +1153,50 @@ exports.getEmailTaskDetails = asyncHandler(async (req, res) => {
       }
     },
 
-    // Group per employee
+    // 🔗 NEW: lookup payouts to mark paid/unpaid for this (employeeId, userId, taskId)
+    {
+      $lookup: {
+        from: 'payouts',
+        let: { empId: '$_id.employeeId', uId: '$_id.userId' },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ['$employeeId', '$$empId'] },
+                  { $eq: ['$userId', '$$uId'] },
+                  { $eq: ['$taskId', taskIdObj] },
+                ]
+              }
+            }
+          },
+          { $project: { _id: 1 } }
+        ],
+        as: 'payout'
+      }
+    },
+    { $addFields: { paid: { $gt: [{ $size: '$payout' }, 0] } } },
+
+    // Group per employee and carry paid flag down to each user object
     {
       $group: {
         _id: '$_id.employeeId',
-        employeeName:  { $first: '$employeeName' },
+        employeeName:  { $first: '$_id.employeeId' }, // fallback if name missing; corrected below
+        employeeNameReal: { $first: '$employeeName' },
         users: {
           $push: {
             userId:   '$_id.userId',
             name:     '$userName',
             doneCount:'$count',
             status:   '$status',
+            paid:     '$paid',
             emails:   '$emails'
           }
         },
         usersCount:     { $sum: 1 },
         completedUsers: { $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] } },
         partialUsers:   { $sum: { $cond: [{ $eq: ['$status', 'partial'] },   1, 0] } },
+        paidUsers:      { $sum: { $cond: ['$paid', 1, 0] } },
         totalEmails:    { $sum: '$count' }
       }
     },
@@ -1176,10 +1206,11 @@ exports.getEmailTaskDetails = asyncHandler(async (req, res) => {
       $project: {
         _id: 0,
         employeeId: '$_id',
-        name: '$employeeName',
+        name: { $ifNull: ['$employeeNameReal', '$employeeName'] },
         usersCount: 1,
         completedUsers: 1,
         partialUsers: 1,
+        paidUsers: 1,
         totalEmails: 1,
         users: 1
       }
@@ -1189,17 +1220,18 @@ exports.getEmailTaskDetails = asyncHandler(async (req, res) => {
 
   const employees = await EmailContact.aggregate(pipeline);
 
-  // Top-level totals
+  // Top-level totals (add paidUsers)
   const totals = employees.reduce(
     (acc, e) => {
-      acc.employees     += 1;
-      acc.users         += e.usersCount || 0;
-      acc.completedUsers+= e.completedUsers || 0;
-      acc.partialUsers  += e.partialUsers || 0;
-      acc.totalEmails   += e.totalEmails || 0;
+      acc.employees      += 1;
+      acc.users          += e.usersCount || 0;
+      acc.completedUsers += e.completedUsers || 0;
+      acc.partialUsers   += e.partialUsers || 0;
+      acc.paidUsers      += e.paidUsers || 0;
+      acc.totalEmails    += e.totalEmails || 0;
       return acc;
     },
-    { employees: 0, users: 0, completedUsers: 0, partialUsers: 0, totalEmails: 0 }
+    { employees: 0, users: 0, completedUsers: 0, partialUsers: 0, paidUsers: 0, totalEmails: 0 }
   );
 
   return res.json({
