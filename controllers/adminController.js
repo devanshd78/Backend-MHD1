@@ -972,67 +972,41 @@ exports.getEmailTaskList = asyncHandler(async (req, res) => {
     sortBy = 'createdAt',
     sortOrder = 'desc',
     search,
-    adminId,
+    // adminId can be used by your auth layer, but we DO NOT use it to filter
+    adminId, // eslint-disable-line no-unused-vars
     platform,
-    active
+    active,
+    includeCompleted = true, // client/UI decides; we don't filter by completion here
+    createdBy,              // OPTIONAL: explicit creator filter (not tied to adminId)
   } = req.body;
 
   const { p, l, skip } = parsePageLimit(page, limit);
-
-  // If caller asks to sort by a computed field, we'll sort in-memory later.
+  const dir = String(sortOrder).toLowerCase() === 'asc' ? 1 : -1;
   const wantsExpiresAtSort = String(sortBy) === 'expiresAt';
-  const sort = wantsExpiresAtSort ? parseSort('createdAt', sortOrder) : parseSort(sortBy, sortOrder);
 
-  const filter = {};
+  // ----- Build match (no adminId-based filtering) -----
+  const match = {};
 
-  if (adminId) filter.createdBy = String(adminId);
+  if (createdBy) {
+    match.createdBy = String(createdBy);
+  }
 
   if (platform) {
     const esc = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    filter.platform = { $regex: esc(platform), $options: 'i' };
+    match.platform = { $regex: esc(platform), $options: 'i' };
   }
 
-  // Active/expired using $expr on createdAt + (expireIn hours)
-  if (typeof active === 'boolean') {
-    const msPerHour = 3600000;
-    const now = new Date();
-    if (active) {
-      filter.$expr = {
-        $gt: [
-          { $add: ['$createdAt', { $multiply: ['$expireIn', msPerHour] }] },
-          now
-        ]
-      };
-    } else {
-      filter.$expr = {
-        $lte: [
-          { $add: ['$createdAt', { $multiply: ['$expireIn', msPerHour] }] },
-          now
-        ]
-      };
-    }
-  }
-
-  // Generic search
   if (search != null && String(search).trim() !== '') {
     const term = String(search).trim();
     const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
     const or = [
-      { platform:  { $regex: esc(term), $options: 'i' } },
-      { createdBy: { $regex: esc(term), $options: 'i' } },
-      { targetUser:{ $regex: esc(term), $options: 'i' } }
+      { platform:   { $regex: esc(term), $options: 'i' } },
+      { createdBy:  { $regex: esc(term), $options: 'i' } },
+      { targetUser: { $regex: esc(term), $options: 'i' } },
     ];
 
-    // attempt _id match
-    try {
-      const { ObjectId } = require('mongodb');
-      if (ObjectId.isValid(term)) {
-        or.push({ _id: new ObjectId(term) });
-      }
-    } catch {}
-
-    // numeric equality on numeric fields only
+    // numeric equality on selected numeric fields
     const num = Number(term);
     if (Number.isFinite(num)) {
       or.push({ targetPerEmployee: num });
@@ -1041,35 +1015,63 @@ exports.getEmailTaskList = asyncHandler(async (req, res) => {
       or.push({ expireIn: num });
     }
 
-    filter.$or = or;
+    // attempt ObjectId match
+    try {
+      const { ObjectId } = require('mongodb');
+      if (ObjectId.isValid(term)) {
+        or.push({ _id: new ObjectId(term) });
+      }
+    } catch {
+      // no-op
+    }
+
+    match.$or = or;
   }
 
-  const [rows, total] = await Promise.all([
-    EmailTask.find(filter)
-      .sort(sort)
-      .skip(skip)
-      .limit(l)
-      .select(
-        'createdBy platform targetUser targetPerEmployee amountPerPerson maxEmails expireIn createdAt updatedAt'
-      )
-      .lean(),
-    EmailTask.countDocuments(filter)
-  ]);
-
-  const now = new Date();
   const msPerHour = 3600000;
+  const now = new Date();
 
-  let tasks = rows.map(t => {
-    const expiresAt = new Date(new Date(t.createdAt).getTime() + t.expireIn * msPerHour);
-    const status = now < expiresAt ? 'active' : 'expired';
-    return { ...t, expiresAt, status };
-  });
+  // ----- Aggregation: compute expiresAt in DB, then sort/paginate -----
+  const pipeline = [
+    { $match: match },
+    // coerce expireIn to number to avoid $multiply null issues
+    { $addFields: { _expireInNum: { $toDouble: "$expireIn" } } },
+    // compute expiresAt from createdAt + expireIn hours
+    { $addFields: { expiresAt: { $add: ["$createdAt", { $multiply: ["$_expireInNum", msPerHour] }] } } },
+  ];
 
-  // In-memory sort if requested by expiresAt
-  if (wantsExpiresAtSort) {
-    const dir = String(sortOrder).toLowerCase() === 'asc' ? 1 : -1;
-    tasks.sort((a, b) => (a.expiresAt - b.expiresAt) * dir);
+  // Optional active/expired filter
+  if (typeof active === 'boolean') {
+    pipeline.push({
+      $match: active ? { expiresAt: { $gt: now } } : { expiresAt: { $lte: now } }
+    });
   }
+
+  // Sort (by expiresAt or any other field), then paginate
+  pipeline.push(
+    { $sort: wantsExpiresAtSort ? { expiresAt: dir } : { [String(sortBy) || 'createdAt']: dir } },
+    {
+      $facet: {
+        rows: [
+          { $skip: skip },
+          { $limit: l },
+          // return all task fields; just drop helper
+          { $project: { _expireInNum: 0 } }
+        ],
+        meta: [{ $count: "total" }]
+      }
+    }
+  );
+
+  const agg = await EmailTask.aggregate(pipeline);
+  const rows = agg[0]?.rows || [];
+  const total = agg[0]?.meta?.[0]?.total || 0;
+
+  // Derive status field at response time (keeps logic centralized)
+  const tasks = rows.map(t => {
+    const status = now < t.expiresAt ? 'active' : 'expired';
+    return { ...t, status };
+  });
 
   res.json({
     tasks,
@@ -1078,6 +1080,8 @@ exports.getEmailTaskList = asyncHandler(async (req, res) => {
     pages: Math.ceil(total / l)
   });
 });
+
+
 
 exports.getEmailTaskDetails = asyncHandler(async (req, res) => {
   const { taskId, employeeId } = req.body || {};
