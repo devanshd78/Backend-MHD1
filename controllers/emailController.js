@@ -11,8 +11,8 @@ const { fetch, Agent } = require('undici');
 const Employee = require('../models/Employee');
 const EmailContact = require('../models/email');
 const User = require('../models/User');
-const mongoose = require('mongoose');                 
-const EmailTask = require('../models/EmailTask'); 
+const mongoose = require('mongoose');
+const EmailTask = require('../models/EmailTask');
 
 // ---------- HTTP agent ----------
 const httpAgent = new Agent({
@@ -24,35 +24,67 @@ const httpAgent = new Agent({
 const USE_SHARP = process.env.USE_SHARP !== '0';
 let sharp = null;
 if (USE_SHARP) {
-  try { sharp = require('sharp'); } catch { }
+  try { sharp = require('sharp'); } catch { /* ignore */ }
 }
 
 // ---------- Optional JSON repair ----------
 let jsonrepairFn = null;
-try { jsonrepairFn = require('jsonrepair').jsonrepair || require('jsonrepair'); } catch { }
+try { jsonrepairFn = require('jsonrepair').jsonrepair || require('jsonrepair'); } catch { /* ignore */ }
 
 // ---------- Models & perf knobs ----------
-const MODEL_PRIMARY = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_VISION_PRIMARY || 'gpt-4o-mini';
-const MODEL_FALLBACK = process.env.OPENAI_VISION_FALLBACK || 'gpt-4o';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-const PRIMARY_TOKENS = Number(process.env.PRIMARY_TOKENS || 320);
-const RETRY_TOKENS = Number(process.env.RETRY_TOKENS || 900);
+// Prefer generic model envs; keep old names as fallbacks.
+const MODEL_PRIMARY =
+  process.env.OPENAI_MODEL_PRIMARY ||
+  process.env.OPENAI_VISION_MODEL ||         // backward compat
+  process.env.OPENAI_VISION_PRIMARY ||       // backward compat
+  'gpt-5';
 
-const TEMP = Number(process.env.TEMPERATURE || 0);
-const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 30000);
+const MODEL_FALLBACK =
+  process.env.OPENAI_MODEL_FALLBACK ||
+  process.env.OPENAI_VISION_FALLBACK ||      // backward compat
+  'gpt-5-mini';
+
+// Optional: pin snapshots for stability, e.g. 2025-08-07
+const MODEL_PRIMARY_SNAPSHOT  = process.env.OPENAI_MODEL_SNAPSHOT_PRIMARY  || '';
+const MODEL_FALLBACK_SNAPSHOT = process.env.OPENAI_MODEL_SNAPSHOT_FALLBACK || '';
+
+function resolveModel(name, snapshot) {
+  // If already a snapshot like "gpt-5-2025-08-07", keep it.
+  if (/-\d{4}-\d{2}-\d{2}$/.test(name)) return name;
+  return snapshot ? `${name}-${snapshot}` : name;
+}
+
+const RESOLVED_MODEL_PRIMARY  = resolveModel(MODEL_PRIMARY,  MODEL_PRIMARY_SNAPSHOT);
+const RESOLVED_MODEL_FALLBACK = resolveModel(MODEL_FALLBACK, MODEL_FALLBACK_SNAPSHOT);
+
+const PRIMARY_TOKENS = Number(process.env.PRIMARY_TOKENS || 320);
+const RETRY_TOKENS   = Number(process.env.RETRY_TOKENS || 900);
+
+const TEMP        = Number(process.env.TEMPERATURE || 0);
+const TIMEOUT_MS  = Number(process.env.OPENAI_TIMEOUT_MS || 30000);
+
+// Image/vision knobs
 const MAX_IMG_W = Number(process.env.MAX_IMAGE_WIDTH || 1280);
 const MAX_IMG_H = Number(process.env.MAX_IMAGE_HEIGHT || 1280);
-const IMAGE_DETAIL = (process.env.IMAGE_DETAIL || 'low'); // 'low'|'auto'
-const ENABLE_CACHE = process.env.ENABLE_CACHE !== '0';
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
-const AGGRESSIVE_RACE = process.env.AGGRESSIVE_RACE === '1';
-const ENABLE_DARK_ENHANCE = process.env.ENABLE_DARK_ENHANCE !== '0'; // default ON
+// Prefer "auto" for gpt-5/gpt-5-mini
+const IMAGE_DETAIL = (process.env.IMAGE_DETAIL || 'auto'); // 'low'|'auto'
 
-// ---------- YouTube API (NEW) ----------
-const YT_API_KEY     = process.env.YOUTUBE_API_KEY;          // <-- set this in .env
-const YT_TIMEOUT_MS  = Number(process.env.YOUTUBE_TIMEOUT_MS || 12000);
-const YT_BASE        = 'https://www.googleapis.com/youtube/v3/channels';
+// Caching & behavior toggles
+const ENABLE_CACHE    = process.env.ENABLE_CACHE !== '0';
+const CACHE_TTL_MS    = Number(process.env.CACHE_TTL_MS || 5 * 60_000);
+const AGGRESSIVE_RACE = process.env.AGGRESSIVE_RACE === '1';
+// Keep available, but enhanceIfDark reads env directly to avoid scope issues
+const ENABLE_DARK_ENHANCE = process.env.ENABLE_DARK_ENHANCE !== '0';
+
+// ---------- YouTube API ----------
+const YT_API_KEY = process.env.YOUTUBE_API_KEY; // <-- set this in .env
+const YT_TIMEOUT_MS = Number(process.env.YOUTUBE_TIMEOUT_MS || 12000);
+const YT_BASE = 'https://www.googleapis.com/youtube/v3/channels';
+// ---------- YouTube subscriber gate (env-overridable) ----------
+const YT_SUBSCRIBER_MIN = Number(process.env.YT_SUBSCRIBER_MIN || 1000);
+const YT_SUBSCRIBER_MAX = Number(process.env.YT_SUBSCRIBER_MAX || 10_000_000);
 
 // ---------- Regex ----------
 const EMAIL_RX = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
@@ -115,6 +147,7 @@ const PLATFORM_MAP = new Map([
   ['other', 'other']
 ]);
 const SERVER_MAX_IMAGES = Number(process.env.MAX_BATCH_IMAGES || 50);
+
 function normalizePlatform(p) {
   if (!p) return null;
   const key = String(p).trim().toLowerCase();
@@ -148,7 +181,6 @@ function contactParsePageLimit(page = 1, limit = 20, maxLimit = 100) {
   return { p, l, skip };
 }
 
-
 function uniqueSorted(arr = []) {
   const seen = new Set(); const out = [];
   for (const s of arr) {
@@ -171,22 +203,69 @@ function cacheGet(key) {
 function cacheSet(key, data) {
   if (!ENABLE_CACHE) return;
   CACHE.set(key, { ts: now(), data });
-  if (CACHE.size > 500) { for (const k of CACHE.keys()) { CACHE.delete(k); if (CACHE.size <= 400) break; } }
+  if (CACHE.size > 500) {
+    for (const k of CACHE.keys()) { CACHE.delete(k); if (CACHE.size <= 400) break; }
+  }
 }
 
+// ---------- YouTube gating ----------
+async function gateBySubscriberCount(more_info) {
+  // If we can't check (no key or no handle), allow by default.
+  if (!YT_API_KEY) return { allowed: true, reason: 'Missing YOUTUBE_API_KEY; gate skipped.' };
+
+  const ytHandle = pickYouTubeHandle(more_info);
+  if (!ytHandle) return { allowed: true, reason: 'No YouTube handle found; gate skipped.' };
+
+  const cacheKey = `subgate|${ytHandle}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const yt = await fetchYouTubeChannelByHandle(ytHandle);
+  if (!yt) {
+    const out = { allowed: false, reason: `No YouTube channel found for ${ytHandle}.` };
+    cacheSet(cacheKey, out);
+    return out;
+  }
+
+  const subs = yt.subscriberCount;
+  if (typeof subs === 'number') {
+    if (subs < YT_SUBSCRIBER_MIN || subs > YT_SUBSCRIBER_MAX) {
+      const out = {
+        allowed: false,
+        reason: `subscriberCount ${subs} outside allowed range [${YT_SUBSCRIBER_MIN}, ${YT_SUBSCRIBER_MAX}]`,
+        youtube: yt
+      };
+      cacheSet(cacheKey, out);
+      return out;
+    }
+  }
+  const out = { allowed: true, youtube: yt };
+  cacheSet(cacheKey, out);
+  return out;
+}
+
+// ---------- Image preprocessing ----------
 async function enhanceIfDark(buffer) {
-  if (!sharp || !ENABLE_DARK_ENHANCE) return buffer;
+  // Read the flag locally each call to avoid ReferenceError if globals aren’t in scope.
+  const darkEnhanceOn = process.env.ENABLE_DARK_ENHANCE === '0' ? false : true;
+  if (!sharp || !darkEnhanceOn) return buffer;
   try {
     const img = sharp(buffer, { failOn: 'none' });
     const stats = await img.stats();
     const means = stats.channels.slice(0, 3).map(c => c.mean || 0);
     const avg = means.reduce((a, b) => a + b, 0) / (means.length || 1);
     if (avg < 85) {
-      return await sharp(buffer).modulate({ brightness: 1.35, saturation: 1.08 }).gamma(1.05).toBuffer();
+      return await sharp(buffer)
+        .modulate({ brightness: 1.35, saturation: 1.08 })
+        .gamma(1.05)
+        .toBuffer();
     }
     return buffer;
-  } catch { return buffer; }
+  } catch {
+    return buffer;
+  }
 }
+
 async function preprocessImage(buffer, mime) {
   if (!sharp) return buffer;
   try {
@@ -198,7 +277,9 @@ async function preprocessImage(buffer, mime) {
     }
     const buf = await (mime.includes('png') ? img.png({ compressionLevel: 6 }) : img.jpeg({ quality: 80 })).toBuffer();
     return await enhanceIfDark(buf);
-  } catch { return await enhanceIfDark(buffer); }
+  } catch {
+    return await enhanceIfDark(buffer);
+  }
 }
 async function imagePartFromBuffer(buffer, mimetype) {
   const mime = mimetype || 'image/jpeg';
@@ -213,7 +294,8 @@ async function imagePartFromPath(absPath) {
   return { type: 'input_image', image_url: bufferToDataUrl(buf, mime) };
 }
 function imagePartFromUrl(url) {
-  return { type: 'input_image', image_url: { url: String(url), detail: IMAGE_DETAIL } };
+  // Some GPT-5 variants ignore "detail"; keeping it optional is fine.
+  return { type: 'input_image', image_url: { url: String(url), ...(IMAGE_DETAIL ? { detail: IMAGE_DETAIL } : {}) } };
 }
 
 // ---------- OpenAI helpers ----------
@@ -256,13 +338,20 @@ function makeBody(imagePart, model, maxTokens) {
     model,
     input: [
       { role: 'system', content: [{ type: 'input_text', text: SYSTEM_MSG }] },
-      { role: 'user', content: [{ type: 'input_text', text: USER_INSTRUCTIONS }, imagePart] }
+      { role: 'user',   content: [{ type: 'input_text', text: USER_INSTRUCTIONS }, imagePart] }
     ],
-    text: { format: { type: 'json_schema', name: 'YouTubeAboutExtraction', schema: RESPONSE_SCHEMA.schema, strict: true } },
-    temperature: TEMP,
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'YouTubeAboutExtraction',
+        schema: RESPONSE_SCHEMA.schema,
+        strict: true
+      }
+    },
     max_output_tokens: maxTokens
   };
 }
+
 async function callOpenAI(body, timeoutMs) {
   const ac = new AbortController(); const t = setTimeout(() => ac.abort(new Error('OpenAI timeout')), timeoutMs);
   try {
@@ -273,7 +362,10 @@ async function callOpenAI(body, timeoutMs) {
       body: JSON.stringify(body),
       signal: ac.signal
     });
-    if (!r.ok) { const errText = await r.text().catch(() => ''); throw new Error(`OpenAI ${r.status}: ${errText || r.statusText}`); }
+    if (!r.ok) {
+      const errText = await r.text().catch(() => '');
+      throw new Error(`OpenAI ${r.status}: ${errText || r.statusText}`);
+    }
     const data = await r.json();
     const text = extractOutputText(data);
     if (!text) throw new Error('Empty output from OpenAI.');
@@ -284,23 +376,46 @@ function isValidStructured(result) {
   if (!result || typeof result !== 'object') return false;
   return ['has_captcha', 'rejection_reason', 'more_info'].every(k => k in result);
 }
+
+// Retry logic that falls back if a model rejects text.format/json_schema
 async function tryOnce(imagePart, model, tokens) {
-  const txt = await callOpenAI(makeBody(imagePart, model, tokens), TIMEOUT_MS);
-  const parsed = safeJSONParse(txt);
-  if (!isValidStructured(parsed)) throw new Error('Invalid structured output');
-  return parsed;
+  try {
+    const txt = await callOpenAI(makeBody(imagePart, model, tokens), TIMEOUT_MS);
+    const parsed = safeJSONParse(txt);
+    if (!isValidStructured(parsed)) throw new Error('Invalid structured output');
+    return parsed;
+  } catch (e) {
+    const msg = String(e?.message || '');
+    const unsupported =
+      msg.includes('text.format') ||
+      msg.includes('json_schema') ||
+      msg.includes('Unsupported') ||
+      msg.includes('not supported with model');
+
+    if (unsupported && model !== RESOLVED_MODEL_FALLBACK) {
+      const txt2 = await callOpenAI(makeBody(imagePart, RESOLVED_MODEL_FALLBACK, tokens), TIMEOUT_MS);
+      const parsed2 = safeJSONParse(txt2);
+      if (!isValidStructured(parsed2)) throw new Error('Invalid structured output (fallback)');
+      return parsed2;
+    }
+    throw e;
+  }
 }
+
 async function callVisionFast(imagePart) {
   if (AGGRESSIVE_RACE) {
-    const pPrimary = (async () => { try { return await tryOnce(imagePart, MODEL_PRIMARY, PRIMARY_TOKENS); } catch { return await tryOnce(imagePart, MODEL_PRIMARY, RETRY_TOKENS); } })();
-    const pFallback = tryOnce(imagePart, MODEL_FALLBACK, RETRY_TOKENS).catch(() => null);
+    const pPrimary = (async () => {
+      try { return await tryOnce(imagePart, RESOLVED_MODEL_PRIMARY, PRIMARY_TOKENS); }
+      catch { return await tryOnce(imagePart, RESOLVED_MODEL_PRIMARY, RETRY_TOKENS); }
+    })();
+    const pFallback = tryOnce(imagePart, RESOLVED_MODEL_FALLBACK, RETRY_TOKENS).catch(() => null);
     const winner = await Promise.any([pPrimary, pFallback].map(p => p.catch(() => Promise.reject())));
     return winner;
   } else {
-    try { return await tryOnce(imagePart, MODEL_PRIMARY, PRIMARY_TOKENS); }
+    try { return await tryOnce(imagePart, RESOLVED_MODEL_PRIMARY, PRIMARY_TOKENS); }
     catch {
-      try { return await tryOnce(imagePart, MODEL_PRIMARY, RETRY_TOKENS); }
-      catch { return await tryOnce(imagePart, MODEL_FALLBACK, RETRY_TOKENS); }
+      try { return await tryOnce(imagePart, RESOLVED_MODEL_PRIMARY, RETRY_TOKENS); }
+      catch { return await tryOnce(imagePart, RESOLVED_MODEL_FALLBACK, RETRY_TOKENS); }
     }
   }
 }
@@ -360,7 +475,7 @@ function shapeForClient(parsed) {
   };
 }
 
-// ---------- YouTube helpers (NEW) ----------
+// ---------- YouTube helpers ----------
 function normalizeHandle(h) {
   if (!h) return null;
   const t = String(h).trim();
@@ -440,7 +555,7 @@ async function enrichYouTubeForContact(more_info, persistResult) {
   if (!YT_API_KEY) return { saved: false, message: 'YouTube enrichment skipped: Missing YOUTUBE_API_KEY.' };
 
   // Decide which doc to update
-  const email  = persistResult?.email  ?? (Array.isArray(more_info?.emails)  ? more_info.emails[0]?.toLowerCase()?.trim()  : null);
+  const email = persistResult?.email ?? (Array.isArray(more_info?.emails) ? more_info.emails[0]?.toLowerCase()?.trim() : null);
   const handle = persistResult?.handle ?? (Array.isArray(more_info?.handles) ? more_info.handles[0]?.toLowerCase()?.trim() : null);
 
   const ytHandle = pickYouTubeHandle(more_info);
@@ -487,7 +602,7 @@ async function enrichYouTubeForContact(more_info, persistResult) {
 
 // ---------- Persistence (returns outcome so caller can mark errors) ----------
 async function persistMoreInfo(normalized, platform, userId, taskId) {
-  const email  = normalized?.email ? normalized.email.toLowerCase().trim() : null;
+  const email = normalized?.email ? normalized.email.toLowerCase().trim() : null;
   const handle = normalized?.handle ? normalized.handle.toLowerCase().trim() : null;
 
   if (!userId || typeof userId !== 'string' || !userId.trim()) {
@@ -541,7 +656,7 @@ async function persistMoreInfo(normalized, platform, userId, taskId) {
       };
     }
     // Both exist but are different documents
-    const updEmail  = await attachTaskIdIfMissing(byEmail);
+    const updEmail = await attachTaskIdIfMissing(byEmail);
     const updHandle = await attachTaskIdIfMissing(byHandle);
     return {
       outcome: 'duplicate',
@@ -588,6 +703,7 @@ async function persistMoreInfo(normalized, platform, userId, taskId) {
 
   return { outcome: 'saved', id: doc._id };
 }
+
 // ---------- Batch via EmailTask (maxEmails) ----------
 exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
   try {
@@ -620,19 +736,19 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
 
     // Prefer platform from task; fallback to request; then 'other'
     const platform = normalizePlatform(task.platform) ||
-                     normalizePlatform(req.body?.platform) ||
-                     'other';
+      normalizePlatform(req.body?.platform) ||
+      'other';
     const userId = (req.body?.userId || '').trim();
 
     // ---------- Gather inputs ----------
-    const allFiles   = Array.isArray(req.files) ? req.files : [];
+    const allFiles = Array.isArray(req.files) ? req.files : [];
     const validFiles = allFiles.filter(f => /^image\/(png|jpe?g|webp)$/i.test(f.mimetype || ''));
 
     const urls = Array.isArray(req.body?.imageUrl) ? req.body.imageUrl
-               : (Array.isArray(req.body?.imageUrls) ? req.body.imageUrls : []);
+      : (Array.isArray(req.body?.imageUrls) ? req.body.imageUrls : []);
 
     const paths = Array.isArray(req.body?.imagePath) ? req.body.imagePath
-                : (Array.isArray(req.body?.imagePaths) ? req.body.imagePaths : []);
+      : (Array.isArray(req.body?.imagePaths) ? req.body.imagePaths : []);
 
     // Allow <= maxImages; reject only if >
     const totalRequested = validFiles.length + urls.length + paths.length;
@@ -655,7 +771,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
       });
     }
 
-    // Build tasks (files → urls → paths). Since totalRequested <= max, remaining is just a guard.
+    // Build tasks (files → urls → paths).
     const jobs = [];
     let remaining = maxImages;
 
@@ -666,7 +782,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
       jobs.push((async () => {
         try {
           const imagePart = await imagePartFromBuffer(f.buffer, f.mimetype);
-          const cacheKey = hashString(`p|${f.originalname}|${f.size}|${MODEL_PRIMARY}|${MODEL_FALLBACK}|${PRIMARY_TOKENS}|${RETRY_TOKENS}|${IMAGE_DETAIL}|darkenhance`);
+          const cacheKey = hashString(`p|${f.originalname}|${f.size}|${RESOLVED_MODEL_PRIMARY}|${RESOLVED_MODEL_FALLBACK}|${PRIMARY_TOKENS}|${RETRY_TOKENS}|${IMAGE_DETAIL}|darkenhance`);
           let shaped = cacheGet(cacheKey);
           if (!shaped) {
             const parsed = await callVisionFast(imagePart);
@@ -676,6 +792,27 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
 
           if (shaped.has_captcha) {
             return { error: 'Captcha detected. Skipping database save.', has_captcha: true };
+          }
+
+          // --- Subscriber-count gate ---
+          let gate = { allowed: true };
+          try {
+            gate = await gateBySubscriberCount(shaped.more_info);
+          } catch (e) {
+            // Fail-open on transient errors
+            gate = { allowed: true, reason: e?.message || 'Subscriber gate check failed; skipping gate.' };
+          }
+          if (!gate.allowed) {
+            return {
+              error: gate.reason || 'Channel outside allowed subscriber range.',
+              has_captcha: false,
+              platform,
+              more_info: shaped.more_info,
+              normalized: shaped.normalized,
+              youtube: gate.youtube || null,
+              youtubeSaved: false,
+              youtubeMessage: 'Skipped due to subscriber policy'
+            };
           }
 
           const dbRes = await persistMoreInfo(shaped.normalized, platform, userId, task._id);
@@ -732,7 +869,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
         jobs.push((async () => {
           try {
             const imagePart = imagePartFromUrl(u);
-            const cacheKey = hashString(`purl|${u}|${MODEL_PRIMARY}|${MODEL_FALLBACK}|${PRIMARY_TOKENS}|${RETRY_TOKENS}|${IMAGE_DETAIL}|darkenhance`);
+            const cacheKey = hashString(`purl|${u}|${RESOLVED_MODEL_PRIMARY}|${RESOLVED_MODEL_FALLBACK}|${PRIMARY_TOKENS}|${RETRY_TOKENS}|${IMAGE_DETAIL}|darkenhance`);
             let shaped = cacheGet(cacheKey);
             if (!shaped) {
               const parsed = await callVisionFast(imagePart);
@@ -742,6 +879,26 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
             if (shaped.has_captcha) {
               return { error: 'Captcha detected. Skipping database save.', has_captcha: true };
             }
+            // Subscriber gate
+            let gate = { allowed: true };
+            try {
+              gate = await gateBySubscriberCount(shaped.more_info);
+            } catch (e) {
+              gate = { allowed: true, reason: e?.message || 'Subscriber gate check failed; skipping gate.' };
+            }
+            if (!gate.allowed) {
+              return {
+                error: gate.reason || 'Channel outside allowed subscriber range.',
+                has_captcha: false,
+                platform,
+                more_info: shaped.more_info,
+                normalized: shaped.normalized,
+                youtube: gate.youtube || null,
+                youtubeSaved: false,
+                youtubeMessage: 'Skipped due to subscriber policy'
+              };
+            }
+
             const dbRes = await persistMoreInfo(shaped.normalized, platform, userId, task._id);
 
             let ytRes = null;
@@ -796,7 +953,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
         jobs.push((async () => {
           try {
             const imagePart = await imagePartFromPath(path.resolve(String(pth)));
-            const cacheKey = hashString(`ppath|${pth}|${MODEL_PRIMARY}|${MODEL_FALLBACK}|${PRIMARY_TOKENS}|${RETRY_TOKENS}|${IMAGE_DETAIL}|darkenhance`);
+            const cacheKey = hashString(`ppath|${pth}|${RESOLVED_MODEL_PRIMARY}|${RESOLVED_MODEL_FALLBACK}|${PRIMARY_TOKENS}|${RETRY_TOKENS}|${IMAGE_DETAIL}|darkenhance`);
             let shaped = cacheGet(cacheKey);
             if (!shaped) {
               const parsed = await callVisionFast(imagePart);
@@ -806,6 +963,26 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
             if (shaped.has_captcha) {
               return { error: 'Captcha detected. Skipping database save.', has_captcha: true };
             }
+            // Subscriber gate
+            let gate = { allowed: true };
+            try {
+              gate = await gateBySubscriberCount(shaped.more_info);
+            } catch (e) {
+              gate = { allowed: true, reason: e?.message || 'Subscriber gate check failed; skipping gate.' };
+            }
+            if (!gate.allowed) {
+              return {
+                error: gate.reason || 'Channel outside allowed subscriber range.',
+                has_captcha: false,
+                platform,
+                more_info: shaped.more_info,
+                normalized: shaped.normalized,
+                youtube: gate.youtube || null,
+                youtubeSaved: false,
+                youtubeMessage: 'Skipped due to subscriber policy'
+              };
+            }
+
             const dbRes = await persistMoreInfo(shaped.normalized, platform, userId, task._id);
 
             let ytRes = null;
@@ -876,11 +1053,8 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
   }
 });
 
-
-
-
 // ---------- POST /email/all (single search; returns only email, handle, platform) ----------
-exports.getAllEmailContacts=asyncHandler(async (req, res)=> {
+exports.getAllEmailContacts = asyncHandler(async (req, res) => {
   try {
     const body = req.body || {};
 
@@ -970,7 +1144,7 @@ exports.getAllEmailContacts=asyncHandler(async (req, res)=> {
       fields.includes('youtube') || fields.some(f => f.startsWith('youtube.'));
     for (const f of fields) {
       if (f === 'youtube' || f.startsWith('youtube.')) {
-        projection.youtube = 1; // select whole subdocument (simpler & future-proof)
+        projection.youtube = 1; // select whole subdocument
       } else {
         projection[f] = 1;
       }
@@ -1083,8 +1257,6 @@ exports.getAllEmailContacts=asyncHandler(async (req, res)=> {
       .select(projection)
       .lean();
 
-    // Result: keep structure as-is; youtube stays nested if selected
-    // (By default, 'youtube' is included via defaultFields.)
     return res.json({
       page,
       limit,
@@ -1098,9 +1270,8 @@ exports.getAllEmailContacts=asyncHandler(async (req, res)=> {
   }
 });
 
-
 // ---------- NEW: POST /email/by-user  (list contacts by userId) ----------
-exports.getContactsByUser=asyncHandler(async (req, res)=> {
+exports.getContactsByUser = asyncHandler(async (req, res) => {
   try {
     const body = req.body || {};
     const userId = (body.userId || '').trim();
@@ -1151,7 +1322,7 @@ exports.getContactsByUser=asyncHandler(async (req, res)=> {
 });
 
 // ---------- NEW: POST /email/list-by-employee (summaries per user; search by username; optional user detail) ----------
-exports.getUserSummariesByEmployee=asyncHandler(async (req, res)=> {
+exports.getUserSummariesByEmployee = asyncHandler(async (req, res) => {
   try {
     const body = req.body || {};
     const employeeId = (body.employeeId || '').trim();
@@ -1211,16 +1382,13 @@ exports.getUserSummariesByEmployee=asyncHandler(async (req, res)=> {
       }, new Map());
     }
 
-    // 3) Build response per user with influencerDetails (replaces previous "platforms" counts)
+    // 3) Build response per user with influencerDetails
     const items = users.map(u => {
       const list = contactsByUser.get(u.userId) || [];
 
-      // compute first/last based on the full (unlimited) set if needed
-      // here we only have the limited list; still provide min/max from that list
       let firstSavedAt = null;
       let lastSavedAt = null;
       if (list.length) {
-        // list is newest-first sorted
         lastSavedAt = list[list.length - 1].createdAt || null; // oldest in the limited slice
         firstSavedAt = list[0].createdAt || null;               // newest in the limited slice
       }
@@ -1249,9 +1417,8 @@ exports.getUserSummariesByEmployee=asyncHandler(async (req, res)=> {
   }
 });
 
-// ---------- NEW (ADMIN): POST /admin/employee-overview (search employees by name; include team + collected data) ----------
 // ---------- UPDATED (ADMIN): POST /admin/employee-overview ----------
-exports.getEmployeeOverviewAdmin=asyncHandler(async (req, res)=> {
+exports.getEmployeeOverviewAdmin = asyncHandler(async (req, res) => {
   try {
     const body = req.body || {};
 
@@ -1326,7 +1493,6 @@ exports.getEmployeeOverviewAdmin=asyncHandler(async (req, res)=> {
         .lean();
     }
 
-    // Helper: include description + categories for admin view
     const summarizeYouTube = (yt) => {
       if (!yt) return undefined;
       return {
@@ -1339,9 +1505,9 @@ exports.getEmployeeOverviewAdmin=asyncHandler(async (req, res)=> {
         subscriberCount: yt.subscriberCount ?? null,
         videoCount: yt.videoCount ?? null,
         viewCount: yt.viewCount ?? null,
-        description: yt.description || null, // <--- added
-        topicCategories: Array.isArray(yt.topicCategories) ? yt.topicCategories : [], // <--- added
-        topicCategoryLabels: Array.isArray(yt.topicCategoryLabels) ? yt.topicCategoryLabels : [], // <--- added
+        description: yt.description || null,
+        topicCategories: Array.isArray(yt.topicCategories) ? yt.topicCategories : [],
+        topicCategoryLabels: Array.isArray(yt.topicCategoryLabels) ? yt.topicCategoryLabels : [],
         fetchedAt: yt.fetchedAt || null
       };
     };
@@ -1364,15 +1530,13 @@ exports.getEmployeeOverviewAdmin=asyncHandler(async (req, res)=> {
           handle: row.handle,
           platform: row.platform,
           createdAt: row.createdAt,
-          youtube: summarizeYouTube(row.youtube)  // includes desc + categories
+          youtube: summarizeYouTube(row.youtube)
         }));
         contactsByUser.set(uid, limited);
       }
     }
 
     // 5) Build response: employee -> collectors[] -> dataCollected[]
-    //    - hide collectors with empty dataCollected
-    //    - drop employees with no collectors after the filter
     const items = employees.map(emp => {
       const team = usersByEmployee.get(emp.employeeId) || [];
 
@@ -1397,8 +1561,8 @@ exports.getEmployeeOverviewAdmin=asyncHandler(async (req, res)=> {
         collectors
       };
     })
-    // remove employees with no visible collectors
-    .filter(empBlock => empBlock.collectors && empBlock.collectors.length > 0);
+      // remove employees with no visible collectors
+      .filter(empBlock => empBlock.collectors && empBlock.collectors.length > 0);
 
     return res.json({
       page,
@@ -1415,14 +1579,13 @@ exports.getEmployeeOverviewAdmin=asyncHandler(async (req, res)=> {
   }
 });
 
-
-// Controller
+// ---------- Controller: POST /email/check-status ----------
 exports.checkStatus = asyncHandler(async (req, res) => {
   try {
-    const rawHandle   = (req.body?.handle ?? '').trim();
+    const rawHandle = (req.body?.handle ?? '').trim();
     const rawPlatform = (req.body?.platform ?? '').trim();
 
-    if (!rawHandle)   return res.status(400).json({ status: 'error', message: 'handle is required' });
+    if (!rawHandle) return res.status(400).json({ status: 'error', message: 'handle is required' });
     if (!rawPlatform) return res.status(400).json({ status: 'error', message: 'platform is required' });
 
     // normalize to lowercase @handle
@@ -1435,13 +1598,16 @@ exports.checkStatus = asyncHandler(async (req, res) => {
     }
 
     // normalize platform (accept common aliases)
-    const PLATFORM_MAP = new Map([
+    const PLATFORM_MAP2 = new Map([
       ['youtube', 'youtube'], ['yt', 'youtube'],
       ['instagram', 'instagram'], ['ig', 'instagram'],
-      ['tiktok', 'tiktok'], ['tt', 'tiktok']
+      ['twitter', 'twitter'], ['x', 'twitter'],
+      ['tiktok', 'tiktok'], ['tt', 'tiktok'],
+      ['facebook', 'facebook'], ['fb', 'facebook'],
+      ['other', 'other']
     ]);
     const platformKey = rawPlatform.toLowerCase();
-    const platform = PLATFORM_MAP.get(platformKey);
+    const platform = PLATFORM_MAP2.get(platformKey);
 
     if (!platform) {
       return res.status(400).json({
@@ -1460,7 +1626,7 @@ exports.checkStatus = asyncHandler(async (req, res) => {
   }
 });
 
-
+// ---------- POST /email/by-task ----------
 exports.getEmailContactsByTask = asyncHandler(async (req, res) => {
   const {
     taskId,
