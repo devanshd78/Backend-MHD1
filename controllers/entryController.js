@@ -1,22 +1,21 @@
-// controllers/entryController.js
+// controllers/entryController.js (OpenAI Vision rewrite — no Flask)
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
-const axios = require('axios');
-const FormData = require('form-data');
 const imghash = require('imghash');
 const mongoose = require('mongoose');
 const { Types } = mongoose;
-const { PNG } = require('pngjs');
-const { Jimp } = require('jimp');
+const Jimp = require('jimp');
 const QrCode = require('qrcode-reader');
 const { parse } = require('querystring');
-const { analyzeBundle } = require('./screenshotController'); // <— NEW
+const OpenAI = require('openai').default; // CJS-compatible import
+
 const Entry = require('../models/Entry');
 const Link = require('../models/Link');
 const Employee = require('../models/Employee');
 const User = require('../models/User');
-const Screenshot = require('../models/Screenshot'); // <— NEW
+const Screenshot = require('../models/Screenshot');
 
+/* ------------------------ utils & helpers ------------------------ */
 const asyncHandler = fn => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
 const notFound = (res, msg) => res.status(404).json({ error: msg });
@@ -26,7 +25,7 @@ function isValidUpi(upi) {
 }
 
 /* -------------------- pHash + dedupe helpers -------------------- */
-const NIBBLE_POP = [0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4];
+const NIBBLE_POP = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
 
 function hexHamming(a, b) {
   const len = Math.max(a.length, b.length);
@@ -46,12 +45,12 @@ function computeSha256(buf) {
 
 async function computePhash(buf) {
   // 16x16 perceptual hash, hex output
-  return imghash.hash(buf, 16); 
+  return imghash.hash(buf, 16);
 }
 
 async function phashBundle(filesByRole) {
   const out = [];
-  for (const role of ['like','comment1','comment2','reply1','reply2']) {
+  for (const role of ['like', 'comment1', 'comment2', 'reply1', 'reply2']) {
     const f = filesByRole[role];
     if (!f) throw new Error(`Missing file: ${role}`);
     const phash = await computePhash(f.buffer, f.mimetype);
@@ -73,15 +72,106 @@ async function isDuplicateForUser(userId, phashes, hammingThreshold = 6) {
   return false;
 }
 
-async function verifyWithFlask(filesByRole) {
-  const form = new FormData();
-  for (const role of ['like','comment1','comment2','reply1','reply2']) {
-    const f = filesByRole[role];
-    form.append(role, f.buffer, { filename: f.originalname || `${role}.png`, contentType: f.mimetype });
+/* ----------------------- OpenAI Vision helper ----------------------- */
+function toDataUrl(file) {
+  // Converts multer file -> data URL for multi-modal input
+  return `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
+}
+
+async function verifyWithOpenAI(filesByRole) {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+  const primaryModel  = process.env.OPENAI_VISION_MODEL   || 'gpt-4.1-nano';
+  const fallbackModel = process.env.OPENAI_VISION_FALLBACK || 'gpt-4.1-mini';
+
+  const roles = ['like', 'comment1', 'comment2', 'reply1', 'reply2'];
+  const imgs  = roles.map(r => ({ role: r, url: toDataUrl(filesByRole[r]) }));
+
+  const instructions = `
+You are a meticulous vision + OCR analyst for YouTube screenshots.
+You will receive exactly 5 images with roles: like, comment1, comment2, reply1, reply2.
+
+Return STRICT JSON (and only JSON) with this exact shape:
+{
+  "liked": boolean,                        // true if the Like button/state is clearly ON/filled/highlighted
+  "user_id": string | null,                // lowercase handle like "@name" if confidently visible; otherwise null
+  "comments": [ { "text": string, "handle": string } ],  // ONLY items from the SAME author; set handle=user_id if you’re confident it’s the same author even if the handle text isn’t visible in that image
+  "replies":  [ { "text": string, "handle": string } ]   // ONLY items from the SAME author; set handle=user_id if confident via avatar/name/thread context
+}
+
+CRITICAL RULES
+- PICK ONE AUTHOR: Choose ONE handle as user_id (from any image where a handle is visible). Normalize to lowercase and keep leading "@".
+- SAME AUTHOR ONLY: Include ONLY comments/replies authored by that same person. If a later image doesn’t render the handle but you can clearly tell it’s the SAME author (same avatar, same display name, same thread bubble/placement), INCLUDE it and set its handle to user_id (do NOT leave null). If not confident, exclude it.
+- CONSERVATIVE OCR: Only include text you can confidently read; preserve original wording/spacing.
+- LIMITS: Provide up to TWO comments and up to TWO replies by that same author across all images (pick the clearest). If fewer are visible, include what you can (0..2).
+- LIKED: Determine from the 'like' image whether the post/video is clearly liked. If ambiguous, set liked=false.
+- DO NOT compute any other fields. Output ONLY the JSON object above.
+`;
+
+  const messages = [
+    { role: 'system', content: 'You are a precise vision/OCR and UI-state verifier.' },
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: instructions },
+        { type: 'text', text: 'Role: like' },
+        { type: 'image_url', image_url: { url: imgs.find(i => i.role === 'like').url } },
+        { type: 'text', text: 'Role: comment1' },
+        { type: 'image_url', image_url: { url: imgs.find(i => i.role === 'comment1').url } },
+        { type: 'text', text: 'Role: comment2' },
+        { type: 'image_url', image_url: { url: imgs.find(i => i.role === 'comment2').url } },
+        { type: 'text', text: 'Role: reply1' },
+        { type: 'image_url', image_url: { url: imgs.find(i => i.role === 'reply1').url } },
+        { type: 'text', text: 'Role: reply2' },
+        { type: 'image_url', image_url: { url: imgs.find(i => i.role === 'reply2').url } },
+      ]
+    }
+  ];
+
+  async function callModel(modelName) {
+    const resp = await openai.chat.completions.create({
+      model: modelName,
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      messages
+    });
+
+    const raw = resp.choices?.[0]?.message?.content || '{}';
+    let parsed; try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+
+    const user_id_raw = typeof parsed.user_id === 'string' ? parsed.user_id : null;
+    const norm = s => (typeof s === 'string' ? s.trim().toLowerCase() : null);
+    const same = (h, uid) => uid && norm(h) === uid;
+    const uid = norm(user_id_raw);
+
+    const detailedComments = Array.isArray(parsed.comments) ? parsed.comments : [];
+    const detailedReplies  = Array.isArray(parsed.replies)  ? parsed.replies  : [];
+
+    const commentsSameUser = detailedComments
+      .filter(it => same(it?.handle, uid))
+      .map(it => String(it.text || '').trim())
+      .filter(Boolean);
+
+    const repliesSameUser = detailedReplies
+      .filter(it => same(it?.handle, uid))
+      .map(it => String(it.text || '').trim())
+      .filter(Boolean);
+
+    return {
+      liked: !!parsed.liked,
+      user_id: uid ? user_id_raw.toLowerCase() : null,
+      comment: commentsSameUser,
+      replies: repliesSameUser,
+      verified: false // server recomputes strictly
+    };
   }
-  const url = (process.env.SS_ANALYZER_URL || 'https://api.sharemitra.com/yt-analyzer') + '/analyze';
-  const { data } = await axios.post(url, form, { headers: form.getHeaders(), timeout: 20000 });
-  return data;
+
+  // Try primary; if insufficient extraction, try fallback
+  const first  = await callModel(primaryModel);
+  const good   = first && first.liked === true && typeof first.user_id === 'string' && first.user_id.length > 0 && Array.isArray(first.comment) && first.comment.length >= 2 && Array.isArray(first.replies) && first.replies.length >= 2;
+  if (good) return first;
+  const second = await callModel(fallbackModel);
+  return second; // may or may not be "good"; caller enforces final rules
 }
 
 /* ------------------------------------------------------------------ */
@@ -120,7 +210,7 @@ exports.createEmployeeEntry = asyncHandler(async (req, res) => {
     }
   }
 
-  if (!upiId)             return badRequest(res, 'UPI ID is required');
+  if (!upiId) return badRequest(res, 'UPI ID is required');
   if (!isValidUpi(upiId)) return badRequest(res, 'Invalid UPI format');
 
   const emp = await Employee.findOne({ employeeId });
@@ -278,23 +368,28 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     // non-fatal → continue
   }
 
-  // ── run Python analyzer (OCR + like) → already normalized + deduped
+  // ── run ChatGPT Vision analyzer (OCR + like)
   let analysis;
   try {
-    analysis = await verifyWithFlask(filesByRole);
+    analysis = await verifyWithOpenAI(filesByRole);
   } catch (e) {
-    console.error('Analyzer error:', e);
+    console.error('OpenAI analyzer error:', e);
     return res.status(502).json({ code: 'ANALYZER_ERROR', message: 'Verification service error. Please try again.' });
   }
 
   // ── stable analysis payload
   const analysisPayload = {
     liked: !!analysis.liked,
-    user_id: analysis.user_id ?? null, // Python returns normalized lowercased @handle or null
+    user_id: analysis.user_id ?? null,
     comment: Array.isArray(analysis.comment) ? analysis.comment : [],
     replies: Array.isArray(analysis.replies) ? analysis.replies : [],
-    verified: !!analysis.verified
+    verified: false // will be recomputed strictly below
   };
+
+  // Enforce SAME-USER requirement strictly on our side too
+  const hasHandle = typeof analysisPayload.user_id === 'string' && analysisPayload.user_id.trim().length > 0;
+  const meetsCounts = analysisPayload.comment.length >= 2 && analysisPayload.replies.length >= 2;
+  analysisPayload.verified = !!analysisPayload.liked && !!hasHandle && meetsCounts;
 
   if (!analysisPayload.verified) {
     return res.status(422).json({
@@ -305,7 +400,7 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
         user_id: analysisPayload.user_id,
         commentCount: analysisPayload.comment.length,
         replyCount: analysisPayload.replies.length,
-        needed: { minComments: 2, minReplies: 2, liked: true }
+        needed: { minComments: 2, minReplies: 2, liked: true, sameUser: true, handleRequired: true }
       },
       verification: analysisPayload
     });
@@ -519,21 +614,20 @@ exports.updateEntry = asyncHandler(async (req, res) => {
   });
 });
 
-
 /* ------------------------------------------------------------------ */
 /*  6) APPROVE / REJECT                                               */
 /* ------------------------------------------------------------------ */
 exports.setEntryStatus = asyncHandler(async (req, res) => {
   const { entryId, approve } = req.body;
-  if (!entryId) 
+  if (!entryId)
     return badRequest(res, 'entryId required');
   const newStatus = Number(approve);
-  if (![0,1].includes(newStatus))
+  if (![0, 1].includes(newStatus))
     return badRequest(res, 'approve must be 0 or 1');
 
   // 1) Load the entry once
   const entry = await Entry.findOne({ entryId });
-  if (!entry) 
+  if (!entry)
     return notFound(res, 'Entry not found');
 
   // 2) If it already has that status, bail out immediately
@@ -565,7 +659,7 @@ exports.setEntryStatus = asyncHandler(async (req, res) => {
 
     // 3a) Load employee and check balance
     const employee = await Employee.findOne({ employeeId: targetEmpId });
-    if (!employee) 
+    if (!employee)
       return notFound(res, 'Employee to debit not found');
     if (employee.balance < deduction) {
       return badRequest(res, 'Insufficient balance. Please add funds before approval.');
@@ -611,13 +705,6 @@ exports.setEntryStatus = asyncHandler(async (req, res) => {
   res.json(payload);
 });
 
-
-
-
-/* ------------------------------------------------------------------ */
-/*  LIST – employee + specific link, POST /entries/listByLink         */
-/*     Body: { employeeId, linkId, page?, limit? }                    */
-/* ------------------------------------------------------------------ */
 /* ------------------------------------------------------------------ */
 /*  LIST – employee + specific link, POST /entries/listByLink         */
 /*     Body: { employeeId, linkId, page?, limit? }                    */
@@ -685,5 +772,3 @@ exports.listEntriesByLink = asyncHandler(async (req, res) => {
     grandTotal
   });
 });
-
-
