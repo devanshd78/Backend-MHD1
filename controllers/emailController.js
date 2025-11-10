@@ -1580,12 +1580,14 @@ exports.getEmployeeOverviewAdmin = asyncHandler(async (req, res) => {
 });
 
 // ---------- Controller: POST /email/check-status ----------
+// controllers/emailController.js
 exports.checkStatus = asyncHandler(async (req, res) => {
   try {
-    const rawHandle = (req.body?.handle ?? '').trim();
+    const rawHandle   = (req.body?.handle ?? '').trim();
     const rawPlatform = (req.body?.platform ?? '').trim();
+    const userId      = typeof req.body?.userId === 'string' ? req.body.userId.trim() : ''; // ← optional
 
-    if (!rawHandle) return res.status(400).json({ status: 'error', message: 'handle is required' });
+    if (!rawHandle)   return res.status(400).json({ status: 'error', message: 'handle is required' });
     if (!rawPlatform) return res.status(400).json({ status: 'error', message: 'platform is required' });
 
     // normalize to lowercase @handle
@@ -1608,18 +1610,28 @@ exports.checkStatus = asyncHandler(async (req, res) => {
     ]);
     const platformKey = rawPlatform.toLowerCase();
     const platform = PLATFORM_MAP2.get(platformKey);
-
     if (!platform) {
       return res.status(400).json({
         status: 'error',
-        message: 'Invalid platform. Use: youtube|instagram|twitter|tiktok|facebook|other (or aliases: yt, ig, x, tt, fb)'
+        message:
+          'Invalid platform. Use: youtube|instagram|twitter|tiktok|facebook|other (or aliases: yt, ig, x, tt, fb)'
       });
     }
 
-    // existence check for the (handle, platform) pair
-    const exists = await EmailContact.exists({ handle, platform });
+    // Build query; if userId provided, restrict to that collector’s entries
+    const query = { handle, platform, ...(userId ? { userId } : {}) };
 
-    return res.json({ status: exists ? 1 : 0 });
+    // fetch one row (schema has unique handle, so at most one anyway)
+    const contact = await EmailContact.findOne(query)
+      .select({ email: 1, handle: 1, platform: 1, userId: 1, _id: 0 })
+      .lean();
+
+    return res.json({
+      status: contact ? 1 : 0,
+      email: contact ? contact.email : null,
+      handle,
+      platform,
+    });
   } catch (err) {
     console.error('checkStatus error:', err);
     return res.status(400).json({ status: 'error', message: err?.message || 'Failed to check handle.' });
