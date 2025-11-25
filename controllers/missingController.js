@@ -42,32 +42,37 @@ exports.createMissing = asyncHandler(async (req, res) => {
     });
   }
 
-  // If the same (handle, platform, brandId) already exists, return it
-  const existing = await Missing.findOne({ handle, platform, brandId: rawBrandId }).lean();
+  // ❗ No duplicate missing handle:
+  // If ANY entry exists for (handle, platform), do NOT create another.
+  const existing = await Missing.findOne({ handle, platform }).lean();
   if (existing) {
-    return res.json({
+    return res.status(200).json({
       status: 'exists',
+      message: 'Data will come soon. Missing request already present.',
       data: {
         missingId: existing.missingId,
         handle: existing.handle,
         platform: existing.platform,
         brandId: existing.brandId,
         note: existing.note ?? null,
+        isAvailable: typeof existing.isAvailable === 'number' ? existing.isAvailable : 0,
         createdAt: existing.createdAt
       }
     });
   }
 
-  // Create new (just store brandId; no Brand lookup)
+  // Create new (store brandId, isAvailable defaults to 0 in schema)
   const doc = await Missing.create({ handle, platform, brandId: rawBrandId, note });
   return res.status(201).json({
     status: 'saved',
+    message: 'Missing request created.',
     data: {
       missingId: doc.missingId,
       handle: doc.handle,
       platform: doc.platform,
       brandId: doc.brandId,
       note: doc.note ?? null,
+      isAvailable: doc.isAvailable, // 0 by default
       createdAt: doc.createdAt
     }
   });
@@ -76,10 +81,11 @@ exports.createMissing = asyncHandler(async (req, res) => {
 // POST /missing/list
 // body: {
 //   page?: number (default 1), limit?: number (default 50, max 200),
-//   search?: string (searches handle, platform, missingId, brandId, note),
+//   search?: string (searches handle, platform, missingId, brandId, note, isAvailable),
 //   platform?: string (optional exact/alias filter),
 //   handle?: string (optional normalized),
-//   brandId?: string (optional exact brand filter)
+//   brandId?: string (optional exact brand filter),
+//   isAvailable?: 0|1 (optional availability filter)
 // }
 exports.listMissing = asyncHandler(async (req, res) => {
   const body = req.body || {};
@@ -89,10 +95,11 @@ exports.listMissing = asyncHandler(async (req, res) => {
   const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? '50', 10)));
 
   // Optional filters
-  const rawSearch   = typeof body.search === 'string' ? body.search.trim() : '';
-  const rawPlatform = typeof body.platform === 'string' ? body.platform.trim() : '';
-  const rawHandle   = typeof body.handle === 'string' ? body.handle.trim() : '';
-  const rawBrandId  = typeof body.brandId === 'string' ? body.brandId.trim() : '';
+  const rawSearch      = typeof body.search === 'string' ? body.search.trim() : '';
+  const rawPlatform    = typeof body.platform === 'string' ? body.platform.trim() : '';
+  const rawHandle      = typeof body.handle === 'string' ? body.handle.trim() : '';
+  const rawBrandId     = typeof body.brandId === 'string' ? body.brandId.trim() : '';
+  const rawIsAvailable = body.isAvailable; // can be 0 or 1 or undefined
 
   const query = {};
 
@@ -122,6 +129,21 @@ exports.listMissing = asyncHandler(async (req, res) => {
     query.brandId = rawBrandId;
   }
 
+  // isAvailable filter
+  if (rawIsAvailable !== undefined && rawIsAvailable !== null && rawIsAvailable !== '') {
+    const val = Number(rawIsAvailable);
+    if (val !== 0 && val !== 1) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Invalid isAvailable filter. Use 0 (not available) or 1 (available).'
+      });
+    }
+    query.isAvailable = val;
+  } else {
+    // 🔹 Default: show ONLY records where isAvailable = 0
+    query.isAvailable = 0;
+  }
+
   // Base fetch
   const [total, docs] = await Promise.all([
     Missing.countDocuments(query),
@@ -129,7 +151,16 @@ exports.listMissing = asyncHandler(async (req, res) => {
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
       .limit(limit)
-      .select({ _id: 0, missingId: 1, handle: 1, platform: 1, brandId: 1, note: 1, createdAt: 1 })
+      .select({
+        _id: 0,
+        missingId: 1,
+        handle: 1,
+        platform: 1,
+        brandId: 1,
+        note: 1,
+        isAvailable: 1,
+        createdAt: 1
+      })
       .lean()
   ]);
 
@@ -137,12 +168,13 @@ exports.listMissing = asyncHandler(async (req, res) => {
   let items = docs;
   if (rawSearch) {
     const rx = new RegExp(escapeRegex(rawSearch), 'i');
-    items = items.filter(r =>
+    items = items.filter((r) =>
       rx.test(r.handle) ||
       rx.test(r.platform) ||
       rx.test(r.missingId) ||
       rx.test(r.brandId || '') ||
-      rx.test(r.note || '')
+      rx.test(r.note || '') ||
+      rx.test(String(r.isAvailable ?? ''))
     );
   }
 
@@ -152,5 +184,49 @@ exports.listMissing = asyncHandler(async (req, res) => {
     total,
     hasNext: page * limit < total,
     data: items
+  });
+});
+
+
+exports.setMissingAvailable = asyncHandler(async (req, res) => {
+  const rawMissingId = (req.body?.missingId ?? '').trim();
+
+  if (!rawMissingId) {
+    return res.status(400).json({
+      status: 'error',
+      message: 'missingId is required'
+    });
+  }
+
+  // Find and update in one go
+  const doc = await Missing.findOneAndUpdate(
+    { missingId: rawMissingId },
+    { $set: { isAvailable: 1 } },
+    { new: true }
+  )
+    .select({
+      _id: 0,
+      missingId: 1,
+      handle: 1,
+      platform: 1,
+      brandId: 1,
+      note: 1,
+      isAvailable: 1,
+      createdAt: 1,
+      updatedAt: 1
+    })
+    .lean();
+
+  if (!doc) {
+    return res.status(404).json({
+      status: 'error',
+      message: 'Missing record not found for the given missingId'
+    });
+  }
+
+  return res.json({
+    status: 'ok',
+    message: 'Missing record marked as available.',
+    data: doc
   });
 });

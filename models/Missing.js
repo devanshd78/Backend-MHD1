@@ -50,6 +50,15 @@ const MissingSchema = new mongoose.Schema({
     ref: 'Brand'
   },
 
+  // NEW: availability flag (0 = not available, 1 = available)
+  isAvailable: {
+    type: Number,
+    required: true,
+    enum: [0, 1],
+    default: 0,
+    index: true
+  },
+
   // Optional: for debugging/notes
   note: { type: String, trim: true }
 }, { timestamps: true });
@@ -58,5 +67,7 @@ const MissingSchema = new mongoose.Schema({
 MissingSchema.index({ createdAt: -1 });
 MissingSchema.index({ handle: 1, platform: 1 });
 MissingSchema.index({ brandId: 1 });
+// You can also keep this, but isAvailable already indexed above
+// MissingSchema.index({ isAvailable: 1 });
 
 module.exports = mongoose.models.Missing || mongoose.model('Missing', MissingSchema);
