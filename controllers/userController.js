@@ -146,17 +146,20 @@ exports.getUsersByEmployeeId = async (req, res) => {
   }
 };
 
-/* show the three newest links, plus completed flags for this user ---- */
+/* show all links, plus completed flags for this user ------------------ */
 exports.listLinksForUser = async (req, res) => {
   try {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ message: 'Please provide userId.' });
 
-    const links = await Link.find().sort({ createdAt: -1 }).limit(3).lean();
+    // 🚫 removed .limit(3) – now returns ALL links, newest first
+    const links = await Link.find().sort({ createdAt: -1 }).lean();
     if (links.length === 0) return res.json([]);
 
     const completedIds = await Entry.distinct('linkId', { type: 1, userId });
     const doneSet = new Set(completedIds.map(id => id.toString()));
+
+    // still keep a "latest" link for highlighting purposes
     const latestId = links[0]._id.toString();
 
     const annotated = links.map(l => ({
@@ -171,6 +174,7 @@ exports.listLinksForUser = async (req, res) => {
     res.status(500).json({ message: 'Server error.' });
   }
 };
+
 
 /* ------------------------------------------------------------------ */
 /*  profile update (name / upi)                                        */
