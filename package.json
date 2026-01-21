@@ -5,12 +5,14 @@
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
-    "start-flask": "flask-api/.venv/bin/python flask-api/image_comment_like_extract.py",
-    "dev": "concurrently \"npm run start-flask\" \"npm start\""
+    "start-flask": "cross-env PORT1=6000 DEBUG=1 OCR_TIMEOUT=12 OCR_THREADS=3 MAX_SIDE=1400 SKIP_OCR_WHEN_UNLIKED=0 FLASK_ANALYZER_LOG=1 TESSERACT_CMD=/opt/homebrew/bin/tesseract flask-api/.venv/bin/python flask-api/image_comment_like_extract.py",
+    "dev": "concurrently -n FLASK,NODE -c green,blue \"npm run start-flask\" \"npm run start\""
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.13.2",
     "bcrypt": "^5.1.1",
     "bcryptjs": "^3.0.2",
     "body-parser": "^2.2.0",
@@ -19,6 +21,7 @@
     "express": "^5.1.0",
     "express-async-handler": "^1.2.0",
     "express-session": "^1.18.1",
+    "form-data": "^4.0.5",
     "image-hash": "^5.3.2",
     "imghash": "^1.1.0",
     "jimp": "^1.6.0",
@@ -40,6 +43,7 @@
     "uuid": "^11.1.0"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "cross-env": "^10.1.0"
   }
 }
