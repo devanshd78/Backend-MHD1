@@ -1,4 +1,4 @@
-// controllers/entryController.js (Flask analyzer version)
+// controllers/entryController.js (Flask analyzer version) — UPDATED
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const imghash = require('imghash');
@@ -26,6 +26,23 @@ function isValidUpi(upi) {
   return /^[a-zA-Z0-9_.-]+@[a-zA-Z0-9.-]+$/.test(upi);
 }
 
+const clamp02 = (v, def) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(0, Math.min(2, Math.floor(n)));
+};
+
+function toBool(v, def = false) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v === 1;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'y'].includes(s)) return true;
+    if (['0', 'false', 'no', 'n'].includes(s)) return false;
+  }
+  return def;
+}
+
 /* -------------------- pHash + dedupe helpers -------------------- */
 const NIBBLE_POP = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
 
@@ -50,9 +67,9 @@ async function computePhash(buf) {
   return imghash.hash(buf, 16);
 }
 
-async function phashBundle(filesByRole) {
+async function phashBundle(filesByRole, roles) {
   const out = [];
-  for (const role of ['like', 'comment1', 'comment2', 'reply1', 'reply2']) {
+  for (const role of roles) {
     const f = filesByRole[role];
     if (!f) throw new Error(`Missing file: ${role}`);
     const phash = await computePhash(f.buffer, f.mimetype);
@@ -77,14 +94,7 @@ async function isDuplicateForUser(userId, phashes, hammingThreshold = 6) {
 
 /* ----------------------- Flask analyzer helper ----------------------- */
 const FLASK_ANALYZER_URL = process.env.FLASK_ANALYZER_URL || 'http://127.0.0.1:6000/analyze';
-const FLASK_TIMEOUT_MS = Number(process.env.FLASK_TIMEOUT_MS || 30000);
-
-function normalizeHandle(h) {
-  if (!h || typeof h !== 'string') return null;
-  const s = h.trim().toLowerCase();
-  if (!s) return null;
-  return s.startsWith('@') ? s : `@${s}`;
-}
+const FLASK_TIMEOUT_MS = Number(process.env.FLASK_TIMEOUT_MS || 45000);
 
 function mimeToExt(mime) {
   if (mime === 'image/png') return 'png';
@@ -92,14 +102,27 @@ function mimeToExt(mime) {
   return 'jpg';
 }
 
-async function verifyWithFlask(filesByRole, { debug = false } = {}) {
-  const roles = ['like', 'comment1', 'comment2', 'reply1', 'reply2'];
-
+/**
+ * IMPORTANT UPDATES:
+ * - Sends the "like" image too (if present) so flask can compute liked.
+ * - Passes min_comments, min_replies, require_like via query string.
+ * - Only sends the images you actually have (presentRoles) + required ones.
+ */
+async function verifyWithFlask(
+  filesByRole,
+  {
+    debug = false,
+    minComments = 2,
+    minReplies = 2,
+    requireLike = false,
+    presentRoles = ['like', 'comment1', 'comment2', 'reply1', 'reply2']
+  } = {}
+) {
   const form = new FormData();
-  for (const role of roles) {
-    const f = filesByRole[role];
-    if (!f) throw new Error(`Missing file: ${role}`);
 
+  for (const role of presentRoles) {
+    const f = filesByRole[role];
+    if (!f) continue;
     form.append(role, f.buffer, {
       filename: `${role}.${mimeToExt(f.mimetype)}`,
       contentType: f.mimetype,
@@ -107,10 +130,20 @@ async function verifyWithFlask(filesByRole, { debug = false } = {}) {
     });
   }
 
-  const url = debug ? `${FLASK_ANALYZER_URL}?debug=1` : FLASK_ANALYZER_URL;
+  const contentLength = await new Promise((resolve, reject) => {
+    form.getLength((err, length) => (err ? reject(err) : resolve(length)));
+  });
+
+  const qs =
+    `min_comments=${encodeURIComponent(minComments)}` +
+    `&min_replies=${encodeURIComponent(minReplies)}` +
+    `&require_like=${requireLike ? 1 : 0}` +
+    (debug ? `&debug=1` : ``);
+
+  const url = `${FLASK_ANALYZER_URL}?${qs}`;
 
   const resp = await axios.post(url, form, {
-    headers: form.getHeaders(),
+    headers: { ...form.getHeaders(), 'Content-Length': contentLength },
     timeout: FLASK_TIMEOUT_MS,
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
@@ -125,36 +158,11 @@ async function verifyWithFlask(filesByRole, { debug = false } = {}) {
     throw err;
   }
 
-  const data = resp.data || {};
-  const liked = !!data.liked;
-  const user_id = normalizeHandle(data.user_id);
-
-  const comment = Array.isArray(data.comment)
-    ? data.comment.map(x => String(x || '').trim()).filter(Boolean)
-    : [];
-
-  const replies = Array.isArray(data.replies)
-    ? data.replies.map(x => String(x || '').trim()).filter(Boolean)
-    : [];
-
-  // strict recompute on Node side
-  const hasHandle = typeof user_id === 'string' && user_id.length > 2;
-  const meetsCounts = comment.length >= 2 && replies.length >= 2;
-
-  return {
-    liked,
-    user_id,
-    comment,
-    replies,
-    verified: !!(liked && hasHandle && meetsCounts),
-    message: typeof data.message === 'string' ? data.message : undefined,
-    debug: data.debug || undefined
-  };
+  return resp.data || {};
 }
 
 /* ------------------------------------------------------------------ */
 /*  1) CREATE by employee (type 0)                                     */
-/*     - manual UPI or QR decode                                       */
 /* ------------------------------------------------------------------ */
 exports.createEmployeeEntry = asyncHandler(async (req, res) => {
   const { name, amount, employeeId, notes = '', upiId: manualUpi } = req.body;
@@ -165,7 +173,6 @@ exports.createEmployeeEntry = asyncHandler(async (req, res) => {
   let upiId = manualUpi?.trim();
 
   if (!upiId && req.file) {
-    // decode QR
     try {
       const img = await Jimp.read(req.file.buffer);
       const upiString = await new Promise((resolve, reject) => {
@@ -261,17 +268,37 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     return res.status(400).json({ code: 'UPI_MISMATCH', message: 'Provided UPI does not match your account' });
   }
 
-  // files validation
-  const roles = ['like', 'comment1', 'comment2', 'reply1', 'reply2'];
-  const files = req.files || {};
-  const filesByRole = Object.fromEntries(roles.map(r => [r, files[r]?.[0]]));
+  // Rules come from Link (defaults if missing)
+  const minComments = clamp02(link.minComments, 2);
+  const minReplies = clamp02(link.minReplies, 2);
+  const requireLike = toBool(link.requireLike, false);
 
-  const missing = roles.filter(r => !filesByRole[r]);
+  if (minComments === 0 && minReplies === 0) {
+    return res.status(400).json({
+      code: 'INVALID_RULES',
+      message: 'Link rules invalid: minComments and minReplies cannot both be 0'
+    });
+  }
+
+  const requiredRoles = [];
+  if (requireLike) requiredRoles.push('like');
+  if (minComments >= 1) requiredRoles.push('comment1');
+  if (minComments >= 2) requiredRoles.push('comment2');
+  if (minReplies >= 1) requiredRoles.push('reply1');
+  if (minReplies >= 2) requiredRoles.push('reply2');
+
+  const ALL_ROLES = ['like', 'comment1', 'comment2', 'reply1', 'reply2'];
+  const files = req.files || {};
+  const filesByRole = Object.fromEntries(ALL_ROLES.map(r => [r, files[r]?.[0]]));
+
+  const missing = requiredRoles.filter(r => !filesByRole[r]);
   if (missing.length) {
     return res.status(400).json({
       code: 'MISSING_IMAGES',
-      message: 'Upload exactly 5 images: like, comment1, comment2, reply1, reply2',
-      missing
+      message: 'Missing required images for this link rules',
+      required: requiredRoles,
+      missing,
+      rules: { minComments, minReplies, requireLike }
     });
   }
 
@@ -280,7 +307,9 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
   const typeErrors = [];
   const sizeErrors = [];
 
-  for (const r of roles) {
+  // validate only uploaded images
+  const presentRoles = ALL_ROLES.filter(r => filesByRole[r]);
+  for (const r of presentRoles) {
     const f = filesByRole[r];
     if (!ALLOWED_MIME.includes(f.mimetype)) typeErrors.push({ role: r, mimetype: f.mimetype });
     if (typeof f.size === 'number' && f.size > MAX_SIZE) sizeErrors.push({ role: r, size: f.size, max: MAX_SIZE });
@@ -297,10 +326,10 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     });
   }
 
-  // pHash + sha
+  // pHash + sha for uploaded images
   let hashed;
   try {
-    hashed = await phashBundle(filesByRole);
+    hashed = await phashBundle(filesByRole, presentRoles);
   } catch (e) {
     console.error('phashBundle error:', e);
     return res.status(500).json({ code: 'PHASH_ERROR', message: 'Image processing failed. Please try again.' });
@@ -325,20 +354,24 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     return res.status(500).json({ code: 'DUP_CHECK_ERROR', message: 'Duplicate check failed. Please try again.' });
   }
 
-  // reuse guard (>=4 reused)
+  // reuse guard
   try {
+    const linkObj = new mongoose.Types.ObjectId(linkId);
     const reuse = await Screenshot.aggregate([
-      { $match: { userId, linkId } },
+      { $match: { userId, $or: [{ linkId }, { linkId: linkObj }] } },
       { $unwind: '$files' },
       { $match: { 'files.sha256': { $in: sha256s } } },
       { $count: 'n' }
     ]);
+
     const reusedCount = reuse?.[0]?.n || 0;
-    if (reusedCount >= 4) {
+    const reuseThreshold = Math.max(presentRoles.length - 1, 2);
+
+    if (reusedCount >= reuseThreshold) {
       return res.status(409).json({
         code: 'NEAR_DUPLICATE',
         message: 'These screenshots largely match a previous submission. Please capture fresh screenshots.',
-        details: { reusedCount }
+        details: { reusedCount, reuseThreshold }
       });
     }
   } catch (e) {
@@ -346,12 +379,18 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     // non-fatal
   }
 
-  // Flask verify
+  // Flask verify (send present roles; rules via query params)
   let analysis;
   const debug = req.query?.debug === '1' || process.env.FLASK_DEBUG === '1';
 
   try {
-    analysis = await verifyWithFlask(filesByRole, { debug });
+    analysis = await verifyWithFlask(filesByRole, {
+      debug,
+      minComments,
+      minReplies,
+      requireLike,
+      presentRoles
+    });
   } catch (e) {
     console.error('Flask analyzer error:', e?.message || e);
     return res.status(502).json({
@@ -364,17 +403,30 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
     });
   }
 
+  const rules = analysis?.rules || { min_comments: minComments, min_replies: minReplies, require_like: requireLike };
+
+  // IMPORTANT: do NOT force liked=true when requireLike=false; keep analyzer output for UI/debug
   const analysisPayload = {
-    liked: !!analysis.liked,
-    user_id: analysis.user_id ?? null,
-    comment: Array.isArray(analysis.comment) ? analysis.comment : [],
-    replies: Array.isArray(analysis.replies) ? analysis.replies : [],
-    verified: false
+    liked: typeof analysis?.liked === 'boolean' ? analysis.liked : false,
+    user_id: analysis?.user_id ?? null,
+    comment: Array.isArray(analysis?.comment) ? analysis.comment : [],
+    replies: Array.isArray(analysis?.replies) ? analysis.replies : [],
+    verified: false,
+    rules: {
+      min_comments: Number(rules.min_comments ?? minComments),
+      min_replies: Number(rules.min_replies ?? minReplies),
+      require_like: !!(rules.require_like ?? requireLike)
+    }
   };
 
   const hasHandle = typeof analysisPayload.user_id === 'string' && analysisPayload.user_id.trim().length > 0;
-  const meetsCounts = analysisPayload.comment.length >= 2 && analysisPayload.replies.length >= 2;
-  analysisPayload.verified = !!analysisPayload.liked && !!hasHandle && meetsCounts;
+  const meetsCounts =
+    analysisPayload.comment.length >= analysisPayload.rules.min_comments &&
+    analysisPayload.replies.length >= analysisPayload.rules.min_replies;
+
+  const meetsLike = analysisPayload.rules.require_like ? !!analysisPayload.liked : true;
+
+  analysisPayload.verified = !!(hasHandle && meetsCounts && meetsLike);
 
   if (!analysisPayload.verified) {
     return res.status(422).json({
@@ -385,7 +437,13 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
         user_id: analysisPayload.user_id,
         commentCount: analysisPayload.comment.length,
         replyCount: analysisPayload.replies.length,
-        needed: { minComments: 2, minReplies: 2, liked: true, sameUser: true, handleRequired: true },
+        needed: {
+          minComments,
+          minReplies,
+          requireLike,
+          handleRequired: true,
+          sameUser: true
+        },
         analyzerMessage: analysis?.message || null,
         debug: analysis?.debug || null
       },
@@ -453,6 +511,7 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
 
   return res.status(201).json({
     message: 'User entry submitted',
+    rules: { minComments, minReplies, requireLike },
     verification: analysisPayload,
     entry
   });
@@ -542,7 +601,6 @@ exports.updateEntry = asyncHandler(async (req, res) => {
       emp.balance -= diff;
       await emp.save();
     }
-
   } else {
     if (noOfPersons == null)
       return badRequest(res, 'noOfPersons required for user entries');

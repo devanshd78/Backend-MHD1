@@ -115,7 +115,17 @@ exports.listPendingEmployees = asyncHandler(async (_req, res) => {
 /*  LINKS                                                             */
 /* ------------------------------------------------------------------ */
 exports.createLink = asyncHandler(async (req, res) => {
-  const { title, adminId, target, amount, expireIn } = req.body;
+  const {
+    title,
+    adminId,
+    target,
+    amount,
+    expireIn,
+    minComments,
+    minReplies,
+    requireLike
+  } = req.body;
+
   if (!adminId || target == null || amount == null || expireIn == null) {
     return badRequest(res, 'adminId, target, amount, and expireIn are required');
   }
@@ -123,20 +133,40 @@ exports.createLink = asyncHandler(async (req, res) => {
     return badRequest(res, 'Invalid adminId');
   }
 
+  const clamp02 = (v, def) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return def;
+    return Math.max(0, Math.min(2, Math.floor(n)));
+  };
+
+  const c = clamp02(minComments, 2);
+  const r = clamp02(minReplies, 2);
+  const like = requireLike === true || requireLike === 1 || requireLike === '1';
+
+  if (c === 0 && r === 0) {
+    return badRequest(res, 'minComments and minReplies cannot both be 0');
+  }
+
   const link = await Link.create({
     title,
     createdBy: adminId,
     target,
     amount,
-    expireIn
+    expireIn,
+    minComments: c,
+    minReplies: r,
+    requireLike: like
   });
 
-  res.json({ link: `/employee/links/${link._id}` });
+  res.json({
+    link: `/employee/links/${link._id}`,
+    rules: { minComments: c, minReplies: r, requireLike: like }
+  });
 });
 
 exports.listLinks = asyncHandler(async (_req, res) => {
   const links = await Link.find()
-    .select('title createdBy createdAt target amount expireIn')
+    .select('title createdBy createdAt target amount expireIn minComments minReplies requireLike')
     .lean();
 
   const annotated = links.map(l => {
