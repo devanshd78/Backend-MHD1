@@ -1,11 +1,12 @@
 // models/Screenshot.js
 const mongoose = require('mongoose');
 
-const ALLOWED_ROLES = ['like', 'comment1', 'comment2', 'reply1', 'reply2'];
+const ROLES_5 = ['like', 'comment1', 'comment2', 'reply1', 'reply2'];
+const ROLES_4 = ['comment1', 'comment2', 'reply1', 'reply2'];
 
 const fileSchema = new mongoose.Schema(
   {
-    role:   { type: String, enum: ALLOWED_ROLES, required: true },
+    role:   { type: String, enum: ROLES_5, required: true },
     phash:  { type: String, required: true },   // hex
     sha256: { type: String, required: true },
     size:   { type: Number },
@@ -21,19 +22,16 @@ const screenshotSchema = new mongoose.Schema(
     userId: { type: String, ref: 'User', required: true },
     linkId: { type: String, ref: 'Link', required: true },
 
-    // outcome + raw payload for audit
     verified: { type: Boolean, required: true },
     analysis: { type: mongoose.Schema.Types.Mixed },
 
-    // dedupe helpers
-    phashes:   [{ type: String, required: true }], // expect 5 items (unique)
-    bundleSig: { type: String, required: true },   // sorted join of phashes
-    bundleSha: { type: String, required: true },   // sorted join of file sha256s
+    phashes:   [{ type: String, required: true }], // 4 or 5 (unique)
+    bundleSig: { type: String, required: true },
+    bundleSha: { type: String, required: true },
 
-    // normalized identity + texts (stored distinctly)
-    handle:   { type: String },        // normalized like '@someuser' (lowercase)
-    comments: [{ type: String }],      // normalized + deduped
-    replies:  [{ type: String }],      // normalized + deduped
+    handle:   { type: String },        // '@someuser'
+    comments: [{ type: String }],
+    replies:  [{ type: String }],
 
     files: { type: [fileSchema], required: true },
 
@@ -70,36 +68,44 @@ function uniqueStrings(arr) {
   return out;
 }
 
-// ---------- validation & derived fields ----------
 screenshotSchema.pre('validate', function (next) {
   try {
-    // phashes: exactly 5 and all unique
-    if (!Array.isArray(this.phashes) || this.phashes.length !== 5) {
-      return next(new Error('Exactly 5 phashes required'));
+    if (!Array.isArray(this.files) || this.files.length < 4) {
+      return next(new Error('At least 4 files required'));
+    }
+
+    const rolesPresent = new Set(this.files.map(f => f.role));
+    const hasLike = rolesPresent.has('like');
+    const expectedRoles = hasLike ? ROLES_5 : ROLES_4;
+
+    // files length must match role set
+    if (this.files.length !== expectedRoles.length) {
+      return next(new Error(`Exactly ${expectedRoles.length} files required`));
+    }
+    for (const r of expectedRoles) {
+      if (!rolesPresent.has(r)) {
+        return next(new Error(`Missing required role: ${r}`));
+      }
+    }
+
+    // sha256 must be unique
+    const shaSet = new Set(this.files.map(f => f.sha256));
+    if (shaSet.size !== this.files.length) {
+      return next(new Error(`file sha256 values must be unique (${this.files.length} distinct)`));
+    }
+
+    // phashes must match file count and be unique
+    if (!Array.isArray(this.phashes) || this.phashes.length !== this.files.length) {
+      return next(new Error(`Exactly ${this.files.length} phashes required`));
     }
     const phSet = new Set(this.phashes);
-    if (phSet.size !== 5) {
-      return next(new Error('phashes must be unique (5 distinct)'));
+    if (phSet.size !== this.phashes.length) {
+      return next(new Error(`phashes must be unique (${this.phashes.length} distinct)`));
     }
 
-    // files: exactly 5, one per role, unique sha256s
-    if (!Array.isArray(this.files) || this.files.length !== 5) {
-      return next(new Error('Exactly 5 files required'));
-    }
-    const roles = new Set(this.files.map((f) => f.role));
-    if (roles.size !== ALLOWED_ROLES.length || !ALLOWED_ROLES.every((r) => roles.has(r))) {
-      return next(new Error(`files must contain one of each role: ${ALLOWED_ROLES.join(', ')}`));
-    }
-    const shaSet = new Set(this.files.map((f) => f.sha256));
-    if (shaSet.size !== 5) {
-      return next(new Error('file sha256 values must be unique (5 distinct)'));
-    }
-
-    // compute dedupe signatures
     this.bundleSig = [...phSet].sort().join('|');
     this.bundleSha = [...shaSet].sort().join('|');
 
-    // normalize handle/comments/replies if present
     if (this.handle) this.handle = normalizeHandle(this.handle);
     if (Array.isArray(this.comments)) this.comments = uniqueStrings(this.comments);
     if (Array.isArray(this.replies))  this.replies  = uniqueStrings(this.replies);
@@ -110,15 +116,9 @@ screenshotSchema.pre('validate', function (next) {
   }
 });
 
-// ---------- indexes (duplicate prevention) ----------
-// Prevent same perceptual bundle on same link by same user
 screenshotSchema.index({ userId: 1, linkId: 1, bundleSig: 1 }, { unique: true });
-
-// Prevent same exact files bundle (sha256) on same link by same user
 screenshotSchema.index({ userId: 1, linkId: 1, bundleSha: 1 }, { unique: true });
 
-// Prevent double-verified proofs for same handle on same link
-// (only applies to documents with verified: true and a non-null handle)
 screenshotSchema.index(
   { linkId: 1, handle: 1 },
   { unique: true, partialFilterExpression: { verified: true, handle: { $type: 'string' } } }

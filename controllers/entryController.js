@@ -462,6 +462,7 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
       handle: analysisPayload.user_id || null,
       comments: analysisPayload.comment,
       replies: analysisPayload.replies,
+      needed: { minComments, minReplies, requireLike },
       phashes,
       bundleSig,
       bundleSha,
