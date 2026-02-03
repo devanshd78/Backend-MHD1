@@ -102,24 +102,18 @@ function mimeToExt(mime) {
   return 'jpg';
 }
 
-/**
- * IMPORTANT UPDATES:
- * - Sends the "like" image too (if present) so flask can compute liked.
- * - Passes min_comments, min_replies, require_like via query string.
- * - Only sends the images you actually have (presentRoles) + required ones.
- */
-async function verifyWithFlask(
-  filesByRole,
-  {
-    debug = false,
-    minComments = 2,
-    minReplies = 2,
-    requireLike = false,
-    presentRoles = ['like', 'comment1', 'comment2', 'reply1', 'reply2']
-  } = {}
-) {
-  const form = new FormData();
+const http = require('http');
+const https = require('https');
 
+const axiosClient = axios.create({
+  httpAgent: new http.Agent({ keepAlive: true }),
+  httpsAgent: new https.Agent({ keepAlive: true })
+});
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function buildForm(filesByRole, presentRoles) {
+  const form = new FormData();
   for (const role of presentRoles) {
     const f = filesByRole[role];
     if (!f) continue;
@@ -130,10 +124,25 @@ async function verifyWithFlask(
     });
   }
 
-  const contentLength = await new Promise((resolve, reject) => {
-    form.getLength((err, length) => (err ? reject(err) : resolve(length)));
+  return new Promise((resolve, reject) => {
+    form.getLength((err, length) => {
+      if (err) return reject(err);
+      resolve({ form, contentLength: length });
+    });
   });
+}
 
+async function verifyWithFlask(
+  filesByRole,
+  {
+    debug = false,
+    minComments = 2,
+    minReplies = 2,
+    requireLike = false,
+    presentRoles = ['like', 'comment1', 'comment2', 'reply1', 'reply2'],
+    maxAttempts = 3
+  } = {}
+) {
   const qs =
     `min_comments=${encodeURIComponent(minComments)}` +
     `&min_replies=${encodeURIComponent(minReplies)}` +
@@ -142,20 +151,30 @@ async function verifyWithFlask(
 
   const url = `${FLASK_ANALYZER_URL}?${qs}`;
 
-  const resp = await axios.post(url, form, {
-    headers: { ...form.getHeaders(), 'Content-Length': contentLength },
-    timeout: FLASK_TIMEOUT_MS,
-    maxBodyLength: Infinity,
-    maxContentLength: Infinity,
-    validateStatus: () => true
-  });
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { form, contentLength } = await buildForm(filesByRole, presentRoles);
 
-  // Treat 422 as "verification failed" (normal analyzer response)
-  if (resp.status === 422) {
-    return resp.data || {};
-  }
+    const resp = await axiosClient.post(url, form, {
+      headers: { ...form.getHeaders(), 'Content-Length': contentLength },
+      timeout: FLASK_TIMEOUT_MS,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      validateStatus: () => true
+    });
 
-  if (resp.status < 200 || resp.status >= 300) {
+    // ✅ busy: retry quickly
+    if (resp.status === 429) {
+      await sleep(250 * (attempt + 1));
+      continue;
+    }
+
+    // ✅ normal "verification failed" response
+    if (resp.status === 422) return resp.data || {};
+
+    // ✅ success
+    if (resp.status >= 200 && resp.status < 300) return resp.data || {};
+
+    // ❌ other upstream errors
     const msg = resp?.data?.message || resp?.data?.error || `Flask analyzer HTTP ${resp.status}`;
     const err = new Error(msg);
     err.status = resp.status;
@@ -163,7 +182,13 @@ async function verifyWithFlask(
     throw err;
   }
 
-  return resp.data || {};
+  // after retries still busy
+  return {
+    verified: false,
+    message: "Analyzer busy, retry",
+    reasons: ["ANALYZER_BUSY"],
+    rules: { min_comments: minComments, min_replies: minReplies, require_like: requireLike }
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -411,44 +436,60 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
   const rules = analysis?.rules || { min_comments: minComments, min_replies: minReplies, require_like: requireLike };
 
   // IMPORTANT: do NOT force liked=true when requireLike=false; keep analyzer output for UI/debug
-const analysisPayload = {
-  liked: typeof analysis?.liked === 'boolean' ? analysis.liked : false,
-  like_provided: !!analysis?.like_provided,
-  user_id: analysis?.user_id ?? null,
-  comment: Array.isArray(analysis?.comment) ? analysis.comment : [],
-  replies: Array.isArray(analysis?.replies) ? analysis.replies : [],
-  reasons: Array.isArray(analysis?.reasons) ? analysis.reasons : [],
-  verified: typeof analysis?.verified === 'boolean' ? analysis.verified : false,
-  rules: {
-    min_comments: Number(rules.min_comments ?? minComments),
-    min_replies: Number(rules.min_replies ?? minReplies),
-    require_like: !!(rules.require_like ?? requireLike)
-  }
-};
+  const analysisPayload = {
+    liked: typeof analysis?.liked === 'boolean' ? analysis.liked : false,
+    like_provided: !!analysis?.like_provided,
+    user_id: analysis?.user_id ?? null,
+    comment: Array.isArray(analysis?.comment) ? analysis.comment : [],
+    replies: Array.isArray(analysis?.replies) ? analysis.replies : [],
+    reasons: Array.isArray(analysis?.reasons) ? analysis.reasons : [],
+    verified: typeof analysis?.verified === 'boolean' ? analysis.verified : false,
+    rules: {
+      min_comments: Number(rules.min_comments ?? minComments),
+      min_replies: Number(rules.min_replies ?? minReplies),
+      require_like: !!(rules.require_like ?? requireLike)
+    }
+  };
 
-  const hasHandle = typeof analysisPayload.user_id === 'string' && analysisPayload.user_id.trim().length > 0;
+  const hasHandle =
+    typeof analysisPayload.user_id === 'string' &&
+    analysisPayload.user_id.trim().length > 0;
+
   const meetsCounts =
     analysisPayload.comment.length >= analysisPayload.rules.min_comments &&
     analysisPayload.replies.length >= analysisPayload.rules.min_replies;
 
   const meetsLike = analysisPayload.rules.require_like ? !!analysisPayload.liked : true;
 
-  analysisPayload.verified = !!(hasHandle && meetsCounts && meetsLike);
+  // ✅ analyzer must be clean too
+  const analyzerClean = Array.isArray(analysisPayload.reasons) && analysisPayload.reasons.length === 0;
+  const analyzerSaysOk = !!analysis?.verified && analyzerClean;
 
-if (!analysisPayload.verified) {
-  return res.status(422).json({
-    code: 'VERIFICATION_FAILED',
-    message: 'Screenshot verification failed. Please upload clearer screenshots.',
-    details: {
-      user_id: analysisPayload.user_id,
-      reasons: analysisPayload.reasons,
-      analyzerMessage: analysis?.message || null,
-      liked: analysisPayload.liked,
-      like_provided: analysisPayload.like_provided
-    },
-    verification: analysisPayload
-  });
-}
+  // ✅ final verified
+  analysisPayload.verified = !!(analyzerSaysOk && hasHandle && meetsCounts && meetsLike);
+
+  if (analysisPayload?.reasons?.includes('ANALYZER_BUSY')) {
+    return res.status(503).json({
+      code: 'ANALYZER_BUSY',
+      message: 'Verification is busy. Please retry in a few seconds.',
+      verification: analysisPayload
+    });
+  }
+
+  if (!analysisPayload.verified) {
+    return res.status(422).json({
+      code: 'VERIFICATION_FAILED',
+      message: 'Screenshot verification failed. Please upload clearer screenshots.',
+      details: {
+        user_id: analysisPayload.user_id,
+        reasons: analysisPayload.reasons,
+        analyzerMessage: analysis?.message || null,
+        liked: analysisPayload.liked,
+        like_provided: analysisPayload.like_provided
+      },
+      verification: analysisPayload
+    });
+  }
 
   // persist Screenshot
   let screenshotDoc;
