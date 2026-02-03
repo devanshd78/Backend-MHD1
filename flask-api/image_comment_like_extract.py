@@ -1,568 +1,495 @@
-import io
 import os
 import re
-from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+import io
+import time
+import uuid
+from typing import Dict, Any, List, Optional
 
-import cv2
-import numpy as np
+from flask import Flask, request, jsonify
+from PIL import Image, ImageEnhance
 import pytesseract
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from PIL import Image
-from werkzeug.exceptions import HTTPException
+from difflib import SequenceMatcher
 
-# ═══════════════════════════════════════════════════════════════════════════
-#                                  CONFIG
-# ═══════════════════════════════════════════════════════════════════════════
-PORT = int(os.getenv("PORT", 6000))
-DEBUG = bool(int(os.getenv("DEBUG", "0")))
-MAX_SIDE = int(os.getenv("MAX_SIDE", "2000"))
-OCR_TIMEOUT = int(os.getenv("OCR_TIMEOUT", "15"))
+# -----------------------------
+# Config
+# -----------------------------
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(60 * 1024 * 1024)))
+OCR_LANG = os.getenv("OCR_LANG", "eng")
+TESSERACT_CONFIG = os.getenv("TESSERACT_CONFIG", "--oem 1 --psm 6")
 
-TESSERACT_CMD = os.getenv("TESSERACT_CMD")
-if TESSERACT_CMD:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+SIMILARITY_SAME = float(os.getenv("SIMILARITY_SAME", "0.90"))
+SIMILARITY_CROSS = float(os.getenv("SIMILARITY_CROSS", "0.88"))
 
-# Verify Tesseract
-TESSERACT_OK = True
-TESSERACT_ERR = None
-try:
-    _ = pytesseract.get_tesseract_version()
-except Exception as e:
-    TESSERACT_OK = False
-    TESSERACT_ERR = str(e)
+ANALYZER_VERSION = "1.2.0"
+ALL_ROLES = ["like", "comment1", "comment2", "reply1", "reply2"]
 
-# ═══════════════════════════════════════════════════════════════════════════
-#                                  FLASK APP
-# ═══════════════════════════════════════════════════════════════════════════
+# Handles: @name or name-like
+AT_HANDLE_RE = re.compile(r"@[\w\.\-]{2,}", re.IGNORECASE)
+
+# Time markers
+AGO_RE = re.compile(r"\bago\b", re.IGNORECASE)
+TIME_RE = re.compile(r"\b(\d+)\s*(sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)\b",
+                     re.IGNORECASE)
+
+STOP_TOKENS = [
+    "add a comment", "add a reply", "write a comment", "write a reply",
+    "view replies", "hide replies", "see more", "show more",
+    "reply", "replies", "topics", "newest", "see translation", "translate to"
+]
+
 app = Flask(__name__)
-CORS(app)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 
-# ═══════════════════════════════════════════════════════════════════════════
-#                            DETECTION CONSTANTS
-# ═══════════════════════════════════════════════════════════════════════════
-# Like button region (left side of screen, middle height)
-LIKE_X1, LIKE_X2 = 0.02, 0.15
-LIKE_Y1, LIKE_Y2 = 0.40, 0.60
-DARK_THRESHOLD = 100
-LIKE_FILLED_THRESHOLD = 0.10  # 10% dark pixels means liked
+# -----------------------------
+# Helpers
+# -----------------------------
+def clamp_int(v, default, lo=0, hi=10):
+    try:
+        n = int(v)
+        return max(lo, min(hi, n))
+    except Exception:
+        return default
 
-# Username pattern
-USERNAME_RE = re.compile(r"@([A-Za-z0-9_.-]{3,})")
+def to_bool(v, default=False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
-# Noise phrases to ignore
-NOISE = {
-    "translate", "hindi", "add a reply", "add reply", "add comment", "reply added",
-    "comments", "replies", "newest", "timed", "top", "pinned", "subscribe",
-    "remember to keep comments respectful", "youtube community guidelines",
-    "learn more", "share", "download", "remix", "39 replies", "read more"
-}
+def normalize_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s@]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-# Time indicators (for detecting author lines)
-TIME_WORDS = {"ago", "edited", "sec", "min", "hour", "day", "week", "month", "year", "mo", "yr"}
+def sim(a: str, b: str) -> float:
+    a_n = normalize_text(a)
+    b_n = normalize_text(b)
+    if not a_n or not b_n:
+        return 0.0
+    return SequenceMatcher(None, a_n, b_n).ratio()
 
-# ═══════════════════════════════════════════════════════════════════════════
-#                              HELPER FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════
+def preprocess(img: Image.Image) -> Image.Image:
+    if img.mode != "RGB":
+        img = img.convert("RGB")
 
-def normalize_username(username: Optional[str]) -> Optional[str]:
-    """Normalize username to @lowercase format"""
-    if not username:
-        return None
-    username = username.strip().lower()
-    if not username.startswith("@"):
-        username = "@" + username
-    # Clean up any trailing garbage
-    username = re.sub(r"[^@a-z0-9_.-].*$", "", username)
-    return username if len(username) > 3 else None
-
-
-def downscale_image(img: Image.Image) -> Image.Image:
-    """Downscale image if needed"""
     w, h = img.size
-    if max(w, h) <= MAX_SIDE:
-        return img.convert("RGB")
-    
-    scale = MAX_SIDE / float(max(w, h))
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    resized = img.convert("RGB")
-    resized.thumbnail((new_w, new_h), Image.BICUBIC)
-    return resized
+    max_w = 1400
+    if w > max_w:
+        new_h = int(h * (max_w / w))
+        img = img.resize((max_w, new_h), Image.LANCZOS)
 
-
-def preprocess_for_ocr(img: Image.Image, crop_y1: float = 0.20, crop_y2: float = 0.96) -> np.ndarray:
-    """
-    Preprocess image for OCR with optimal settings for YouTube dark/light modes
-    """
-    # Downscale and crop to relevant region
-    img = downscale_image(img)
-    w, h = img.size
-    y1 = int(h * crop_y1)
-    y2 = int(h * crop_y2)
-    x1 = int(w * 0.01)
-    x2 = int(w * 0.99)
-    
-    cropped = img.crop((x1, y1, x2, y2))
-    
-    # Convert to grayscale
-    gray = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2GRAY)
-    
-    # Upscale for better OCR (3x gives best results for YouTube UI)
-    gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-    
-    # Detect dark mode (mean brightness < 100 = dark mode)
-    mean_brightness = np.mean(gray)
-    
-    if mean_brightness < 100:
-        # Dark mode: invert so text is dark on light background
-        gray = cv2.bitwise_not(gray)
-    
-    # Apply CLAHE for better contrast
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    
-    # Light denoising
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    
+    gray = img.convert("L")
+    gray = ImageEnhance.Contrast(gray).enhance(1.8)
+    gray = ImageEnhance.Sharpness(gray).enhance(1.4)
     return gray
 
+def ocr_image(img: Image.Image, config: Optional[str] = None) -> str:
+    img = preprocess(img)
+    cfg = config or TESSERACT_CONFIG
+    return pytesseract.image_to_string(img, lang=OCR_LANG, config=cfg) or ""
 
-def extract_text_lines(img: Image.Image) -> List[str]:
-    """Extract text lines from image using OCR"""
-    processed = preprocess_for_ocr(img)
-    
-    # Use PSM 6 (uniform block of text) - best for comments/replies
-    config = "--oem 3 --psm 6 -c preserve_interword_spaces=1"
-    
-    try:
-        text = pytesseract.image_to_string(
-            processed,
-            lang="eng",
-            config=config,
-            timeout=OCR_TIMEOUT
-        )
-    except Exception as e:
-        app.logger.error(f"OCR failed: {e}")
-        return []
-    
-    # Split into lines and clean
-    lines = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line and len(line) > 1:
-            lines.append(line)
-    
-    return lines
+def clean_snippet(s: str, max_len: int = 180) -> str:
+    s = (s or "").strip()
+    s = s.replace("“", "").replace("”", "").replace("’", "'").replace("`", "'")
+    s = re.sub(r"\s+", " ", s).strip()
 
+    # cut on known UI tokens
+    low = s.lower()
+    for tok in STOP_TOKENS:
+        idx = low.find(tok)
+        if idx != -1:
+            s = s[:idx].strip()
+            low = s.lower()
 
-def is_noise_line(text: str) -> bool:
-    """Check if line is UI noise"""
-    text_lower = text.lower()
-    return any(phrase in text_lower for phrase in NOISE)
+    # remove leading junk
+    s = re.sub(r"^[\|\)\]\}\>]+", "", s).strip()
 
+    # remove trailing icons/counters often OCR’d
+    s = re.sub(r"(\s+\d{1,4}){1,4}\s*([&❤👍💬]|$).*?$", "", s).strip()
 
-def has_time_indicator(text: str) -> bool:
-    """Check if line contains time indicator (author line)"""
-    text_lower = text.lower()
-    # Check for time words
-    if any(word in text_lower for word in TIME_WORDS):
+    # remove trademark-ish symbols
+    s = re.sub(r"[©®™]+", "", s).strip()
+
+    if len(s) > max_len:
+        s = s[:max_len].rstrip()
+
+    return s
+
+def is_ui_line(line: str) -> bool:
+    l = (line or "").strip().lower()
+    if not l:
         return True
-    # Check for patterns like "2 mo ago", "1 day ago", "0 sec ago"
-    if re.search(r"\d+\s*(sec|min|hour|day|week|mo|month|yr|year)", text_lower):
+    # common UI / chrome
+    for tok in STOP_TOKENS:
+        if tok in l:
+            return True
+    # pure counters/icons
+    if re.fullmatch(r"[\d\W_]+", l):
         return True
     return False
 
+def normalize_handle(h: str) -> str:
+    h = (h or "").strip()
+    if not h:
+        return ""
+    if h.startswith("@"):
+        return h
+    return "@" + h
 
-def extract_username(text: str) -> Optional[str]:
-    """Extract username from text line"""
-    # Try pattern with @
-    match = USERNAME_RE.search(text)
-    if match:
-        return normalize_username("@" + match.group(1))
-    
-    # Try to find username-like token at start of line
-    tokens = text.split()
-    if tokens:
-        first_token = tokens[0].strip()
-        # Check if it looks like a username
-        if re.match(r"^@?[A-Za-z][A-Za-z0-9_.-]{2,}$", first_token):
-            # Make sure it's not a time word
-            if first_token.lower() not in TIME_WORDS:
-                return normalize_username(first_token)
-    
+def extract_handle_from_line(line: str) -> Optional[str]:
+    """
+    Handle line patterns seen in YouTube screenshots:
+      @handle + 2 min ago
+      @handle 2 min ago
+      handle • 2 min ago   (no @)
+    """
+    if not line:
+        return None
+
+    m = AT_HANDLE_RE.search(line)
+    if m:
+        return normalize_handle(m.group(0))
+
+    # no @, but looks like a username + time + 'ago'
+    if AGO_RE.search(line) and TIME_RE.search(line):
+        first = re.split(r"\s+", line.strip())[0]
+        if re.match(r"^[A-Za-z][\w\.\-]{2,}$", first):
+            return normalize_handle(first)
+
     return None
 
-
-def clean_text(text: str) -> str:
-    """Clean comment/reply text - remove ALL OCR artifacts"""
-    # Remove leading/trailing special characters
-    text = re.sub(r"^[~\-•\*\|\[\](){}<>]+\s*", "", text)
-    text = re.sub(r"\s*[~\-•\*\|\[\](){}<>]+$", "", text)
-    
-    # Remove emoji-like artifacts and symbols (but keep spaces to avoid joining words)
-    text = re.sub(r"[&@#%$!©®™°]+", " ", text)
-    
-    # Remove "Reply...", "Comment...", "(0)", etc at the end
-    text = re.sub(r"\s*(Reply|Comment|Translate|PP|GP|iy|dy|ds|ie|Sl)\.{0,3}\s*\(?\d*\)?$", "", text, flags=re.IGNORECASE)
-    
-    # Remove patterns like "i)" "7" at the end
-    text = re.sub(r"\s+[a-z]\)\s*\d*\s*$", "", text, flags=re.IGNORECASE)
-    
-    # Remove standalone punctuation
-    text = re.sub(r"\s+[:;,.\-]+\s+", " ", text)
-    
-    # Normalize whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-    
-    return text
-
-
-def parse_comments_replies(lines: List[str]) -> List[Tuple[str, str]]:
+def extract_blocks_by_handle(full_text: str) -> Dict[str, List[str]]:
     """
-    Parse OCR lines to extract (username, text) pairs
-    
-    Expected format:
-    @username • X time ago
-    Comment or reply text here
-    (may span multiple lines)
+    Line-based extraction:
+    - Detect a "handle line" (username + time ago)
+    - Capture following lines as message until next handle line or UI line.
+    - Also supports same-line message after ":" (if present).
+    Returns: {handle_lower: [msg1, msg2, ...]}
     """
-    results = []
-    i = 0
-    
-    while i < len(lines):
-        line = lines[i]
-        
-        # Skip noise
-        if is_noise_line(line):
-            i += 1
+    lines = [ln.strip() for ln in (full_text or "").splitlines() if ln.strip()]
+    out: Dict[str, List[str]] = {}
+
+    current_handle: Optional[str] = None
+    buf: List[str] = []
+
+    def flush():
+        nonlocal current_handle, buf
+        if current_handle and buf:
+            msg = clean_snippet(" ".join(buf))
+            if msg:
+                out.setdefault(current_handle.lower(), []).append(msg)
+        buf = []
+
+    for ln in lines:
+        h = extract_handle_from_line(ln)
+        if h:
+            flush()
+            current_handle = h
+            # same line message support: take text after ":" if present
+            if ":" in ln:
+                parts = ln.split(":", 1)
+                tail = parts[1].strip()
+                if tail and not is_ui_line(tail):
+                    buf.append(tail)
+            else:
+                # sometimes message starts after "ago" on same line (rare)
+                idx = ln.lower().rfind("ago")
+                if idx != -1:
+                    tail = ln[idx + 3 :].strip()
+                    if tail and len(tail) > 3 and not is_ui_line(tail):
+                        buf.append(tail)
             continue
-        
-        # Look for author line (has username and time)
-        if has_time_indicator(line):
-            username = extract_username(line)
-            
-            if username:
-                # Collect following lines as comment/reply text
-                i += 1
-                text_lines = []
-                
-                while i < len(lines):
-                    next_line = lines[i]
-                    
-                    # Stop at next author line
-                    if is_noise_line(next_line):
-                        break
-                    if has_time_indicator(next_line):
-                        # Check if it has a username (new author line)
-                        if extract_username(next_line):
-                            break
-                    
-                    text_lines.append(next_line)
-                    i += 1
-                
-                # Join and clean the text
-                comment_text = " ".join(text_lines)
-                comment_text = clean_text(comment_text)
-                
-                # Only add if we have actual text
-                if comment_text and len(comment_text) >= 3:
-                    results.append((username, comment_text))
-                
+
+        if current_handle:
+            if is_ui_line(ln):
+                # end block
+                flush()
+                current_handle = None
                 continue
-        
-        i += 1
-    
-    return results
+            buf.append(ln)
 
+    flush()
+    return out
 
-def detect_like(img: Image.Image) -> bool:
-    """Detect if like button is active (filled)"""
-    img = downscale_image(img)
-    w, h = img.size
-    
-    # Crop like button region
-    x1 = int(w * LIKE_X1)
-    x2 = int(w * LIKE_X2)
-    y1 = int(h * LIKE_Y1)
-    y2 = int(h * LIKE_Y2)
-    
-    like_region = img.crop((x1, y1, x2, y2))
-    gray = cv2.cvtColor(np.array(like_region), cv2.COLOR_RGB2GRAY)
-    
-    # Calculate dark pixel ratio
-    dark_pixels = np.sum(gray < DARK_THRESHOLD)
-    total_pixels = gray.size
-    dark_ratio = dark_pixels / total_pixels
-    
-    # If enough dark pixels, like is filled
-    # Convert to native Python bool for JSON serialization
-    return bool(dark_ratio >= LIKE_FILLED_THRESHOLD)
+def pick_majority_handle(handles_by_role: Dict[str, List[str]], required_roles: List[str]) -> str:
+    counts: Dict[str, int] = {}
+    occ: Dict[str, int] = {}
+    original: Dict[str, str] = {}
 
+    roles_to_use = [r for r in required_roles if r != "like"]
+    for role in roles_to_use:
+        hs = handles_by_role.get(role) or []
+        seen = set()
+        for h in hs:
+            key = h.lower()
+            original.setdefault(key, h)
+            occ[key] = occ.get(key, 0) + 1
+            if key not in seen:
+                counts[key] = counts.get(key, 0) + 1
+                seen.add(key)
 
-def are_texts_distinct(text1: str, text2: str) -> bool:
-    """Check if two texts are meaningfully different"""
-    t1 = text1.lower().strip()
-    t2 = text2.lower().strip()
-    
-    if t1 == t2:
+    if not counts:
+        return ""
+    best = sorted(counts.keys(), key=lambda k: (counts[k], occ.get(k, 0)), reverse=True)[0]
+    return original[best]
+
+def uniqueness_check(texts: List[str], threshold: float) -> bool:
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            if sim(texts[i], texts[j]) >= threshold:
+                return False
+    return True
+
+def cross_check(comments: List[str], replies: List[str], threshold: float) -> bool:
+    for c in comments:
+        for r in replies:
+            if sim(c, r) >= threshold:
+                return False
+    return True
+
+def detect_liked(ocr_text: str) -> Optional[bool]:
+    t = normalize_text(ocr_text)
+    if "liked" in t:
+        return True
+    if "like" in t:
         return False
-    
-    # Word-based similarity
-    words1 = set(t1.split())
-    words2 = set(t2.split())
-    
-    if not words1 or not words2:
-        return False
-    
-    overlap = len(words1 & words2)
-    total = len(words1 | words2)
-    similarity = overlap / total if total > 0 else 0
-    
-    # Less than 70% similar = distinct
-    return similarity < 0.70
+    return None
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#                                  ROUTES
-# ═══════════════════════════════════════════════════════════════════════════
-
-@app.route("/", methods=["GET"])
+# -----------------------------
+# Routes
+# -----------------------------
+@app.get("/health")
 def health():
-    """Health check endpoint"""
-    return jsonify({
-        "ok": True,
-        "tesseract_ok": TESSERACT_OK,
-        "service": "YouTube Engagement Verifier"
-    }), 200
+    return jsonify({"ok": True, "version": ANALYZER_VERSION})
 
-
-@app.route("/analyze", methods=["POST"])
+@app.post("/analyze")
 def analyze():
-    """
-    Verify YouTube engagement from screenshots
-    
-    Required files:
-    - comment1: First comment screenshot
-    - comment2: Second comment screenshot  
-    - reply1: First reply screenshot
-    - reply2: Second reply screenshot
-    
-    Optional files:
-    - like: Like button screenshot
-    
-    Query params:
-    - debug=1: Include debug information
-    """
-    
-    debug = bool(int(request.args.get("debug", "0"))) or DEBUG
-    
-    # Check Tesseract
-    if not TESSERACT_OK:
-        return jsonify({
-            "error": "tesseract_missing",
-            "message": "Tesseract OCR is not installed or not reachable.",
-            "details": TESSERACT_ERR
-        }), 503
-    
-    # Check required files
-    required = ["comment1", "comment2", "reply1", "reply2"]
-    optional = ["like"]  # Like is optional
-    missing = [k for k in required if k not in request.files]
-    
+    start = time.time()
+    req_id = str(uuid.uuid4())
+
+    min_comments = clamp_int(request.args.get("min_comments"), 2, lo=0, hi=10)
+    min_replies = clamp_int(request.args.get("min_replies"), 2, lo=0, hi=10)
+    require_like = to_bool(request.args.get("require_like"), False)
+    debug = to_bool(request.args.get("debug"), False)
+
+    required_roles: List[str] = []
+    if require_like:
+        required_roles.append("like")
+    if min_comments >= 1:
+        required_roles.append("comment1")
+    if min_comments >= 2:
+        required_roles.append("comment2")
+    if min_replies >= 1:
+        required_roles.append("reply1")
+    if min_replies >= 2:
+        required_roles.append("reply2")
+
+    files = request.files or {}
+    missing = [r for r in required_roles if r not in files]
     if missing:
         return jsonify({
+            "request_id": req_id,
             "verified": False,
-            "error": "missing_screenshots",
-            "message": f"Missing required screenshots: {', '.join(missing)}",
-            "required": required,
-            "optional": optional
+            "message": "Missing required images",
+            "reasons": ["MISSING_IMAGES"],
+            "missing": missing,
+            "rules": {"min_comments": min_comments, "min_replies": min_replies, "require_like": require_like},
+            "analyzer_version": ANALYZER_VERSION
         }), 400
-    
-    # Load images
-    images = {}
-    for key in required + ["like"]:
-        if key in request.files:
-            try:
-                file_storage = request.files[key]
-                file_storage.stream.seek(0)
-                images[key] = Image.open(io.BytesIO(file_storage.read())).convert("RGB")
-            except Exception as e:
-                return jsonify({
-                    "verified": False,
-                    "error": "invalid_image",
-                    "message": f"Failed to load image '{key}': {str(e)}"
-                }), 400
-    
-    # Detect like button if provided
-    liked = None
-    if "like" in images:
+
+    present_roles = [r for r in ALL_ROLES if r in files]
+    parsed: Dict[str, Dict[str, Any]] = {}
+    reasons: List[str] = []
+    warnings: List[str] = []
+
+    for role in present_roles:
+        f = files.get(role)
+        raw = f.read()
+        if len(raw) > MAX_IMAGE_BYTES:
+            return jsonify({
+                "request_id": req_id,
+                "verified": False,
+                "message": f"Image too large: {role}",
+                "reasons": ["IMAGE_TOO_LARGE"],
+                "role": role,
+                "analyzer_version": ANALYZER_VERSION
+            }), 400
+
         try:
-            liked = detect_like(images["like"])
-            # Ensure it's a native Python bool for JSON serialization
-            if liked is not None:
-                liked = bool(liked)
-        except Exception as e:
-            app.logger.error(f"Like detection failed: {e}")
-            liked = None
-    
-    # Extract text from all screenshots
-    extracted = {}
-    debug_info = {}
-    
-    for key in required:
-        try:
-            lines = extract_text_lines(images[key])
-            parsed = parse_comments_replies(lines)
-            extracted[key] = parsed
-            
-            if debug:
-                debug_info[key] = {
-                    "lines": lines[:30],  # First 30 lines
-                    "parsed_count": len(parsed),
-                    "parsed": parsed
-                }
-        except Exception as e:
-            app.logger.error(f"OCR failed for {key}: {e}")
-            extracted[key] = []
-            if debug:
-                debug_info[key] = {"error": str(e)}
-    
-    # Group by username
-    user_comments = defaultdict(list)
-    user_replies = defaultdict(list)
-    
-    for username, text in extracted.get("comment1", []):
-        user_comments[username].append(text)
-    
-    for username, text in extracted.get("comment2", []):
-        user_comments[username].append(text)
-    
-    for username, text in extracted.get("reply1", []):
-        user_replies[username].append(text)
-    
-    for username, text in extracted.get("reply2", []):
-        user_replies[username].append(text)
-    
-    # Find all unique usernames
-    all_users = set(user_comments.keys()) | set(user_replies.keys())
-    
-    if not all_users:
-        return jsonify({
-            "verified": False,
-            "error": "no_username_found",
-            "message": "Could not extract any username. Ensure screenshots clearly show @username and timestamp.",
-            "user_id": None,
-            "comments": [],
-            "replies": [],
+            img = Image.open(io.BytesIO(raw))
+            img.load()
+        except Exception:
+            return jsonify({
+                "request_id": req_id,
+                "verified": False,
+                "message": f"Invalid image: {role}",
+                "reasons": ["INVALID_IMAGE"],
+                "role": role,
+                "analyzer_version": ANALYZER_VERSION
+            }), 400
+
+        w, h = img.size
+        top_crop = img.crop((0, 0, w, int(h * 0.35)))
+
+        full_text = ocr_image(img)
+        top_text = ocr_image(top_crop)
+
+        # main extraction from full_text (line-based)
+        segments = extract_blocks_by_handle(full_text)
+
+        # fallback: if no segments, OCR lower part (common for replies)
+        if not segments and role in ("reply1", "reply2"):
+            lower = img.crop((0, int(h * 0.25), w, h))
+            lower_text = ocr_image(lower)
+            segments = extract_blocks_by_handle(lower_text)
+        else:
+            lower_text = ""
+
+        # handles present = keys from segments + any @handles seen anywhere
+        handles = set()
+        handles.update([normalize_handle(k) for k in segments.keys()])
+        for m in AT_HANDLE_RE.findall(full_text + " " + top_text):
+            handles.add(normalize_handle(m))
+
+        liked = None
+        if role == "like":
+            liked = detect_liked(full_text)
+
+        parsed[role] = {
+            "role": role,
+            "handles": sorted(handles),
+            "segments": segments,  # keys are lower already in extract_blocks_by_handle
             "liked": liked,
-            "debug": debug_info if debug else None
-        }), 200
-    
-    # Score users by total items found
-    user_scores = {}
-    for user in all_users:
-        score = len(user_comments.get(user, [])) + len(user_replies.get(user, []))
-        user_scores[user] = score
-    
-    # Pick user with most items
-    target_user = max(user_scores, key=user_scores.get)
-    
-    # Get comments and replies for target user
-    comments = user_comments.get(target_user, [])
-    replies = user_replies.get(target_user, [])
-    
-    # Remove duplicates while preserving order
-    def dedupe(items):
-        seen = set()
-        result = []
-        for item in items:
-            if item not in seen:
-                seen.add(item)
-                result.append(item)
-        return result
-    
-    comments = dedupe(comments)
-    replies = dedupe(replies)
-    
-    # Verification checks
-    reasons = []
-    
-    # Need at least 2 distinct comments
-    if len(comments) < 2:
-        reasons.append(f"Need 2 distinct comments from same user, found {len(comments)}")
-    elif len(comments) >= 2:
-        if not are_texts_distinct(comments[0], comments[1]):
-            reasons.append("Comments are too similar, need distinct comments")
-    
-    # Need at least 2 distinct replies
-    if len(replies) < 2:
-        reasons.append(f"Need 2 distinct replies from same user, found {len(replies)}")
-    elif len(replies) >= 2:
-        if not are_texts_distinct(replies[0], replies[1]):
-            reasons.append("Replies are too similar, need distinct replies")
-    
-    # Ensure comments differ from replies
-    if len(comments) >= 2 and len(replies) >= 2:
-        for c in comments[:2]:
-            for r in replies[:2]:
-                if not are_texts_distinct(c, r):
-                    reasons.append("Comments and replies should be different from each other")
-                    break
-    
-    verified = len(reasons) == 0
-    
-    # Build response matching the expected format
-    response = {
-        "verified": verified,
-        "user_id": target_user,
-        "comment": comments[:2] if len(comments) >= 2 else comments,  # Array of comments
-        "replies": replies[:2] if len(replies) >= 2 else replies,      # Array of replies
-        "liked": liked  # Will be None if not provided, True/False if checked
-    }
-    
-    # Add debug info if requested
-    if debug:
-        response["debug"] = {
-            "all_users": list(all_users),
-            "user_scores": user_scores,
-            "target_user": target_user,
-            "comments_found": len(comments),
-            "replies_found": len(replies),
-            "all_comments": comments,
-            "all_replies": replies,
-            "extraction_details": debug_info
+            "ocr_full": full_text,
+            "ocr_top": top_text,
+            "ocr_lower": lower_text
         }
-    
-    return jsonify(response), 200
 
+    # Like logic
+    like_provided = "like" in parsed
+    liked_state = None
+    if like_provided:
+        liked_state = parsed["like"].get("liked")
+        if liked_state is None:
+            if require_like:
+                reasons.append("LIKE_UNCLEAR")
+            else:
+                warnings.append("LIKE_UNCLEAR")
 
-@app.errorhandler(Exception)
-def handle_exception(e):
-    """Global exception handler"""
-    code = e.code if isinstance(e, HTTPException) else 500
-    app.logger.exception("Unhandled exception")
-    return jsonify({
-        "error": "internal_server_error" if code == 500 else "http_error",
-        "status": code
-    }), code
+    # handle selection
+    handles_by_role: Dict[str, List[str]] = {}
+    for r in ["comment1", "comment2", "reply1", "reply2"]:
+        if r in parsed:
+            handles_by_role[r] = parsed[r].get("handles") or []
 
+    main_handle = pick_majority_handle(handles_by_role, required_roles)
+    if not main_handle:
+        reasons.append("USERNAME_NOT_FOUND")
 
-# ═══════════════════════════════════════════════════════════════════════════
-#                                  MAIN
-# ═══════════════════════════════════════════════════════════════════════════
+    def get_msgs(role: str) -> List[str]:
+        segs = parsed.get(role, {}).get("segments") or {}
+        return segs.get(main_handle.lower(), [])
+
+    # Username visibility check (smarter)
+    # Only fail if required role has neither handle detected nor messages extracted.
+    if main_handle:
+        for rr in [r for r in required_roles if r != "like"]:
+            role_handles = [h.lower() for h in (parsed.get(rr, {}).get("handles") or [])]
+            role_msgs = get_msgs(rr)
+            if (main_handle.lower() not in role_handles) and (not role_msgs):
+                reasons.append("USERNAME_NOT_VISIBLE")
+                break
+
+    # Extract texts
+    comments: List[str] = []
+    replies: List[str] = []
+
+    for r in ["comment1", "comment2"]:
+        if r in parsed and main_handle:
+            msgs = get_msgs(r)
+            if msgs:
+                comments.append(msgs[0])  # comment is usually first block
+
+    for r in ["reply1", "reply2"]:
+        if r in parsed and main_handle:
+            msgs = get_msgs(r)
+            if msgs:
+                replies.append(msgs[-1])  # reply is usually last block
+
+    # Count checks
+    if len(comments) < min_comments:
+        reasons.append("INSUFFICIENT_COMMENTS")
+    if len(replies) < min_replies:
+        reasons.append("INSUFFICIENT_REPLIES")
+
+    # Uniqueness
+    if len(comments) >= 2 and not uniqueness_check(comments, SIMILARITY_SAME):
+        reasons.append("COMMENTS_TOO_SIMILAR")
+    if len(replies) >= 2 and not uniqueness_check(replies, SIMILARITY_SAME):
+        reasons.append("REPLIES_TOO_SIMILAR")
+
+    # Cross-check
+    if comments and replies and not cross_check(comments, replies, SIMILARITY_CROSS):
+        reasons.append("COMMENT_EQUALS_REPLY")
+
+    # Like enforce
+    if require_like:
+        if not like_provided:
+            reasons.append("LIKE_REQUIRED_BUT_NOT_PROVIDED")
+        elif liked_state is not True:
+            if liked_state is False:
+                reasons.append("LIKE_REQUIRED_BUT_NOT_LIKED")
+
+    verified = (len(reasons) == 0)
+
+    resp: Dict[str, Any] = {
+        "request_id": req_id,
+        "verified": verified,
+        "user_id": main_handle or None,
+        "comment": comments,
+        "replies": replies,
+
+        "like_provided": bool(like_provided),
+        "liked": bool(liked_state) if like_provided and liked_state is not None else False,
+        "liked_state": ("yes" if liked_state is True else "no" if liked_state is False else "unknown" if like_provided else "not_provided"),
+
+        "rules": {
+            "min_comments": min_comments,
+            "min_replies": min_replies,
+            "require_like": bool(require_like),
+        },
+        "reasons": reasons,
+        "warnings": warnings,
+        "message": "Verified" if verified else "Verification failed",
+        "processing_ms": int((time.time() - start) * 1000),
+        "analyzer_version": ANALYZER_VERSION,
+    }
+
+    if debug:
+        resp["debug"] = {
+            "present_roles": present_roles,
+            "handles_by_role": handles_by_role,
+            "segments_for_main": {
+                role: (parsed.get(role, {}).get("segments") or {}).get((main_handle or "").lower(), [])
+                for role in present_roles
+            },
+            "handles_detected": {
+                role: parsed.get(role, {}).get("handles", [])
+                for role in present_roles
+            }
+        }
+
+    return jsonify(resp), (200 if verified else 422)
+
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("YouTube Engagement Verification API")
-    print("=" * 70)
-    print(f"Tesseract OK: {TESSERACT_OK}")
-    if not TESSERACT_OK:
-        print(f"Tesseract Error: {TESSERACT_ERR}")
-    print(f"Port: {PORT}")
-    print(f"Debug: {DEBUG}")
-    print("=" * 70)
-    
-    app.run(host="0.0.0.0", port=PORT, debug=DEBUG)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "6000")), debug=False)

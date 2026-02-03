@@ -150,6 +150,11 @@ async function verifyWithFlask(
     validateStatus: () => true
   });
 
+  // Treat 422 as "verification failed" (normal analyzer response)
+  if (resp.status === 422) {
+    return resp.data || {};
+  }
+
   if (resp.status < 200 || resp.status >= 300) {
     const msg = resp?.data?.message || resp?.data?.error || `Flask analyzer HTTP ${resp.status}`;
     const err = new Error(msg);
@@ -406,18 +411,20 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
   const rules = analysis?.rules || { min_comments: minComments, min_replies: minReplies, require_like: requireLike };
 
   // IMPORTANT: do NOT force liked=true when requireLike=false; keep analyzer output for UI/debug
-  const analysisPayload = {
-    liked: typeof analysis?.liked === 'boolean' ? analysis.liked : false,
-    user_id: analysis?.user_id ?? null,
-    comment: Array.isArray(analysis?.comment) ? analysis.comment : [],
-    replies: Array.isArray(analysis?.replies) ? analysis.replies : [],
-    verified: false,
-    rules: {
-      min_comments: Number(rules.min_comments ?? minComments),
-      min_replies: Number(rules.min_replies ?? minReplies),
-      require_like: !!(rules.require_like ?? requireLike)
-    }
-  };
+const analysisPayload = {
+  liked: typeof analysis?.liked === 'boolean' ? analysis.liked : false,
+  like_provided: !!analysis?.like_provided,
+  user_id: analysis?.user_id ?? null,
+  comment: Array.isArray(analysis?.comment) ? analysis.comment : [],
+  replies: Array.isArray(analysis?.replies) ? analysis.replies : [],
+  reasons: Array.isArray(analysis?.reasons) ? analysis.reasons : [],
+  verified: typeof analysis?.verified === 'boolean' ? analysis.verified : false,
+  rules: {
+    min_comments: Number(rules.min_comments ?? minComments),
+    min_replies: Number(rules.min_replies ?? minReplies),
+    require_like: !!(rules.require_like ?? requireLike)
+  }
+};
 
   const hasHandle = typeof analysisPayload.user_id === 'string' && analysisPayload.user_id.trim().length > 0;
   const meetsCounts =
@@ -428,28 +435,20 @@ exports.createUserEntry = asyncHandler(async (req, res) => {
 
   analysisPayload.verified = !!(hasHandle && meetsCounts && meetsLike);
 
-  if (!analysisPayload.verified) {
-    return res.status(422).json({
-      code: 'VERIFICATION_FAILED',
-      message: 'Screenshot verification failed. Please upload clearer screenshots.',
-      details: {
-        liked: analysisPayload.liked,
-        user_id: analysisPayload.user_id,
-        commentCount: analysisPayload.comment.length,
-        replyCount: analysisPayload.replies.length,
-        needed: {
-          minComments,
-          minReplies,
-          requireLike,
-          handleRequired: true,
-          sameUser: true
-        },
-        analyzerMessage: analysis?.message || null,
-        debug: analysis?.debug || null
-      },
-      verification: analysisPayload
-    });
-  }
+if (!analysisPayload.verified) {
+  return res.status(422).json({
+    code: 'VERIFICATION_FAILED',
+    message: 'Screenshot verification failed. Please upload clearer screenshots.',
+    details: {
+      user_id: analysisPayload.user_id,
+      reasons: analysisPayload.reasons,
+      analyzerMessage: analysis?.message || null,
+      liked: analysisPayload.liked,
+      like_provided: analysisPayload.like_provided
+    },
+    verification: analysisPayload
+  });
+}
 
   // persist Screenshot
   let screenshotDoc;
