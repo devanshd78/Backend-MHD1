@@ -1,4 +1,9 @@
-import os, re, io, time, uuid, threading
+import os
+import re
+import io
+import time
+import uuid
+import threading
 from typing import Dict, Any, List, Optional
 
 from flask import Flask, request, jsonify
@@ -9,24 +14,24 @@ from difflib import SequenceMatcher
 # -----------------------------
 # Config
 # -----------------------------
-ANALYZER_VERSION = "2.2.0"
+ANALYZER_VERSION = "2.3.0"
 
-MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
-MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(60 * 1024 * 1024)))
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))          # 10MB per image
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(60 * 1024 * 1024)))       # request cap
 
 OCR_LANG = os.getenv("OCR_LANG", "eng")
 
-# FAST defaults for UI screenshots
+# FAST defaults for mobile UI screenshots
 TESSERACT_FAST = os.getenv("TESSERACT_FAST", "--oem 1 --psm 11")
 TESSERACT_HEADER = os.getenv("TESSERACT_HEADER", "--oem 1 --psm 7")
 
 OCR_TIMEOUT_SEC = int(os.getenv("OCR_TIMEOUT_SEC", "8"))
 
 # Similarity thresholds
-SIMILARITY_SAME = float(os.getenv("SIMILARITY_SAME", "0.90"))
-SIMILARITY_CROSS = float(os.getenv("SIMILARITY_CROSS", "0.88"))
+SIMILARITY_SAME = float(os.getenv("SIMILARITY_SAME", "0.90"))     # comment1 vs comment2, reply1 vs reply2
+SIMILARITY_CROSS = float(os.getenv("SIMILARITY_CROSS", "0.88"))   # comment vs reply (should be different)
 
-# Concurrency cap: prevents queue → Node timeout
+# Concurrency cap (prevents node timeout by queueing)
 MAX_CONCURRENT_OCR = int(os.getenv("MAX_CONCURRENT_OCR", "3"))
 BUSY_ACQUIRE_TIMEOUT_SEC = float(os.getenv("BUSY_ACQUIRE_TIMEOUT_SEC", "0.8"))
 OCR_SEM = threading.BoundedSemaphore(MAX_CONCURRENT_OCR)
@@ -37,13 +42,19 @@ AT_HANDLE_RE = re.compile(r"@[\w\.\-]{2,}", re.IGNORECASE)
 AGO_RE = re.compile(r"\bago\b", re.IGNORECASE)
 TIME_RE = re.compile(
     r"\b(\d+)\s*(sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)\b",
-    re.IGNORECASE
+    re.IGNORECASE,
+)
+
+# Strip "0s ago", "2 min ago" when OCR merges time with message
+LEAD_TIME_AGO_RE = re.compile(
+    r"^\s*\d+\s*(sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)\s*ago\s+",
+    re.IGNORECASE,
 )
 
 STOP_TOKENS = [
     "add a comment", "add a reply", "write a comment", "write a reply",
     "view replies", "hide replies", "see more", "show more",
-    "reply", "replies", "topics", "newest", "see translation", "translate to"
+    "reply", "replies", "topics", "newest", "see translation", "translate to",
 ]
 
 app = Flask(__name__)
@@ -66,11 +77,12 @@ def sim(a: str, b: str) -> float:
         return 0.0
     return SequenceMatcher(None, a_n, b_n).ratio()
 
-def clean_snippet(s: str, max_len: int = 180) -> str:
+def clean_snippet(s: str, max_len: int = 200) -> str:
     s = (s or "").strip()
     s = s.replace("“", "").replace("”", "").replace("’", "'").replace("`", "'")
     s = re.sub(r"\s+", " ", s).strip()
 
+    # cut on common UI tokens
     low = s.lower()
     for tok in STOP_TOKENS:
         idx = low.find(tok)
@@ -78,8 +90,9 @@ def clean_snippet(s: str, max_len: int = 180) -> str:
             s = s[:idx].strip()
             low = s.lower()
 
-    # trim junk counters/icons at end
+    s = LEAD_TIME_AGO_RE.sub("", s).strip()
     s = re.sub(r"[©®™]+", "", s).strip()
+
     if len(s) > max_len:
         s = s[:max_len].rstrip()
     return s
@@ -141,20 +154,17 @@ def ocr(img: Image.Image, cfg: str) -> str:
 
 def ocr_role(img: Image.Image, role: str) -> Dict[str, Any]:
     """
-    Biggest speed win:
-    - OCR only a ROI (content area), NOT entire screenshot.
-    - Do header OCR ONLY if handle is missing.
+    Speed strategy:
+    - OCR only ROI (content area)
+    - If handle not found, OCR header as fallback
     """
     w, h = img.size
 
-    # ROI choices (tuned for YouTube comments UI)
     if role in ("comment1", "comment2", "reply1", "reply2"):
-        # ignore top navbar + bottom buttons area
         roi = img.crop((0, int(h * 0.16), w, int(h * 0.92)))
         roi = preprocess(roi, max_w=1000)
         text = ocr(roi, TESSERACT_FAST)
 
-        # fallback header OCR ONLY if no handle found
         if not AT_HANDLE_RE.search(text or ""):
             header = img.crop((0, 0, w, int(h * 0.28)))
             header = preprocess(header, max_w=900)
@@ -164,7 +174,7 @@ def ocr_role(img: Image.Image, role: str) -> Dict[str, Any]:
 
         return {"text": (htext + "\n" + text).strip(), "roi_used": True}
 
-    # like image: small middle/bottom area is enough usually
+    # like image ROI
     roi = img.crop((0, int(h * 0.45), w, int(h * 0.98)))
     roi = preprocess(roi, max_w=900)
     text = ocr(roi, TESSERACT_FAST)
@@ -196,7 +206,6 @@ def extract_handle_from_line(line: str) -> Optional[str]:
 
 def extract_blocks_by_handle(full_text: str) -> Dict[str, List[str]]:
     """
-    Works even when replies don't have ":".
     Detect handle line -> capture subsequent lines as message until next handle/UI.
     """
     lines = [ln.strip() for ln in (full_text or "").splitlines() if ln.strip()]
@@ -218,7 +227,7 @@ def extract_blocks_by_handle(full_text: str) -> Dict[str, List[str]]:
         if h:
             flush()
             current = h
-            # same-line message (if OCR captured)
+            # same-line message if OCR includes it
             if ":" in ln:
                 tail = ln.split(":", 1)[1].strip()
                 if tail and not is_ui_line(tail):
@@ -235,6 +244,33 @@ def extract_blocks_by_handle(full_text: str) -> Dict[str, List[str]]:
     flush()
     return out
 
+def extract_fallback_chunks(text: str) -> List[str]:
+    """
+    Fallback extraction when username is NOT visible (scroll / crop).
+    Collect contiguous non-UI lines -> cleaned message chunks.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    chunks: List[str] = []
+    buf: List[str] = []
+
+    def flush():
+        nonlocal buf
+        if buf:
+            s = clean_snippet(" ".join(buf))
+            if len(s) >= 6:
+                chunks.append(s)
+        buf = []
+
+    for ln in lines:
+        if is_ui_line(ln):
+            flush()
+            continue
+        buf.append(ln)
+
+    flush()
+    chunks.sort(key=len, reverse=True)
+    return chunks
+
 def detect_liked(text: str) -> Optional[bool]:
     t = normalize_text(text)
     if "liked" in t:
@@ -246,6 +282,7 @@ def detect_liked(text: str) -> Optional[bool]:
 def pick_majority_handle(handles_by_role: Dict[str, List[str]], required_roles: List[str]) -> str:
     counts, occ, original = {}, {}, {}
     roles = [r for r in required_roles if r != "like"]
+
     for role in roles:
         seen = set()
         for h in (handles_by_role.get(role) or []):
@@ -255,6 +292,7 @@ def pick_majority_handle(handles_by_role: Dict[str, List[str]], required_roles: 
             if key not in seen:
                 counts[key] = counts.get(key, 0) + 1
                 seen.add(key)
+
     if not counts:
         return ""
     best = sorted(counts.keys(), key=lambda k: (counts[k], occ.get(k, 0)), reverse=True)[0]
@@ -287,7 +325,6 @@ def analyze():
     start = time.time()
     req_id = str(uuid.uuid4())
 
-    # prevent queue → return 429 quickly (Node should retry)
     acquired = OCR_SEM.acquire(timeout=BUSY_ACQUIRE_TIMEOUT_SEC)
     if not acquired:
         return jsonify({
@@ -355,11 +392,13 @@ def analyze():
                 }), 400
 
             res = ocr_role(img, role)
-            text = res["text"] or ""
+            text = res.get("text") or ""
             if not text:
                 warnings.append("OCR_EMPTY_OR_TIMEOUT")
 
             segments = extract_blocks_by_handle(text) if text else {}
+            fallback = extract_fallback_chunks(text) if text else []
+
             handles = set([normalize_handle(h) for h in segments.keys()])
             for m in AT_HANDLE_RE.findall(text):
                 handles.add(normalize_handle(m))
@@ -369,6 +408,7 @@ def analyze():
             parsed[role] = {
                 "text": text,
                 "segments": segments,
+                "fallback": fallback,
                 "handles": sorted(handles),
                 "liked": liked,
             }
@@ -395,26 +435,38 @@ def analyze():
             seg = parsed.get(role, {}).get("segments") or {}
             return seg.get((main_handle or "").lower(), [])
 
-        # Visibility check: required role must have handle OR extracted msgs
+        # Relaxed visibility: only fail if handle not seen anywhere
         if main_handle:
+            handle_seen_any = False
             for rr in [r for r in required_roles if r != "like"]:
                 role_handles = [h.lower() for h in parsed.get(rr, {}).get("handles", [])]
-                role_msgs = msgs(rr)
-                if (main_handle.lower() not in role_handles) and (not role_msgs):
-                    reasons.append("USERNAME_NOT_VISIBLE")
+                if main_handle.lower() in role_handles:
+                    handle_seen_any = True
                     break
+            if not handle_seen_any:
+                reasons.append("USERNAME_NOT_VISIBLE")
 
-        # Extract comments/replies
+        # Extract comments/replies with fallback
         comments: List[str] = []
         replies: List[str] = []
 
         for r in ["comment1", "comment2"]:
             ms = msgs(r) if main_handle else []
-            if ms: comments.append(ms[0])
+            if ms:
+                comments.append(ms[0])
+            else:
+                fb = parsed.get(r, {}).get("fallback") or []
+                if fb:
+                    comments.append(fb[0])
 
         for r in ["reply1", "reply2"]:
             ms = msgs(r) if main_handle else []
-            if ms: replies.append(ms[-1])
+            if ms:
+                replies.append(ms[-1])
+            else:
+                fb = parsed.get(r, {}).get("fallback") or []
+                if fb:
+                    replies.append(fb[0])
 
         if len(comments) < min_comments:
             reasons.append("INSUFFICIENT_COMMENTS")
@@ -432,7 +484,7 @@ def analyze():
         if require_like:
             if not like_provided:
                 reasons.append("LIKE_REQUIRED_BUT_NOT_PROVIDED")
-            elif liked_state is not True and liked_state is False:
+            elif liked_state is False:
                 reasons.append("LIKE_REQUIRED_BUT_NOT_LIKED")
 
         verified = (len(reasons) == 0)
@@ -443,10 +495,8 @@ def analyze():
             "user_id": main_handle or None,
             "comment": comments,
             "replies": replies,
-
             "like_provided": bool(like_provided),
             "liked": bool(liked_state) if like_provided and liked_state is not None else False,
-
             "rules": {
                 "min_comments": min_comments,
                 "min_replies": min_replies,
@@ -463,7 +513,11 @@ def analyze():
             resp["debug"] = {
                 "present_roles": present_roles,
                 "handles_by_role": handles_by_role,
-                "segments_for_main": {r: msgs(r) for r in present_roles if r != "like"}
+                "segments_for_main": {r: msgs(r) for r in present_roles if r != "like"},
+                "fallback_used": {
+                    r: (parsed.get(r, {}).get("fallback") or [])[:2]
+                    for r in present_roles if r != "like"
+                },
             }
 
         return jsonify(resp), (200 if verified else 422)
