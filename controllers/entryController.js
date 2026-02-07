@@ -1,29 +1,38 @@
-// controllers/entryController.js (Flask analyzer version) — UPDATED
-const { v4: uuidv4 } = require('uuid');
-const crypto = require('crypto');
-const imghash = require('imghash');
-const mongoose = require('mongoose');
+// controllers/entryController.js  (YouTube API verification via Link.title + permalinks)
+// FULL REWRITE (no placeholders)
+// ✅ SAME user resubmits => UPDATE screenshot+entry (no duplicate error)
+// ✅ Reuse checks apply ONLY across DIFFERENT users
+// ✅ requireLike doesn't block verification; if required => liked assumed true
+
+const { v4: uuidv4 } = require("uuid");
+const mongoose = require("mongoose");
 const { Types } = mongoose;
-const Jimp = require('jimp');
-const QrCode = require('qrcode-reader');
-const { parse } = require('querystring');
 
-const axios = require('axios');
-const FormData = require('form-data');
+const axios = require("axios");
+const Jimp = require("jimp");
+const QrCode = require("qrcode-reader");
+const { parse } = require("querystring");
 
-const Entry = require('../models/Entry');
-const Link = require('../models/Link');
-const Employee = require('../models/Employee');
-const User = require('../models/User');
-const Screenshot = require('../models/Screenshot');
+const Entry = require("../models/Entry");
+const Link = require("../models/Link");
+const Employee = require("../models/Employee");
+const User = require("../models/User");
+const Screenshot = require("../models/Screenshot");
 
 /* ------------------------ utils & helpers ------------------------ */
-const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-const badRequest = (res, msg) => res.status(400).json({ error: msg });
-const notFound = (res, msg) => res.status(404).json({ error: msg });
+const asyncHandler =
+  (fn) =>
+  (req, res, next) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
+
+const badRequest = (res, code, message, extra = {}) =>
+  res.status(400).json({ code, message, ...extra });
+
+const notFound = (res, code, message, extra = {}) =>
+  res.status(404).json({ code, message, ...extra });
 
 function isValidUpi(upi) {
-  return /^[a-zA-Z0-9_.-]+@[a-zA-Z0-9.-]+$/.test(upi);
+  return /^[a-zA-Z0-9_.-]+@[a-zA-Z0-9.-]+$/.test(String(upi || "").trim());
 }
 
 const clamp02 = (v, def) => {
@@ -33,554 +42,828 @@ const clamp02 = (v, def) => {
 };
 
 function toBool(v, def = false) {
-  if (typeof v === 'boolean') return v;
-  if (typeof v === 'number') return v === 1;
-  if (typeof v === 'string') {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v === 1;
+  if (typeof v === "string") {
     const s = v.trim().toLowerCase();
-    if (['1', 'true', 'yes', 'y'].includes(s)) return true;
-    if (['0', 'false', 'no', 'n'].includes(s)) return false;
+    if (["1", "true", "yes", "y"].includes(s)) return true;
+    if (["0", "false", "no", "n"].includes(s)) return false;
   }
   return def;
 }
 
-/* -------------------- pHash + dedupe helpers -------------------- */
-const NIBBLE_POP = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
-
-function hexHamming(a, b) {
-  const len = Math.max(a.length, b.length);
-  a = a.padStart(len, '0');
-  b = b.padStart(len, '0');
-  let dist = 0;
-  for (let i = 0; i < len; i++) {
-    const x = (parseInt(a[i], 16) ^ parseInt(b[i], 16)) & 0xF;
-    dist += NIBBLE_POP[x];
-  }
-  return dist;
-}
-
-function computeSha256(buf) {
-  return crypto.createHash('sha256').update(buf).digest('hex');
-}
-
-async function computePhash(buf) {
-  // 16x16 perceptual hash, hex output
-  return imghash.hash(buf, 16);
-}
-
-async function phashBundle(filesByRole, roles) {
+function uniq(arr) {
   const out = [];
-  for (const role of roles) {
-    const f = filesByRole[role];
-    if (!f) throw new Error(`Missing file: ${role}`);
-    const phash = await computePhash(f.buffer, f.mimetype);
-    const sha = computeSha256(f.buffer);
-    out.push({ role, phash, sha256: sha, size: f.size, mime: f.mimetype });
+  const seen = new Set();
+  for (const x of arr || []) {
+    const t = String(x || "").trim();
+    if (!t) continue;
+    if (!seen.has(t)) {
+      seen.add(t);
+      out.push(t);
+    }
   }
   return out;
 }
 
-async function isDuplicateForUser(userId, phashes, hammingThreshold = 6) {
-  const prev = await Screenshot.find({ userId }).select('phashes').lean();
-  const seen = prev.flatMap(p => p.phashes || []);
-  if (!seen.length) return false;
+function safeUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) throw new Error("Empty URL");
+  if (/^https?:\/\//i.test(s)) return s;
+  return `https://${s}`;
+}
 
-  for (const h of phashes) {
-    for (const old of seen) {
-      if (hexHamming(h, old) <= hammingThreshold) return true;
-    }
+// Accepts full YouTube URLs and returns 11-char videoId or null
+function extractVideoId(urlLike) {
+  const u = new URL(safeUrl(urlLike));
+
+  // watch?v=
+  const v = u.searchParams.get("v");
+  if (v && /^[0-9A-Za-z_-]{11}$/.test(v)) return v;
+
+  // youtu.be/<id>
+  if (u.hostname === "youtu.be" || u.hostname.endsWith(".youtu.be")) {
+    const id = u.pathname.split("/").filter(Boolean)[0];
+    if (id && /^[0-9A-Za-z_-]{11}$/.test(id)) return id;
   }
-  return false;
+
+  // /shorts/<id>, /embed/<id>
+  const seg = u.pathname.split("/").filter(Boolean);
+  if (seg[0] === "shorts" || seg[0] === "embed") {
+    const id = seg[1];
+    if (id && /^[0-9A-Za-z_-]{11}$/.test(id)) return id;
+  }
+
+  return null;
 }
 
-/* ----------------------- Flask analyzer helper ----------------------- */
-const FLASK_ANALYZER_URL = process.env.FLASK_ANALYZER_URL || 'http://127.0.0.1:6000/analyze';
-const FLASK_TIMEOUT_MS = Number(process.env.FLASK_TIMEOUT_MS || 45000);
+// Parses a YouTube comment/reply permalink:
+// https://www.youtube.com/watch?v=VIDEO&lc=PARENT
+// https://www.youtube.com/watch?v=VIDEO&lc=PARENT.REPLYKEY
+function parseCommentPermalink(rawUrl) {
+  const url = safeUrl(rawUrl);
+  const u = new URL(url);
 
-function mimeToExt(mime) {
-  if (mime === 'image/png') return 'png';
-  if (mime === 'image/webp') return 'webp';
-  return 'jpg';
+  const videoId = extractVideoId(url);
+  const lc = u.searchParams.get("lc");
+
+  if (!videoId || !lc) {
+    throw new Error("Invalid YouTube permalink (must contain videoId + lc=...)");
+  }
+
+  const [parentId, replyKey] = lc.split(".");
+  return {
+    permalink: url,
+    videoId,
+    lc,
+    parentId,
+    replyKey: replyKey || null,
+    isReply: !!replyKey,
+  };
 }
 
-const http = require('http');
-const https = require('https');
+function normText(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .replace(/[^\w'\s]/g, "")
+    .trim()
+    .toLowerCase();
+}
 
-const axiosClient = axios.create({
-  httpAgent: new http.Agent({ keepAlive: true }),
-  httpsAgent: new https.Agent({ keepAlive: true })
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function decodeUpiFromQrBuffer(buffer) {
+  const img = await Jimp.read(buffer);
+
+  const qrValue = await new Promise((resolve, reject) => {
+    const qr = new QrCode();
+    let done = false;
+
+    qr.callback = (err, value) => {
+      if (done) return;
+      done = true;
+      if (err || !value) return reject(new Error("QR decode failed"));
+      resolve(value.result);
+    };
+
+    qr.decode(img.bitmap);
+    setTimeout(() => !done && reject(new Error("QR decode timeout")), 5000);
+  });
+
+  const upiString = String(qrValue || "").trim();
+  if (!upiString) return "";
+
+  // upi://pay?pa=xxxx@bank&...
+  if (upiString.startsWith("upi://")) {
+    const qs = upiString.split("?")[1] || "";
+    const parsed = parse(qs);
+    return String(parsed.pa || "").trim();
+  }
+
+  return upiString;
+}
+
+/* ------------------------ YouTube API client ------------------------ */
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+const YT_TIMEOUT_MS = Number(process.env.YT_TIMEOUT_MS || 15000);
+const YT_MAX_PAGES = Number(process.env.YT_MAX_PAGES || 5);
+
+const yt = axios.create({
+  baseURL: "https://www.googleapis.com/youtube/v3",
+  timeout: YT_TIMEOUT_MS,
+  validateStatus: () => true,
 });
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-function buildForm(filesByRole, presentRoles) {
-  const form = new FormData();
-  for (const role of presentRoles) {
-    const f = filesByRole[role];
-    if (!f) continue;
-    form.append(role, f.buffer, {
-      filename: `${role}.${mimeToExt(f.mimetype)}`,
-      contentType: f.mimetype,
-      knownLength: f.size
-    });
-  }
-
-  return new Promise((resolve, reject) => {
-    form.getLength((err, length) => {
-      if (err) return reject(err);
-      resolve({ form, contentLength: length });
-    });
+async function ytGetCommentThreadsByIds(ids) {
+  if (!ids.length) return [];
+  const resp = await yt.get("/commentThreads", {
+    params: {
+      key: YOUTUBE_API_KEY,
+      part: "snippet",
+      id: ids.join(","),
+      textFormat: "plainText",
+    },
   });
+
+  if (resp.status !== 200) {
+    const msg =
+      resp?.data?.error?.message ||
+      `YouTube API error (commentThreads.list): HTTP ${resp.status}`;
+    throw new Error(msg);
+  }
+  return resp.data?.items || [];
 }
 
-async function verifyWithFlask(
-  filesByRole,
-  {
-    debug = false,
-    minComments = 2,
-    minReplies = 2,
-    requireLike = false,
-    presentRoles = ['like', 'comment1', 'comment2', 'reply1', 'reply2'],
-    maxAttempts = 3
-  } = {}
-) {
-  const qs =
-    `min_comments=${encodeURIComponent(minComments)}` +
-    `&min_replies=${encodeURIComponent(minReplies)}` +
-    `&require_like=${requireLike ? 1 : 0}` +
-    (debug ? `&debug=1` : ``);
+async function ytListRepliesByParent(parentId, pageToken = null) {
+  const resp = await yt.get("/comments", {
+    params: {
+      key: YOUTUBE_API_KEY,
+      part: "snippet",
+      parentId,
+      maxResults: 100,
+      pageToken: pageToken || undefined,
+      textFormat: "plainText",
+    },
+  });
 
-  const url = `${FLASK_ANALYZER_URL}?${qs}`;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const { form, contentLength } = await buildForm(filesByRole, presentRoles);
-
-    const resp = await axiosClient.post(url, form, {
-      headers: { ...form.getHeaders(), 'Content-Length': contentLength },
-      timeout: FLASK_TIMEOUT_MS,
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-      validateStatus: () => true
-    });
-
-    // ✅ busy: retry quickly
-    if (resp.status === 429) {
-      await sleep(250 * (attempt + 1));
-      continue;
-    }
-
-    // ✅ normal "verification failed" response
-    if (resp.status === 422) return resp.data || {};
-
-    // ✅ success
-    if (resp.status >= 200 && resp.status < 300) return resp.data || {};
-
-    // ❌ other upstream errors
-    const msg = resp?.data?.message || resp?.data?.error || `Flask analyzer HTTP ${resp.status}`;
-    const err = new Error(msg);
-    err.status = resp.status;
-    err.payload = resp.data;
-    throw err;
+  if (resp.status !== 200) {
+    const msg =
+      resp?.data?.error?.message ||
+      `YouTube API error (comments.list): HTTP ${resp.status}`;
+    throw new Error(msg);
   }
-
-  // after retries still busy
-  return {
-    verified: false,
-    message: "Analyzer busy, retry",
-    reasons: ["ANALYZER_BUSY"],
-    rules: { min_comments: minComments, min_replies: minReplies, require_like: requireLike }
-  };
+  return resp.data || {};
 }
 
 /* ------------------------------------------------------------------ */
 /*  1) CREATE by employee (type 0)                                     */
 /* ------------------------------------------------------------------ */
 exports.createEmployeeEntry = asyncHandler(async (req, res) => {
-  const { name, amount, employeeId, notes = '', upiId: manualUpi } = req.body;
-  const { linkId } = req.body;
-  if (!name || amount == null || !employeeId || !linkId)
-    return badRequest(res, 'employeeId, linkId, name & amount required');
+  const { name, amount, employeeId, notes = "", upiId: manualUpi, linkId } =
+    req.body;
 
-  let upiId = manualUpi?.trim();
+  if (!name || amount == null || !employeeId || !linkId) {
+    return badRequest(
+      res,
+      "VALIDATION_ERROR",
+      "employeeId, linkId, name & amount required"
+    );
+  }
 
-  if (!upiId && req.file) {
+  let upiId = String(manualUpi || "").trim();
+
+  // Optional: allow QR image to supply UPI
+  if (!upiId && req.file?.buffer) {
     try {
-      const img = await Jimp.read(req.file.buffer);
-      const upiString = await new Promise((resolve, reject) => {
-        const qr = new QrCode();
-        let done = false;
-        qr.callback = (err, value) => {
-          if (done) return;
-          done = true;
-          if (err || !value) return reject(new Error('QR decode failed'));
-          resolve(value.result);
-        };
-        qr.decode(img.bitmap);
-        setTimeout(() => !done && reject(new Error('QR decode timeout')), 5000);
-      });
-
-      upiId = upiString.startsWith('upi://')
-        ? parse(upiString.split('?')[1]).pa
-        : upiString.trim();
+      upiId = await decodeUpiFromQrBuffer(req.file.buffer);
     } catch (e) {
-      return badRequest(res, 'Invalid or unreadable QR code');
+      return badRequest(res, "QR_INVALID", "Invalid or unreadable QR code");
     }
   }
 
-  if (!upiId) return badRequest(res, 'UPI ID is required');
-  if (!isValidUpi(upiId)) return badRequest(res, 'Invalid UPI format');
+  if (!upiId) return badRequest(res, "UPI_REQUIRED", "UPI ID is required");
+  if (!isValidUpi(upiId))
+    return badRequest(res, "INVALID_UPI", "Invalid UPI format");
 
   const emp = await Employee.findOne({ employeeId });
-  if (!emp) return notFound(res, 'Employee not found');
-  if (emp.balance < amount) return badRequest(res, 'Insufficient balance');
+  if (!emp) return notFound(res, "EMPLOYEE_NOT_FOUND", "Employee not found");
+  if (emp.balance < Number(amount))
+    return badRequest(res, "INSUFFICIENT_BALANCE", "Insufficient balance");
 
-  if (await Entry.exists({ linkId, upiId }))
-    return badRequest(res, 'This UPI ID has already been used for this link');
+  // uniqueness scoped to employee entries
+  if (await Entry.exists({ linkId, upiId, type: 0 })) {
+    return badRequest(
+      res,
+      "DUPLICATE_UPI",
+      "This UPI ID has already been used for this link"
+    );
+  }
 
   const entry = await Entry.create({
     entryId: uuidv4(),
     type: 0,
     employeeId,
     linkId,
-    name: name.trim(),
-    upiId,
-    amount,
-    notes: notes.trim()
+    name: String(name).trim(),
+    upiId: String(upiId).trim(),
+    amount: Number(amount),
+    notes: String(notes).trim(),
   });
 
-  emp.balance -= amount;
-  await emp.save();
-
-  res.status(201).json({ message: 'Employee entry submitted', entry });
+  res.status(201).json({ message: "Employee entry submitted", entry });
 });
 
 /* ------------------------------------------------------------------ */
 /*  2) CREATE by user (type 1)                                         */
-/*     - verify user exists + matches UPI                              */
-/*     - dedupe + flask OCR/like verify                                */
+/*  ✅ SAME user resubmits => UPDATE screenshot+entry                   */
+/*  ✅ Reuse checks ONLY across DIFFERENT users                         */
 /* ------------------------------------------------------------------ */
 exports.createUserEntry = asyncHandler(async (req, res) => {
-  const { userId, linkId, name, worksUnder, upiId } = req.body;
-
-  if (!userId || !linkId || !name || !worksUnder || !upiId) {
-    return res.status(400).json({
-      code: 'VALIDATION_ERROR',
-      message: 'userId, linkId, name, worksUnder, upiId required'
+  if (!YOUTUBE_API_KEY) {
+    return res.status(500).json({
+      code: "YOUTUBE_API_KEY_MISSING",
+      message: "Server missing YOUTUBE_API_KEY env. Add YouTube Data API key.",
     });
   }
 
-  if (!Types.ObjectId.isValid(linkId)) {
-    return res.status(400).json({
-      code: 'INVALID_OBJECT_ID',
-      message: 'Invalid linkId format (must be a 24-char hex ObjectId)'
-    });
+  const {
+    userId,
+    linkId,
+    name,
+    worksUnder,
+    upiId,
+
+    commentLinks,
+    replyLinks,
+
+    commentTexts,
+    replyTexts,
+  } = req.body;
+
+  if (!linkId || !Types.ObjectId.isValid(linkId)) {
+    return badRequest(
+      res,
+      "INVALID_OBJECT_ID",
+      "Invalid linkId format (must be a 24-char hex ObjectId)"
+    );
   }
 
   const link = await Link.findById(linkId).lean();
-  if (!link) {
-    return res.status(404).json({
-      code: 'LINK_NOT_FOUND',
-      message: 'Invalid linkId'
-    });
+  if (!link) return notFound(res, "LINK_NOT_FOUND", "Invalid linkId");
+
+  const minComments = clamp02(link.minComments, 2);
+  const minReplies = clamp02(link.minReplies, 2);
+
+  // like rule doesn't block (assumed true if required)
+  const likeRequired = toBool(link.requireLike, false);
+  const likedAssumed = likeRequired ? true : false;
+
+  if (minComments === 0 && minReplies === 0) {
+    return badRequest(
+      res,
+      "INVALID_RULES",
+      "Link rules invalid: minComments and minReplies cannot both be 0"
+    );
+  }
+
+  // validate required user fields
+  if (!userId || !name || !worksUnder || !upiId) {
+    return badRequest(
+      res,
+      "VALIDATION_ERROR",
+      "userId, name, worksUnder, upiId required"
+    );
   }
 
   const normalizedReqUpi = String(upiId).trim().toLowerCase();
   if (!isValidUpi(normalizedReqUpi)) {
-    return res.status(400).json({ code: 'INVALID_UPI', message: 'Invalid UPI format' });
+    return badRequest(res, "INVALID_UPI", "Invalid UPI format");
   }
 
   const user = await User.findOne({ userId }).lean();
-  if (!user) {
-    return res.status(404).json({ code: 'USER_NOT_FOUND', message: 'User not found' });
-  }
+  if (!user) return notFound(res, "USER_NOT_FOUND", "User not found");
 
-  const normalizedUserUpi = String(user.upiId || '').trim().toLowerCase();
+  const normalizedUserUpi = String(user.upiId || "").trim().toLowerCase();
   if (normalizedUserUpi !== normalizedReqUpi) {
-    return res.status(400).json({ code: 'UPI_MISMATCH', message: 'Provided UPI does not match your account' });
+    return badRequest(
+      res,
+      "UPI_MISMATCH",
+      "Provided UPI does not match your account"
+    );
   }
 
-  // Rules come from Link (defaults if missing)
-  const minComments = clamp02(link.minComments, 2);
-  const minReplies = clamp02(link.minReplies, 2);
-  const requireLike = toBool(link.requireLike, false);
+  // proof arrays
+  const cLinks = uniq(Array.isArray(commentLinks) ? commentLinks : []);
+  const rLinks = uniq(Array.isArray(replyLinks) ? replyLinks : []);
 
-  if (minComments === 0 && minReplies === 0) {
-    return res.status(400).json({
-      code: 'INVALID_RULES',
-      message: 'Link rules invalid: minComments and minReplies cannot both be 0'
-    });
+  if (cLinks.length < minComments) {
+    return badRequest(
+      res,
+      "NOT_ENOUGH_COMMENTS",
+      `Need at least ${minComments} comment links`,
+      { required: minComments, provided: cLinks.length }
+    );
+  }
+  if (rLinks.length < minReplies) {
+    return badRequest(
+      res,
+      "NOT_ENOUGH_REPLIES",
+      `Need at least ${minReplies} reply links`,
+      { required: minReplies, provided: rLinks.length }
+    );
   }
 
-  const requiredRoles = [];
-  if (requireLike) requiredRoles.push('like');
-  if (minComments >= 1) requiredRoles.push('comment1');
-  if (minComments >= 2) requiredRoles.push('comment2');
-  if (minReplies >= 1) requiredRoles.push('reply1');
-  if (minReplies >= 2) requiredRoles.push('reply2');
-
-  const ALL_ROLES = ['like', 'comment1', 'comment2', 'reply1', 'reply2'];
-  const files = req.files || {};
-  const filesByRole = Object.fromEntries(ALL_ROLES.map(r => [r, files[r]?.[0]]));
-
-  const missing = requiredRoles.filter(r => !filesByRole[r]);
-  if (missing.length) {
-    return res.status(400).json({
-      code: 'MISSING_IMAGES',
-      message: 'Missing required images for this link rules',
-      required: requiredRoles,
-      missing,
-      rules: { minComments, minReplies, requireLike }
-    });
-  }
-
-  const ALLOWED_MIME = ['image/jpeg', 'image/png', 'image/webp'];
-  const MAX_SIZE = 10 * 1024 * 1024;
-  const typeErrors = [];
-  const sizeErrors = [];
-
-  // validate only uploaded images
-  const presentRoles = ALL_ROLES.filter(r => filesByRole[r]);
-  for (const r of presentRoles) {
-    const f = filesByRole[r];
-    if (!ALLOWED_MIME.includes(f.mimetype)) typeErrors.push({ role: r, mimetype: f.mimetype });
-    if (typeof f.size === 'number' && f.size > MAX_SIZE) sizeErrors.push({ role: r, size: f.size, max: MAX_SIZE });
-  }
-
-  if (typeErrors.length || sizeErrors.length) {
-    return res.status(400).json({
-      code: 'INVALID_IMAGE_FILES',
-      message: 'One or more images are of unsupported type or exceed size limit',
-      typeErrors,
-      sizeErrors,
-      allowed: ALLOWED_MIME,
-      maxBytes: MAX_SIZE
-    });
-  }
-
-  // pHash + sha for uploaded images
-  let hashed;
+  // Parse permalinks
+  let parsedComments = [];
+  let parsedReplies = [];
   try {
-    hashed = await phashBundle(filesByRole, presentRoles);
+    parsedComments = cLinks.slice(0, minComments).map(parseCommentPermalink);
+    parsedReplies = rLinks.slice(0, minReplies).map(parseCommentPermalink);
   } catch (e) {
-    console.error('phashBundle error:', e);
-    return res.status(500).json({ code: 'PHASH_ERROR', message: 'Image processing failed. Please try again.' });
+    return badRequest(
+      res,
+      "INVALID_PERMALINK",
+      e?.message || "Invalid comment/reply permalink"
+    );
   }
 
-  const phashes = hashed.map(h => h.phash);
-  const sha256s = hashed.map(h => h.sha256);
-  const bundleSig = [...phashes].sort().join('|');
-  const bundleSha = [...sha256s].sort().join('|');
-
-  // near-duplicate check
-  try {
-    const isDup = await isDuplicateForUser(userId, phashes, 6);
-    if (isDup) {
-      return res.status(409).json({
-        code: 'NEAR_DUPLICATE',
-        message: 'These screenshots are too similar to a previous upload. Please capture fresh screenshots.'
-      });
-    }
-  } catch (e) {
-    console.error('Duplicate check error:', e);
-    return res.status(500).json({ code: 'DUP_CHECK_ERROR', message: 'Duplicate check failed. Please try again.' });
+  if (parsedComments.some((x) => x.isReply)) {
+    return badRequest(
+      res,
+      "COMMENT_LINK_MUST_BE_TOPLEVEL",
+      "commentLinks must be top-level comment permalinks (lc without dot)."
+    );
+  }
+  if (parsedReplies.some((x) => !x.isReply)) {
+    return badRequest(
+      res,
+      "REPLY_LINK_MUST_BE_REPLY",
+      "replyLinks must be reply permalinks (lc=parent.replyKey)."
+    );
   }
 
-  // reuse guard
+  // Determine campaign videoId from Link.title URL
+  const linkTitleUrl = String(link.title || "").trim();
+  let campaignVideoId = null;
   try {
-    const linkObj = new mongoose.Types.ObjectId(linkId);
-    const reuse = await Screenshot.aggregate([
-      { $match: { userId, $or: [{ linkId }, { linkId: linkObj }] } },
-      { $unwind: '$files' },
-      { $match: { 'files.sha256': { $in: sha256s } } },
-      { $count: 'n' }
-    ]);
+    campaignVideoId = linkTitleUrl ? extractVideoId(linkTitleUrl) : null;
+  } catch {
+    campaignVideoId = null;
+  }
+  campaignVideoId =
+    campaignVideoId ||
+    parsedComments[0]?.videoId ||
+    parsedReplies[0]?.videoId ||
+    null;
 
-    const reusedCount = reuse?.[0]?.n || 0;
-    const reuseThreshold = Math.max(presentRoles.length - 1, 2);
-
-    if (reusedCount >= reuseThreshold) {
-      return res.status(409).json({
-        code: 'NEAR_DUPLICATE',
-        message: 'These screenshots largely match a previous submission. Please capture fresh screenshots.',
-        details: { reusedCount, reuseThreshold }
-      });
-    }
-  } catch (e) {
-    console.error('Reuse-count check error:', e);
-    // non-fatal
+  if (!campaignVideoId) {
+    return badRequest(
+      res,
+      "INVALID_VIDEO_ID",
+      "Could not determine YouTube videoId from Link.title or permalinks."
+    );
   }
 
-  // Flask verify (send present roles; rules via query params)
-  let analysis;
-  const debug = req.query?.debug === '1' || process.env.FLASK_DEBUG === '1';
-
-  try {
-    analysis = await verifyWithFlask(filesByRole, {
-      debug,
-      minComments,
-      minReplies,
-      requireLike,
-      presentRoles
-    });
-  } catch (e) {
-    console.error('Flask analyzer error:', e?.message || e);
-    return res.status(502).json({
-      code: 'ANALYZER_ERROR',
-      message: 'Verification service error. Please try again.',
-      details: {
-        upstreamStatus: e?.status || null,
-        upstream: e?.payload || null
+  // Ensure all permalinks match campaign video
+  const allParsed = [...parsedComments, ...parsedReplies];
+  const wrongVideo = allParsed.find((x) => x.videoId !== campaignVideoId);
+  if (wrongVideo) {
+    return badRequest(
+      res,
+      "WRONG_VIDEO",
+      "One or more permalinks are not from the campaign video.",
+      {
+        details: {
+          expectedVideoId: campaignVideoId,
+          gotVideoId: wrongVideo.videoId,
+          permalink: wrongVideo.permalink,
+        },
       }
+    );
+  }
+
+  // Fetch threads for all parentIds
+  const allParentIds = uniq([
+    ...parsedComments.map((x) => x.parentId),
+    ...parsedReplies.map((x) => x.parentId),
+  ]);
+
+  const threadMap = new Map();
+  try {
+    for (const ch of chunk(allParentIds, 50)) {
+      const items = await ytGetCommentThreadsByIds(ch);
+      for (const it of items) threadMap.set(it.id, it);
+    }
+  } catch (e) {
+    return res.status(502).json({
+      code: "YT_API_ERROR",
+      message: e?.message || "YouTube API error while verifying comment threads",
     });
   }
 
-  const rules = analysis?.rules || { min_comments: minComments, min_replies: minReplies, require_like: requireLike };
+  const actions = [];
+  const reasons = [];
 
-  // IMPORTANT: do NOT force liked=true when requireLike=false; keep analyzer output for UI/debug
-  const analysisPayload = {
-    liked: typeof analysis?.liked === 'boolean' ? analysis.liked : false,
-    like_provided: !!analysis?.like_provided,
-    user_id: analysis?.user_id ?? null,
-    comment: Array.isArray(analysis?.comment) ? analysis.comment : [],
-    replies: Array.isArray(analysis?.replies) ? analysis.replies : [],
-    reasons: Array.isArray(analysis?.reasons) ? analysis.reasons : [],
-    verified: typeof analysis?.verified === 'boolean' ? analysis.verified : false,
-    rules: {
-      min_comments: Number(rules.min_comments ?? minComments),
-      min_replies: Number(rules.min_replies ?? minReplies),
-      require_like: !!(rules.require_like ?? requireLike)
+  // detect channelId from proof
+  let detectedChannelId = null;
+  function setDetectedChannel(cid, tag) {
+    if (!cid) {
+      reasons.push(`${tag}_MISSING_AUTHOR_CHANNEL`);
+      return;
     }
+    if (!detectedChannelId) detectedChannelId = cid;
+    else if (detectedChannelId !== cid)
+      reasons.push(`MIXED_AUTHORS:${detectedChannelId}:${cid}`);
+  }
+
+  // verify comments
+  for (let i = 0; i < parsedComments.length; i++) {
+    const p = parsedComments[i];
+    const t = threadMap.get(p.parentId);
+
+    if (!t) {
+      reasons.push(`COMMENT_NOT_FOUND:${p.parentId}`);
+      continue;
+    }
+    if (t?.snippet?.videoId !== campaignVideoId) {
+      reasons.push(`COMMENT_WRONG_VIDEO:${p.parentId}`);
+      continue;
+    }
+
+    const top = t?.snippet?.topLevelComment?.snippet;
+    const author = top?.authorChannelId?.value || null;
+    if (!author) {
+      reasons.push(`COMMENT_AUTHOR_MISSING:${p.parentId}`);
+      continue;
+    }
+
+    setDetectedChannel(author, "COMMENT");
+
+    actions.push({
+      kind: "comment",
+      videoId: campaignVideoId,
+      commentId: p.parentId,
+      parentId: null,
+      permalink: p.permalink,
+      text:
+        top?.textOriginal ||
+        (Array.isArray(commentTexts) ? commentTexts[i] : null) ||
+        null,
+      authorChannelId: author,
+      publishedAt: top?.publishedAt || null,
+    });
+  }
+
+  // verify replies
+  const usedReplyIds = new Set();
+  const usedReplyParentIds = new Set();
+
+  for (let i = 0; i < parsedReplies.length; i++) {
+    const p = parsedReplies[i];
+    const parentId = p.parentId;
+
+    if (usedReplyParentIds.has(parentId)) {
+      reasons.push(`REPLY_PARENT_DUPLICATE:${parentId}`);
+      continue;
+    }
+
+    const parentThread = threadMap.get(parentId);
+    if (!parentThread) {
+      reasons.push(`REPLY_PARENT_NOT_FOUND:${parentId}`);
+      continue;
+    }
+    if (parentThread?.snippet?.videoId !== campaignVideoId) {
+      reasons.push(`REPLY_PARENT_WRONG_VIDEO:${parentId}`);
+      continue;
+    }
+
+    const parentAuthor =
+      parentThread?.snippet?.topLevelComment?.snippet?.authorChannelId?.value ||
+      null;
+
+    const wantReplyIdFull = p.lc;
+    const wantReplyIdShort = p.replyKey;
+
+    let pageToken = null;
+    let found = null;
+
+    for (let page = 0; page < YT_MAX_PAGES; page++) {
+      let data;
+      try {
+        data = await ytListRepliesByParent(parentId, pageToken);
+      } catch {
+        reasons.push(`REPLY_API_ERROR:${parentId}`);
+        break;
+      }
+
+      const items = data?.items || [];
+      for (const r of items) {
+        const rid = r?.id || null;
+        if (!rid) continue;
+        if (rid === wantReplyIdFull || (wantReplyIdShort && rid === wantReplyIdShort)) {
+          found = r;
+          break;
+        }
+      }
+
+      if (found) break;
+      pageToken = data?.nextPageToken || null;
+      if (!pageToken) break;
+    }
+
+    if (!found) {
+      reasons.push(`REPLY_NOT_FOUND:${parentId}`);
+      continue;
+    }
+
+    if (usedReplyIds.has(found.id)) {
+      reasons.push(`REPLY_DUPLICATE_ID:${found.id}`);
+      continue;
+    }
+
+    const sn = found?.snippet;
+    const replyAuthor = sn?.authorChannelId?.value || null;
+    if (!replyAuthor) {
+      reasons.push(`REPLY_AUTHOR_MISSING:${parentId}`);
+      continue;
+    }
+
+    if (parentAuthor && parentAuthor === replyAuthor) {
+      reasons.push(`REPLY_TO_OWN_COMMENT_NOT_ALLOWED:${parentId}`);
+      continue;
+    }
+
+    setDetectedChannel(replyAuthor, "REPLY");
+
+    const wantText = Array.isArray(replyTexts) ? normText(replyTexts[i]) : null;
+    if (wantText) {
+      const gotText = normText(sn?.textOriginal || "");
+      if (gotText !== wantText) {
+        reasons.push(`REPLY_TEXT_MISMATCH:${found.id}`);
+        continue;
+      }
+    }
+
+    usedReplyIds.add(found.id);
+    usedReplyParentIds.add(parentId);
+
+    actions.push({
+      kind: "reply",
+      videoId: campaignVideoId,
+      commentId: found.id,
+      parentId,
+      permalink: p.permalink,
+      text:
+        sn?.textOriginal ||
+        (Array.isArray(replyTexts) ? replyTexts[i] : null) ||
+        null,
+      authorChannelId: replyAuthor,
+      publishedAt: sn?.publishedAt || null,
+    });
+  }
+
+  if (!detectedChannelId) {
+    return res.status(422).json({
+      code: "CHANNEL_NOT_DETECTED",
+      message:
+        "Could not detect author channelId from your comment/reply links. Ensure they are public.",
+      verification: { reasons },
+    });
+  }
+
+  // optionally store detected channelId
+  try {
+    const existing = String(
+      user.ytChannelId || user.youtubeChannelId || user.channelId || ""
+    ).trim();
+
+    if (!existing || existing === detectedChannelId) {
+      await User.updateOne({ userId }, { $set: { ytChannelId: detectedChannelId } });
+    } else if (existing !== detectedChannelId) {
+      return res.status(422).json({
+        code: "YT_CHANNEL_MISMATCH",
+        message:
+          "Your saved YouTube channel does not match the channel used to comment/reply.",
+        verification: { detected: detectedChannelId, saved: existing, reasons },
+      });
+    }
+  } catch {
+    // ignore
+  }
+
+  const gotComments = actions.filter((a) => a.kind === "comment").length;
+  const gotReplies = actions.filter((a) => a.kind === "reply").length;
+
+  const verified =
+    reasons.length === 0 &&
+    gotComments >= minComments &&
+    gotReplies >= minReplies &&
+    (!likeRequired || likedAssumed === true);
+
+  const analysisPayload = {
+    verified,
+    liked: likeRequired ? true : false, // assumed
+    channel_id: detectedChannelId,
+    comments: actions.filter((a) => a.kind === "comment").map((a) => a.commentId),
+    replies: actions.filter((a) => a.kind === "reply").map((a) => a.commentId),
+    reasons,
+    rules: {
+      min_comments: minComments,
+      min_replies: minReplies,
+      require_like: likeRequired,
+    },
   };
 
-  const hasHandle =
-    typeof analysisPayload.user_id === 'string' &&
-    analysisPayload.user_id.trim().length > 0;
-
-  const meetsCounts =
-    analysisPayload.comment.length >= analysisPayload.rules.min_comments &&
-    analysisPayload.replies.length >= analysisPayload.rules.min_replies;
-
-  const meetsLike = analysisPayload.rules.require_like ? !!analysisPayload.liked : true;
-
-  // ✅ analyzer must be clean too
-  const analyzerClean = Array.isArray(analysisPayload.reasons) && analysisPayload.reasons.length === 0;
-  const analyzerSaysOk = !!analysis?.verified && analyzerClean;
-
-  // ✅ final verified
-  analysisPayload.verified = !!(analyzerSaysOk && hasHandle && meetsCounts && meetsLike);
-
-  if (analysisPayload?.reasons?.includes('ANALYZER_BUSY')) {
-    return res.status(503).json({
-      code: 'ANALYZER_BUSY',
-      message: 'Verification is busy. Please retry in a few seconds.',
-      verification: analysisPayload
-    });
-  }
-
-  if (!analysisPayload.verified) {
+  if (!verified) {
     return res.status(422).json({
-      code: 'VERIFICATION_FAILED',
-      message: 'Screenshot verification failed. Please upload clearer screenshots.',
-      details: {
-        user_id: analysisPayload.user_id,
-        reasons: analysisPayload.reasons,
-        analyzerMessage: analysis?.message || null,
-        liked: analysisPayload.liked,
-        like_provided: analysisPayload.like_provided
-      },
-      verification: analysisPayload
+      code: "VERIFICATION_FAILED",
+      message:
+        "YouTube verification failed. Ensure comments/replies are public, correct, and from the same channel.",
+      verification: analysisPayload,
     });
   }
 
-  // persist Screenshot
+  // ✅ Reuse check ONLY across OTHER users
+  const usedCommentIds = analysisPayload.comments;
+  const usedReplyIdsArr = analysisPayload.replies;
+  const allUsed = uniq([...usedCommentIds, ...usedReplyIdsArr]);
+
+  const reuseByOtherUser = await Screenshot.findOne({
+    linkId,                 // IMPORTANT: Screenshot.linkId is STRING in your model
+    verified: true,
+    userId: { $ne: String(userId) }, // ✅ exclude current user
+    $or: [
+      { commentIds: { $in: usedCommentIds } },
+      { replyIds: { $in: usedReplyIdsArr } },
+      { "actions.commentId": { $in: allUsed } },
+      { "analysis.comments": { $in: usedCommentIds } },
+      { "analysis.replies": { $in: usedReplyIdsArr } },
+    ],
+  }).select("userId screenshotId").lean();
+
+  if (reuseByOtherUser) {
+    return res.status(409).json({
+      code: "ALREADY_USED_BY_OTHER_USER",
+      message: "One or more of these comments/replies were already used by another user for this campaign.",
+      conflict: {
+        byUserId: reuseByOtherUser.userId,
+        screenshotId: reuseByOtherUser.screenshotId,
+      },
+      verification: analysisPayload,
+    });
+  }
+
+  // Build flattened arrays explicitly (works for both create + update)
+  const commentIds = uniq(actions.filter(a => a.kind === "comment").map(a => a.commentId));
+  const replyIds = uniq(actions.filter(a => a.kind === "reply").map(a => a.commentId));
+
+  // ✅ Upsert-like behavior: if user's screenshot exists -> UPDATE; else CREATE
   let screenshotDoc;
   try {
-    screenshotDoc = await Screenshot.create({
-      userId,
-      linkId,
-      verified: true,
-      analysis: analysisPayload,
-      handle: analysisPayload.user_id || null,
-      comments: analysisPayload.comment,
-      replies: analysisPayload.replies,
-      needed: { minComments, minReplies, requireLike },
-      phashes,
-      bundleSig,
-      bundleSha,
-      files: hashed
-    });
-  } catch (e) {
-    console.error('Screenshot.create error:', e);
-    if (e && e.code === 11000) {
-      const msg = String(e.message || '');
-      if (msg.includes('bundleSig')) {
-        return res.status(409).json({ code: 'DUPLICATE_BUNDLE_SIG', message: 'A matching screenshot bundle already exists for this link.' });
-      }
-      if (msg.includes('bundleSha')) {
-        return res.status(409).json({ code: 'DUPLICATE_BUNDLE_SHA', message: 'This exact set of image files was already submitted for this link.' });
-      }
-      if (msg.includes('handle') && msg.includes('linkId')) {
-        return res.status(409).json({ code: 'HANDLE_ALREADY_VERIFIED', message: 'This handle has already been verified for this video.' });
-      }
-      return res.status(409).json({ code: 'DUPLICATE_KEY', message: 'A similar submission already exists.' });
+    screenshotDoc = await Screenshot.findOne({ userId, linkId });
+
+    if (screenshotDoc) {
+      screenshotDoc.videoId = campaignVideoId;
+      screenshotDoc.channelId = detectedChannelId;
+      screenshotDoc.verified = true;
+      screenshotDoc.analysis = analysisPayload;
+      screenshotDoc.actions = actions;
+
+      // ensure arrays exist for your unique indexes
+      screenshotDoc.commentIds = commentIds;
+      screenshotDoc.replyIds = replyIds;
+
+      await screenshotDoc.save(); // triggers schema validation hooks
+    } else {
+      screenshotDoc = await Screenshot.create({
+        userId,
+        linkId,
+        videoId: campaignVideoId,
+        channelId: detectedChannelId,
+        verified: true,
+        analysis: analysisPayload,
+        actions,
+        commentIds,
+        replyIds,
+      });
     }
-    return res.status(500).json({ code: 'SCREENSHOT_PERSIST_ERROR', message: 'Could not persist screenshots. Please try again.' });
+  } catch (e) {
+    if (e?.code === 11000) {
+      // index hit (rare after our reuse check, but race conditions happen)
+      const key = e?.keyPattern || {};
+      if (key.userId && key.linkId) {
+        return res.status(409).json({
+          code: "USER_ALREADY_VERIFIED",
+          message: "This user already submitted verification for this campaign.",
+        });
+      }
+      if (key.linkId && key.commentIds) {
+        return res.status(409).json({
+          code: "COMMENT_ALREADY_USED",
+          message: "This comment was already used for this campaign by someone else.",
+        });
+      }
+      if (key.linkId && key.replyIds) {
+        return res.status(409).json({
+          code: "REPLY_ALREADY_USED",
+          message: "This reply was already used for this campaign by someone else.",
+        });
+      }
+      return res.status(409).json({
+        code: "DUPLICATE_VERIFICATION",
+        message: "Duplicate verification (unique index hit).",
+      });
+    }
+
+    return res.status(500).json({
+      code: "VERIFICATION_PERSIST_ERROR",
+      message: "Could not persist verification. Please try again.",
+    });
   }
 
-  // amounts
+  // Amounts
   const linkAmount = Number(link.amount) || 0;
   const totalAmount = linkAmount;
 
-  // create Entry
+  // ✅ Entry upsert-like behavior: same user+link => UPDATE instead of CREATE
   let entry;
   try {
-    entry = await Entry.create({
-      entryId: uuidv4(),
-      type: 1,
-      userId,
-      linkId,
-      name: String(name).trim(),
-      worksUnder: String(worksUnder).trim(),
-      upiId: normalizedReqUpi,
-      linkAmount,
-      totalAmount,
-      screenshotId: screenshotDoc.screenshotId
+    entry = await Entry.findOne({ type: 1, userId, linkId });
+    if (entry) {
+      entry.name = String(name).trim();
+      entry.worksUnder = String(worksUnder).trim();
+      entry.upiId = normalizedReqUpi;
+      entry.linkAmount = linkAmount;
+      entry.totalAmount = totalAmount;
+      entry.screenshotId = screenshotDoc.screenshotId || screenshotDoc._id;
+      await entry.save();
+    } else {
+      entry = await Entry.create({
+        entryId: uuidv4(),
+        type: 1,
+        userId,
+        linkId,
+        name: String(name).trim(),
+        worksUnder: String(worksUnder).trim(),
+        upiId: normalizedReqUpi,
+        linkAmount,
+        totalAmount,
+        screenshotId: screenshotDoc.screenshotId || screenshotDoc._id,
+      });
+    }
+  } catch {
+    return res.status(500).json({
+      code: "ENTRY_PERSIST_ERROR",
+      message: "Could not save your entry. Please try again.",
     });
-  } catch (e) {
-    console.error('Entry.create error:', e);
-    return res.status(500).json({ code: 'ENTRY_PERSIST_ERROR', message: 'Could not save your entry. Please try again.' });
   }
 
   return res.status(201).json({
-    message: 'User entry submitted',
-    rules: { minComments, minReplies, requireLike },
+    message: screenshotDoc?.isNew ? "User entry submitted" : "User entry updated",
+    rules: { minComments, minReplies, requireLike: likeRequired },
     verification: analysisPayload,
-    entry
+    screenshot: {
+      screenshotId: screenshotDoc.screenshotId,
+      linkId: screenshotDoc.linkId,
+      userId: screenshotDoc.userId,
+      videoId: screenshotDoc.videoId,
+      channelId: screenshotDoc.channelId,
+      verified: screenshotDoc.verified,
+      actions: screenshotDoc.actions || [],
+      createdAt: screenshotDoc.createdAt,
+    },
+    entry,
   });
 });
 
 /* ------------------------------------------------------------------ */
-/*  3) READ / LIST                                                     */
+/*  3) READ / LIST                                                    */
 /* ------------------------------------------------------------------ */
 exports.listEntries = asyncHandler(async (req, res) => {
   const { employeeId, page = 1, limit = 20 } = req.body;
-  if (!employeeId) return badRequest(res, 'employeeId required');
+  if (!employeeId)
+    return badRequest(res, "VALIDATION_ERROR", "employeeId required");
 
   const filter = { employeeId };
 
   const [entries, total] = await Promise.all([
     Entry.find(filter)
       .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
+      .skip((Number(page) - 1) * Number(limit))
       .limit(Number(limit))
       .lean(),
-    Entry.countDocuments(filter)
+    Entry.countDocuments(filter),
   ]);
 
   return res.json({
     entries,
     total,
     page: Number(page),
-    pages: Math.ceil(total / limit)
+    pages: Math.ceil(total / Number(limit)),
   });
 });
 
@@ -590,7 +873,7 @@ exports.listEntries = asyncHandler(async (req, res) => {
 exports.getEntryById = asyncHandler(async (req, res) => {
   const { entryId } = req.params;
   const entry = await Entry.findOne({ entryId }).lean();
-  if (!entry) return notFound(res, 'Entry not found');
+  if (!entry) return notFound(res, "ENTRY_NOT_FOUND", "Entry not found");
   res.json({ entry });
 });
 
@@ -599,63 +882,86 @@ exports.getEntryById = asyncHandler(async (req, res) => {
 /* ------------------------------------------------------------------ */
 exports.updateEntry = asyncHandler(async (req, res) => {
   const { entryId, name, upiId, notes, amount, noOfPersons } = req.body;
-  if (!entryId) return badRequest(res, 'entryId required');
+  if (!entryId)
+    return badRequest(res, "VALIDATION_ERROR", "entryId required");
 
   const entry = await Entry.findOne({ entryId });
-  if (!entry) return notFound(res, 'Entry not found');
+  if (!entry) return notFound(res, "ENTRY_NOT_FOUND", "Entry not found");
 
   const changes = [];
 
   if (entry.type === 0) {
-    if (!name || !upiId || amount == null)
-      return badRequest(res, 'name, upiId & amount required for employee entries');
-    if (!isValidUpi(upiId.trim()))
-      return badRequest(res, 'Invalid UPI format');
+    if (!name || !upiId || amount == null) {
+      return badRequest(
+        res,
+        "VALIDATION_ERROR",
+        "name, upiId & amount required for employee entries"
+      );
+    }
+    if (!isValidUpi(String(upiId).trim())) {
+      return badRequest(res, "INVALID_UPI", "Invalid UPI format");
+    }
 
     const emp = await Employee.findOne({ employeeId: entry.employeeId });
-    if (!emp) return notFound(res, 'Employee not found');
+    if (!emp) return notFound(res, "EMPLOYEE_NOT_FOUND", "Employee not found");
 
-    const trimmedName = name.trim();
+    const trimmedName = String(name).trim();
     if (entry.name !== trimmedName) {
-      changes.push({ field: 'name', from: entry.name, to: trimmedName });
+      changes.push({ field: "name", from: entry.name, to: trimmedName });
       entry.name = trimmedName;
     }
 
-    const trimmedUpi = upiId.trim();
+    const trimmedUpi = String(upiId).trim();
     if (entry.upiId !== trimmedUpi) {
-      changes.push({ field: 'upiId', from: entry.upiId, to: trimmedUpi });
+      changes.push({ field: "upiId", from: entry.upiId, to: trimmedUpi });
       entry.upiId = trimmedUpi;
     }
 
-    const newNotes = (notes || '').trim();
+    const newNotes = String(notes || "").trim();
     if (entry.notes !== newNotes) {
-      changes.push({ field: 'notes', from: entry.notes, to: newNotes });
+      changes.push({ field: "notes", from: entry.notes, to: newNotes });
       entry.notes = newNotes;
     }
 
-    if (entry.amount !== amount) {
-      const diff = amount - entry.amount;
-      if (diff > 0 && emp.balance < diff)
-        return badRequest(res, 'Insufficient balance');
-      changes.push({ field: 'amount', from: entry.amount, to: amount });
-      entry.amount = amount;
+    if (Number(entry.amount) !== Number(amount)) {
+      const diff = Number(amount) - Number(entry.amount);
+      if (diff > 0 && emp.balance < diff) {
+        return badRequest(res, "INSUFFICIENT_BALANCE", "Insufficient balance");
+      }
+
+      changes.push({ field: "amount", from: entry.amount, to: Number(amount) });
+      entry.amount = Number(amount);
+
       emp.balance -= diff;
       await emp.save();
     }
   } else {
-    if (noOfPersons == null)
-      return badRequest(res, 'noOfPersons required for user entries');
+    if (noOfPersons == null) {
+      return badRequest(
+        res,
+        "VALIDATION_ERROR",
+        "noOfPersons required for user entries"
+      );
+    }
 
     const newCount = Number(noOfPersons);
 
     if (entry.noOfPersons !== newCount) {
-      changes.push({ field: 'noOfPersons', from: entry.noOfPersons, to: newCount });
+      changes.push({
+        field: "noOfPersons",
+        from: entry.noOfPersons,
+        to: newCount,
+      });
       entry.noOfPersons = newCount;
     }
 
-    const newTotal = newCount * entry.linkAmount;
-    if (entry.totalAmount !== newTotal) {
-      changes.push({ field: 'totalAmount', from: entry.totalAmount, to: newTotal });
+    const newTotal = newCount * Number(entry.linkAmount || 0);
+    if (Number(entry.totalAmount) !== Number(newTotal)) {
+      changes.push({
+        field: "totalAmount",
+        from: entry.totalAmount,
+        to: newTotal,
+      });
       entry.totalAmount = newTotal;
     }
   }
@@ -663,53 +969,65 @@ exports.updateEntry = asyncHandler(async (req, res) => {
   if (changes.length) {
     entry.isUpdated = 1;
     const timestamp = new Date();
-    changes.forEach(c => entry.history.push({ ...c, updatedAt: timestamp }));
+    changes.forEach((c) => entry.history.push({ ...c, updatedAt: timestamp }));
   }
 
   await entry.save();
-  res.json({ message: changes.length ? 'Entry updated' : 'No changes detected', entry });
+  res.json({
+    message: changes.length ? "Entry updated" : "No changes detected",
+    entry,
+  });
 });
 
 /* ------------------------------------------------------------------ */
-/*  6) APPROVE / REJECT                                               */
+/*  6) APPROVE / REJECT                                                */
 /* ------------------------------------------------------------------ */
 exports.setEntryStatus = asyncHandler(async (req, res) => {
   const { entryId, approve } = req.body;
-  if (!entryId) return badRequest(res, 'entryId required');
+  if (!entryId)
+    return badRequest(res, "VALIDATION_ERROR", "entryId required");
 
   const newStatus = Number(approve);
-  if (![0, 1].includes(newStatus))
-    return badRequest(res, 'approve must be 0 or 1');
+  if (![0, 1].includes(newStatus)) {
+    return badRequest(res, "VALIDATION_ERROR", "approve must be 0 or 1");
+  }
 
   const entry = await Entry.findOne({ entryId });
-  if (!entry) return notFound(res, 'Entry not found');
+  if (!entry) return notFound(res, "ENTRY_NOT_FOUND", "Entry not found");
 
   if (entry.status === newStatus) {
     return res.json({
-      message: newStatus ? 'Already approved' : 'Already rejected',
-      entry: { entryId, status: entry.status }
+      message: newStatus ? "Already approved" : "Already rejected",
+      entry: { entryId, status: entry.status },
     });
   }
 
   if (newStatus === 1) {
-    let deduction, targetEmpId;
+    let deduction = 0;
+    let targetEmpId = null;
 
     if (entry.type === 0 && entry.employeeId) {
-      deduction = entry.amount;
+      deduction = Number(entry.amount || 0);
       targetEmpId = entry.employeeId;
     } else if (entry.type === 1 && entry.worksUnder) {
-      deduction = entry.totalAmount;
+      deduction = Number(entry.totalAmount || 0);
       targetEmpId = entry.worksUnder;
     }
 
-    if (typeof deduction !== 'number' || !targetEmpId) {
-      return badRequest(res, 'Cannot determine deduction or employee');
+    if (!targetEmpId || !Number.isFinite(deduction)) {
+      return badRequest(res, "INVALID_DEDUCTION", "Cannot determine deduction or employee");
     }
 
     const employee = await Employee.findOne({ employeeId: targetEmpId });
-    if (!employee) return notFound(res, 'Employee to debit not found');
+    if (!employee)
+      return notFound(res, "EMPLOYEE_NOT_FOUND", "Employee to debit not found");
+
     if (employee.balance < deduction) {
-      return badRequest(res, 'Insufficient balance. Please add funds before approval.');
+      return badRequest(
+        res,
+        "INSUFFICIENT_BALANCE",
+        "Insufficient balance. Please add funds before approval."
+      );
     }
 
     await Employee.updateOne(
@@ -726,60 +1044,68 @@ exports.setEntryStatus = asyncHandler(async (req, res) => {
 
   if (!updatedEntry) {
     return res.json({
-      message: newStatus ? 'Already approved' : 'Already rejected',
-      entry: { entryId, status: newStatus }
+      message: newStatus ? "Already approved" : "Already rejected",
+      entry: { entryId, status: newStatus },
     });
   }
 
   const payload = {
-    message: newStatus ? 'Approved' : 'Rejected',
-    entry: { entryId, status: newStatus }
+    message: newStatus ? "Approved" : "Rejected",
+    entry: { entryId, status: newStatus },
   };
 
   if (newStatus === 1) {
     const emp = await Employee.findOne({
-      employeeId: entry.type === 0 ? entry.employeeId : entry.worksUnder
-    }).select('balance');
-    payload.newBalance = emp.balance;
+      employeeId: entry.type === 0 ? entry.employeeId : entry.worksUnder,
+    }).select("balance");
+    payload.newBalance = emp?.balance;
   }
 
   res.json(payload);
 });
 
 /* ------------------------------------------------------------------ */
-/*  LIST – employee + specific link, POST /entries/listByLink         */
+/*  LIST – employee + specific link, POST /entries/listByLink          */
 /* ------------------------------------------------------------------ */
 exports.listEntriesByLink = asyncHandler(async (req, res) => {
   const { employeeId, linkId, page = 1, limit = 20 } = req.body;
-  if (!employeeId) return badRequest(res, 'employeeId required');
-  if (!linkId) return badRequest(res, 'linkId required');
+  if (!employeeId)
+    return badRequest(res, "VALIDATION_ERROR", "employeeId required");
+  if (!linkId) return badRequest(res, "VALIDATION_ERROR", "linkId required");
 
   const filter = {
     linkId,
-    $or: [{ employeeId }, { worksUnder: employeeId }]
+    $or: [{ employeeId }, { worksUnder: employeeId }],
   };
 
   const [entries, total] = await Promise.all([
     Entry.find(filter)
       .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
+      .skip((Number(page) - 1) * Number(limit))
       .limit(Number(limit))
       .lean(),
-    Entry.countDocuments(filter)
+    Entry.countDocuments(filter),
   ]);
 
-  const screenshotIds = entries.map(e => e.screenshotId).filter(Boolean);
+  const screenshotIds = entries.map((e) => e.screenshotId).filter(Boolean);
+
   let screenshotsById = {};
   if (screenshotIds.length) {
-    const screenshots = await Screenshot.find({ screenshotId: { $in: screenshotIds } })
-      .select('screenshotId userId linkId verified analysis createdAt')
+    const screenshots = await Screenshot.find({
+      screenshotId: { $in: screenshotIds },
+    })
+      .select("screenshotId userId linkId verified analysis createdAt videoId channelId actions")
       .lean();
-    screenshotsById = Object.fromEntries(screenshots.map(s => [s.screenshotId, s]));
+
+    screenshotsById = Object.fromEntries(
+      screenshots.map((s) => [String(s.screenshotId), s])
+    );
   }
 
-  const entriesWithScreenshots = entries.map(e => {
-    if (e.screenshotId && screenshotsById[e.screenshotId]) {
-      return { ...e, screenshot: screenshotsById[e.screenshotId] };
+  const entriesWithScreenshots = entries.map((e) => {
+    const sid = e.screenshotId ? String(e.screenshotId) : "";
+    if (sid && screenshotsById[sid]) {
+      return { ...e, screenshot: screenshotsById[sid] };
     }
     return e;
   });
@@ -789,9 +1115,9 @@ exports.listEntriesByLink = asyncHandler(async (req, res) => {
     {
       $group: {
         _id: null,
-        grandTotal: { $sum: { $ifNull: ['$totalAmount', '$amount'] } }
-      }
-    }
+        grandTotal: { $sum: { $ifNull: ["$totalAmount", "$amount"] } },
+      },
+    },
   ]);
 
   const grandTotal = agg[0]?.grandTotal ?? 0;
@@ -800,7 +1126,7 @@ exports.listEntriesByLink = asyncHandler(async (req, res) => {
     entries: entriesWithScreenshots,
     total,
     page: Number(page),
-    pages: Math.ceil(total / limit),
-    grandTotal
+    pages: Math.ceil(total / Number(limit)),
+    grandTotal,
   });
 });

@@ -22,17 +22,18 @@ const entrySchema = new mongoose.Schema({
   amount:    { type: Number },
   notes:     { type: String },
 
-  /* user only (updated) */
-  userId:     { type: String, ref: 'User' },
-  worksUnder: { type: String, ref: 'Employee' },   // who created this entry
-  linkAmount: { type: Number },
-  totalAmount:{ type: Number },
+  /* user only */
+  userId:      { type: String, ref: 'User' },
+  worksUnder:  { type: String, ref: 'Employee' },
+  linkAmount:  { type: Number },
+  totalAmount: { type: Number },
+
+  // still named screenshotId for compatibility (now it points to API verification doc)
   screenshotId: { type: String, ref: 'Screenshot' },
 
-  isUpdated:  { type: Number, default: 0 }, // true if updated by user (for employee flow)
+  isUpdated:  { type: Number, default: 0 },
   createdAt:  { type: Date, default: Date.now },
 
-  // —— audit trail for updates ——
   history: [{
     field:     { type: String, required: true },
     from:      { type: mongoose.Schema.Types.Mixed },
@@ -41,13 +42,8 @@ const entrySchema = new mongoose.Schema({
   }]
 });
 
-/**
- * Unique rule change:
- * - keep uniqueness for employee entries (type: 0)
- * - allow duplicates for user entries (type: 1)
- */
 entrySchema.index(
-  { linkId: 1},
+  { linkId: 1 },
   { unique: true, partialFilterExpression: { type: 0 } }
 );
 

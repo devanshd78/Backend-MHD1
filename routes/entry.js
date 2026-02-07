@@ -1,25 +1,18 @@
 // routes/entryRoutes.js
-const router = require('express').Router();
+const express = require('express');
+const router = express.Router();
+
 const multer = require('multer');
-const upload = multer(); // in-memory buffers
+const upload = multer();
 
 const entry = require('../controllers/entryController');
 
-// Employee (type 0) — optional QR image upload as 'qr'
+router.use(express.json({ limit: '1mb' }));
+router.use(express.urlencoded({ extended: true }));
+
 router.post('/employee', upload.single('qr'), entry.createEmployeeEntry);
 
-// User (type 1) — exactly 5 screenshots with these field names
-router.post(
-  '/user',
-  upload.fields([
-    { name: 'like', maxCount: 1 },
-    { name: 'comment1', maxCount: 1 },
-    { name: 'comment2', maxCount: 1 },
-    { name: 'reply1',  maxCount: 1 },
-    { name: 'reply2',  maxCount: 1 },
-  ]),
-  entry.createUserEntry
-);
+router.post('/user', entry.createUserEntry);
 
 // Listing / updates / status / fetch
 router.post('/getlist', entry.listEntries);

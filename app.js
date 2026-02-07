@@ -12,7 +12,7 @@ const emailRoutes    = require('./routes/emailRoutes');
 const missingRoutes  = require('./routes/missingRoutes');
 
 const app  = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 7000;
 
 // ─── CORS CONFIG ─────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.FRONTEND_ORIGIN || '')
