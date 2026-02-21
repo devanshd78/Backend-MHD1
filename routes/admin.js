@@ -71,4 +71,5 @@ router.post('/emailtasks', ctrl.createEmailTask);
 router.post('/emailtasks/list', ctrl.getEmailTaskList);
 router.post('/emailtasks/bytaskId', ctrl.getEmailTaskDetails)
 
+router.get('/countries', ctrl.getCountryList);
 module.exports = router;

@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node app.js",
     "start-flask": "cross-env PORT1=6000 DEBUG=1 OCR_TIMEOUT=12 OCR_THREADS=3 MAX_SIDE=1400 SKIP_OCR_WHEN_UNLIKED=0 FLASK_ANALYZER_LOG=1 TESSERACT_CMD=/opt/homebrew/bin/tesseract flask-api/.venv/bin/python flask-api/image_comment_like_extract.py",
-    "dev": "concurrently -n FLASK,NODE -c green,blue \"npm run start-flask\" \"npm run start\""
+    "dev": "nodemon app.js"
   },
   "author": "",
   "license": "ISC",

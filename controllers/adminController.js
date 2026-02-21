@@ -15,6 +15,7 @@ const Screenshot = require("../models/Screenshot");
 const AdminOTP = require("../models/AdminOTP");
 const EmailTask = require("../models/EmailTask");
 const EmailContact = require("../models/email");
+const countries = require('../services/countryList'); 
 
 const asyncHandler = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
@@ -941,6 +942,41 @@ exports.getScreenshotsByLinkAndEmployee = asyncHandler(async (req, res) => {
 /* ------------------------------------------------------------------ */
 /*  EMAIL TASKS                                                       */
 /* ------------------------------------------------------------------ */
+const MIN_FOLLOWERS = 1000;
+const MAX_FOLLOWERS = 10_000_000;
+
+function clampFollowers(n, defVal) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return defVal;
+  return Math.max(MIN_FOLLOWERS, Math.min(MAX_FOLLOWERS, Math.floor(x)));
+}
+
+function normalizeTagList(arr, mode = 'raw') {
+  const src = Array.isArray(arr) ? arr : [];
+  const cleaned = src
+    .map(v => String(v || '').trim())
+    .filter(Boolean);
+
+  if (!cleaned.length) return ['ANY'];
+
+  const isAny = (x) => {
+    const s = String(x || '').trim().toLowerCase();
+    return s === 'any' || s === 'any country' || s === 'any category';
+  };
+
+  // ✅ IMPORTANT: if specific values exist, ignore ANY
+  const specific = cleaned.filter(x => !isAny(x));
+
+  const effective = specific.length ? specific : ['ANY'];
+
+  if (mode === 'country') {
+    return [...new Set(effective.map(x => String(x).trim().toUpperCase()))];
+  }
+  if (mode === 'category') {
+    return [...new Set(effective.map(x => String(x).trim().toLowerCase()))];
+  }
+  return [...new Set(effective)];
+}
 
 exports.createEmailTask = asyncHandler(async (req, res) => {
   const {
@@ -952,6 +988,10 @@ exports.createEmailTask = asyncHandler(async (req, res) => {
     targetPerEmployee,
     maxEmails,
     adminId,
+        minFollowers,
+    maxFollowers,
+    countries: countriesIn,
+    categories: categoriesIn,
   } = req.body || {};
 
   if (!adminId) return badRequest(res, "adminId required");
@@ -960,7 +1000,10 @@ exports.createEmailTask = asyncHandler(async (req, res) => {
 
   const rows = Array.isArray(items)
     ? items
-    : [{ platform, targetUser, amountPerPerson, expireIn, targetPerEmployee, maxEmails }];
+    : [{ platform, targetUser, amountPerPerson, expireIn, targetPerEmployee, maxEmails,minFollowers,
+        maxFollowers,
+        countries: countriesIn,
+        categories: categoriesIn, }];
 
   const toIntOrDefault = (val, def = 1) => {
     const n = Number(val);
@@ -980,6 +1023,16 @@ exports.createEmailTask = asyncHandler(async (req, res) => {
     const tpe = toIntOrDefault(r?.targetPerEmployee, 1);
     const me = toIntOrDefault(r?.maxEmails, 1);
 
+    // ✅ NEW: follower range + tags
+    const minFollowers = clampFollowers(r?.minFollowers, MIN_FOLLOWERS);
+    const maxFollowers = clampFollowers(r?.maxFollowers, MAX_FOLLOWERS);
+    if (maxFollowers < minFollowers) {
+      return badRequest(res, "maxFollowers must be >= minFollowers");
+    }
+
+    const countries = normalizeTagList(r?.countries, 'country');     // ['ANY'] or ['US','AE']
+    const categories = normalizeTagList(r?.categories, 'category');  // ['ANY'] or ['beauty','tech']
+
     docs.push({
       createdBy: String(adminId),
       platform: p,
@@ -988,6 +1041,12 @@ exports.createEmailTask = asyncHandler(async (req, res) => {
       expireIn: e,
       targetPerEmployee: tpe,
       maxEmails: me,
+
+      // ✅ NEW fields saved
+      minFollowers,
+      maxFollowers,
+      countries,
+      categories,
     });
   }
 
@@ -1237,4 +1296,47 @@ exports.getEmailTaskDetails = asyncHandler(async (req, res) => {
     totals,
     employees,
   });
+});
+
+exports.getCountryList = asyncHandler(async (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const alpha2 = String(req.query.alpha2 || '').trim().toUpperCase();
+  const alpha3 = String(req.query.alpha3 || '').trim().toUpperCase();
+  const numeric = String(req.query.numeric || '').trim();
+  const includeAny = String(req.query.includeAny || '0') === '1';
+  const format = String(req.query.format || '').trim().toLowerCase(); // "select"
+
+  let list = Array.isArray(countries) ? countries.slice() : [];
+
+  // exact filters
+  if (alpha2) list = list.filter(c => String(c.alpha2 || '').toUpperCase() === alpha2);
+  if (alpha3) list = list.filter(c => String(c.alpha3 || '').toUpperCase() === alpha3);
+  if (numeric) list = list.filter(c => String(c.numeric || '') === numeric);
+
+  // search
+  if (q) {
+    list = list.filter(c => {
+      const name = String(c.name || '').toLowerCase();
+      const a2 = String(c.alpha2 || '').toLowerCase();
+      const a3 = String(c.alpha3 || '').toLowerCase();
+      const num = String(c.numeric || '').toLowerCase();
+      return name.includes(q) || a2.includes(q) || a3.includes(q) || num.includes(q);
+    });
+  }
+
+  // sort by name
+  list.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+
+  // add Any option
+  if (includeAny) {
+    list = [{ name: 'Any Country', alpha2: 'ANY', alpha3: 'ANY', numeric: '000' }, ...list];
+  }
+
+  // dropdown format
+  if (format === 'select') {
+    const out = list.map(c => ({ value: c.alpha2, label: c.name }));
+    return res.json({ total: out.length, data: out });
+  }
+
+  return res.json({ total: list.length, data: list });
 });

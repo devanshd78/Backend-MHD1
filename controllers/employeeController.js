@@ -1,4 +1,6 @@
 // controllers/employee.js
+'use strict';
+
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcrypt');
 const mongoose = require('mongoose');
@@ -10,7 +12,9 @@ const Link = require('../models/Link');
 const EmailTask = require('../models/EmailTask');
 const EmailContact = require('../models/email');
 const BalanceHistory = require('../models/BalanceHistory');
-const Payout = require('../models/Payout');   // <— add this
+const Payout = require('../models/Payout');
+
+const countryList = require('../services/countryList');
 
 const asyncHandler = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
@@ -41,6 +45,26 @@ function maskEmail(email = '') {
   } catch {
     return '***@***';
   }
+}
+
+/* ====================== country mapping ====================== */
+// ✅ ANY => {value:'ANY',label:'Any Country'}, US => {value:'US',label:'United States'}
+const COUNTRY_BY_A2 = new Map(
+  (Array.isArray(countryList) ? countryList : []).map((c) => [
+    String(c.alpha2 || '').toUpperCase(),
+    String(c.name || '').trim(),
+  ])
+);
+
+function countryOptionFromCode(code) {
+  const c = String(code || '').trim().toUpperCase();
+  if (!c || c === 'ANY') return { value: 'ANY', label: 'Any Country' };
+  return { value: c, label: COUNTRY_BY_A2.get(c) || c };
+}
+
+function countryOptionsFromCodes(codes) {
+  const arr = Array.isArray(codes) && codes.length ? codes : ['ANY'];
+  return arr.map(countryOptionFromCode);
 }
 
 /* ====================== auth ====================== */
@@ -122,48 +146,95 @@ exports.getLink = asyncHandler(async (req, res) => {
 });
 
 /* ====================== email tasks list ====================== */
-
+/* - include expired
+   - show minFollowers/maxFollowers + countries(codes->label) + categories
+*/
 exports.listEmailTasks = asyncHandler(async (_req, res) => {
-  const now = new Date();
+  // keep status/expiresAt in sync (do NOT filter out)
+  await EmailTask.updateMany(
+    {},
+    [
+      {
+        $set: {
+          expiresAt: {
+            $ifNull: [
+              '$expiresAt',
+              { $add: ['$createdAt', { $multiply: [{ $toDouble: '$expireIn' }, MS_PER_HOUR] }] },
+            ],
+          },
+        },
+      },
+      {
+        $set: {
+          status: {
+            $cond: [
+              { $eq: ['$status', 'disabled'] },
+              'disabled',
+              { $cond: [{ $lte: ['$expiresAt', '$$NOW'] }, 'expired', 'active'] },
+            ],
+          },
+        },
+      },
+    ],
+    { strict: false }
+  );
 
   const rows = await EmailTask.find()
     .sort({ createdAt: -1 })
-    .select('createdBy platform targetUser targetPerEmployee amountPerPerson maxEmails expireIn createdAt updatedAt')
+    .select(
+      'createdBy platform targetUser targetPerEmployee amountPerPerson maxEmails expireIn expiresAt status createdAt updatedAt ' +
+      'minFollowers maxFollowers countries categories'
+    )
     .lean();
 
-  if (rows.length === 0) return res.json([]);
+  if (!rows.length) return res.json([]);
 
-  const tasks = rows.map((t, idx) => {
-    const createdAt = new Date(t.createdAt);
-    const expiresAt = new Date(createdAt.getTime() + (Number(t.expireIn) || 0) * MS_PER_HOUR);
-    const status = now < expiresAt ? 'active' : 'expired';
-    return {
-      ...t,
-      expiresAt,
-      status,
-      isLatest: idx === 0, // kept for legacy UI, but front-end should rely on expiry
-    };
-  });
+  const tasks = rows.map((t, idx) => ({
+    ...t,
+    expiresAt:
+      t.expiresAt ||
+      new Date(new Date(t.createdAt).getTime() + (Number(t.expireIn) || 0) * MS_PER_HOUR),
+
+    status: t.status || 'active',
+    isLatest: idx === 0,
+
+    minFollowers: Number(t.minFollowers ?? 1000),
+    maxFollowers: Number(t.maxFollowers ?? 10_000_000),
+
+    // ✅ requested format
+    countries: countryOptionsFromCodes(t.countries),
+    categories: Array.isArray(t.categories) && t.categories.length ? t.categories : ['ANY'],
+  }));
 
   res.json(tasks);
 });
 
+/* ====================== task by user under employee ====================== */
+/* ✅ do NOT show EmailContact where isValid === false
+   ✅ show meta details: followerCount/country/categories + task min/max + countries label
+*/
 exports.taskByUser = asyncHandler(async (req, res) => {
   const { taskId, employeeId } = req.body || {};
   if (!taskId || !employeeId) return badRequest(res, 'taskId and employeeId are required');
   if (!isValidObjectId(taskId)) return badRequest(res, 'Invalid taskId');
 
-  const task = await EmailTask.findById(taskId).lean();
+  const task = await EmailTask.findById(taskId)
+    .select(
+      'platform targetPerEmployee amountPerPerson maxEmails expireIn createdAt expiresAt status ' +
+      'minFollowers maxFollowers countries categories'
+    )
+    .lean();
   if (!task) return notFound(res, 'Task not found');
 
-  const createdAt = new Date(task.createdAt);
-  const expiresAt = new Date(createdAt.getTime() + Number(task.expireIn || 0) * MS_PER_HOUR);
-  const taskStatus = new Date() < expiresAt ? 'active' : 'expired';
+  const expiresAt =
+    task.expiresAt ||
+    new Date(new Date(task.createdAt).getTime() + Number(task.expireIn || 0) * MS_PER_HOUR);
 
-  // all users under employee
-  const users = await User.find({ worksUnder: employeeId })
-    .select('userId name')
-    .lean();
+  const taskStatus =
+    task.status || (new Date() < expiresAt ? 'active' : 'expired');
+
+  // users under employee
+  const users = await User.find({ worksUnder: employeeId }).select('userId name').lean();
 
   if (!users.length) {
     return res.json({
@@ -177,6 +248,11 @@ exports.taskByUser = asyncHandler(async (req, res) => {
         createdAt: task.createdAt,
         expiresAt,
         status: taskStatus,
+
+        minFollowers: Number(task.minFollowers ?? 1000),
+        maxFollowers: Number(task.maxFollowers ?? 10_000_000),
+        countries: countryOptionsFromCodes(task.countries),
+        categories: Array.isArray(task.categories) && task.categories.length ? task.categories : ['ANY'],
       },
       totals: { performing: 0, completed: 0, partial: 0 },
       users: [],
@@ -185,11 +261,13 @@ exports.taskByUser = asyncHandler(async (req, res) => {
 
   const userIdList = users.map((u) => u.userId);
 
+  // ✅ aggregate only valid contacts
   const agg = await EmailContact.aggregate([
     {
       $match: {
         taskId: new ObjectId(taskId),
-        userId: { $in: userIdList }, // userId is a String in EmailContact
+        userId: { $in: userIdList },
+        isValid: { $ne: false }, // ✅ hide invalid
       },
     },
     {
@@ -202,6 +280,12 @@ exports.taskByUser = asyncHandler(async (req, res) => {
             handle: '$handle',
             platform: '$platform',
             createdAt: '$createdAt',
+
+            // ✅ include meta details per influencer (saved in EmailContact)
+            followerCount: '$followerCount',
+            country: '$country',
+            categories: '$categories',
+            youtube: '$youtube',
           },
         },
       },
@@ -218,7 +302,7 @@ exports.taskByUser = asyncHandler(async (req, res) => {
     const row = byUserId.get(u.userId);
     if (!row || !row.count) continue;
 
-    const doneCount = row.count;
+    const doneCount = Number(row.count || 0);
     const status = doneCount >= Number(task.maxEmails || 0) ? 'completed' : 'partial';
 
     if (status === 'completed') completedCount += 1;
@@ -232,23 +316,29 @@ exports.taskByUser = asyncHandler(async (req, res) => {
       emails: (row.emails || []).map((e) => ({
         emailMasked: maskEmail(e.email),
         handle: e.handle,
-        platform: e.platform, // comes from EmailContact (lowercased)
+        platform: e.platform,
         createdAt: e.createdAt,
+
+        // ✅ include details
+        followerCount: e.followerCount ?? null,
+        country: e.country ?? null,
+        categories: Array.isArray(e.categories) ? e.categories : [],
+        youtube: e.youtube || null,
       })),
     });
   }
 
-  // ...after building `performing` array
-
-  // Determine who is already paid for this (employeeId, taskId)
+  // paid set
   const paidRows = await Payout.find({
     employeeId,
     taskId,
-    userId: { $in: performing.map(u => u.userId) },
-  }).select('userId').lean();
+    userId: { $in: performing.map((u) => u.userId) },
+  })
+    .select('userId')
+    .lean();
 
-  const paidSet = new Set(paidRows.map(p => p.userId));
-  const performingWithPaid = performing.map(u => ({ ...u, paid: paidSet.has(u.userId) }));
+  const paidSet = new Set(paidRows.map((p) => p.userId));
+  const performingWithPaid = performing.map((u) => ({ ...u, paid: paidSet.has(u.userId) }));
 
   res.json({
     task: {
@@ -261,6 +351,12 @@ exports.taskByUser = asyncHandler(async (req, res) => {
       createdAt: task.createdAt,
       expiresAt,
       status: taskStatus,
+
+      // ✅ show task filters too
+      minFollowers: Number(task.minFollowers ?? 1000),
+      maxFollowers: Number(task.maxFollowers ?? 10_000_000),
+      countries: countryOptionsFromCodes(task.countries),
+      categories: Array.isArray(task.categories) && task.categories.length ? task.categories : ['ANY'],
     },
     totals: {
       performing: performingWithPaid.length,
@@ -269,9 +365,9 @@ exports.taskByUser = asyncHandler(async (req, res) => {
     },
     users: performingWithPaid.sort((a, b) => b.doneCount - a.doneCount),
   });
-
 });
 
+/* ====================== payout deduction ====================== */
 
 exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
   const { employeeId, userId, taskId } = req.body || {};
@@ -282,7 +378,6 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
     return badRequest(res, 'Invalid taskId');
   }
 
-  // Ensure task exists
   const task = await EmailTask.findById(taskId)
     .select('amountPerPerson expireIn createdAt status expiresAt platform')
     .lean();
@@ -297,13 +392,11 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
     return badRequest(res, 'Invalid task amountPerPerson');
   }
 
-  // Ensure user exists
   const user = await User.findOne({ userId: String(userId) })
     .select('_id userId name')
     .lean();
   if (!user) return notFound(res, 'User not found');
 
-  // Idempotency: if payout already exists, short-circuit
   const existing = await Payout.findOne({ employeeId, userId: user.userId, taskId }).lean();
   if (existing) {
     return res.json({
@@ -324,7 +417,6 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
     let updatedEmp = null;
 
     await session.withTransaction(async () => {
-      // Decrement balance atomically if sufficient
       const emp = await Employee.findOneAndUpdate(
         { employeeId, balance: { $gte: amount } },
         { $inc: { balance: -amount } },
@@ -338,21 +430,29 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
       }
       updatedEmp = emp;
 
-      // Balance history
-      await BalanceHistory.create([{
-        employeeId,
-        amount: -amount,
-        addedBy: user.userId,
-        note: `Deducted ₹${amount} for task ${taskId} (${task.platform || 'task'})`
-      }], { session });
+      await BalanceHistory.create(
+        [
+          {
+            employeeId,
+            amount: -amount,
+            addedBy: user.userId,
+            note: `Deducted ₹${amount} for task ${taskId} (${task.platform || 'task'})`,
+          },
+        ],
+        { session }
+      );
 
-      // Create payout (unique per employeeId+userId+taskId)
-      await Payout.create([{
-        employeeId,
-        userId: user.userId,
-        taskId,
-        amount,
-      }], { session });
+      await Payout.create(
+        [
+          {
+            employeeId,
+            userId: user.userId,
+            taskId,
+            amount,
+          },
+        ],
+        { session }
+      );
     });
 
     session.endSession();
@@ -371,12 +471,15 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
     });
   } catch (e) {
     session.endSession();
-    // Handle double submit race (unique index)
+
     if (e?.code === 11000) {
       return res.json({
         message: 'Already paid',
-        employeeId, userId, taskId,
-        paid: true, alreadyPaid: true,
+        employeeId,
+        userId,
+        taskId,
+        paid: true,
+        alreadyPaid: true,
       });
     }
     if (e.message === 'EMPLOYEE_NOT_FOUND') {
@@ -388,4 +491,3 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
     throw e;
   }
 });
-
