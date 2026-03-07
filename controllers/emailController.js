@@ -830,9 +830,11 @@ const MISMATCH_CODES = new Set(['FOLLOWERS_MISMATCH', 'COUNTRY_MISMATCH', 'CATEG
 
 async function gateByTaskFilters(task, platform, shaped) {
   const handle = shaped?.normalized?.handle || pickYouTubeHandle(shaped?.more_info);
+
   if (!handle) {
-    const err = new Error('Influencer verification failed (API unavailable).');
-    err.status = 502;
+    const err = new Error('Handle not found in screenshot.');
+    err.status = 422;
+    err.code = 'HANDLE_NOT_FOUND';
     throw err;
   }
 
@@ -843,16 +845,29 @@ async function gateByTaskFilters(task, platform, shaped) {
     try {
       meta = await fetchInfluencerMeta(platform, handle);
       cacheSet(cacheKey, meta);
-    } catch {
-      const err = new Error('Influencer verification failed (API unavailable).');
-      err.status = 502;
+    } catch (e) {
+      console.error('fetchInfluencerMeta failed:', {
+        platform,
+        handle,
+        message: e?.message,
+        status: e?.status,
+        code: e?.code,
+        details: e?.details || null,
+        response: e?.response?.data || null,
+      });
+
+      const err = new Error(e?.message || 'Influencer verification failed.');
+      err.status = Number(e?.status) || 503;
+      err.code = e?.code || 'META_API_FAILED';
+      err.details = e?.details || null;
       throw err;
     }
   }
 
   if (!meta) {
-    const err = new Error('Influencer verification failed (API unavailable).');
-    err.status = 502;
+    const err = new Error('Influencer meta not found.');
+    err.status = 404;
+    err.code = 'META_NOT_FOUND';
     throw err;
   }
 
@@ -874,7 +889,6 @@ async function gateByTaskFilters(task, platform, shaped) {
     throw e;
   }
 }
-
 // ======================================================
 // Persistence
 // ======================================================
@@ -1229,26 +1243,35 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
       )
     );
 
-    const apiFail = phase1.find((r) => r?.status === 502);
-    if (apiFail) {
-      return res.status(502).json({
-        status: 'error',
-        message: apiFail.error || 'Influencer verification failed (API unavailable).',
-        reason: apiFail.reason || 'META_API_FAILED',
-        emailTaskId: task._id,
-        platform,
-        maxImages,
-        alreadySaved,
-        remainingSlots,
-        accepted: inputs.length,
-        results: phase1.map((r) => ({
-          ok: !!r.ok,
-          has_captcha: !!r.has_captcha,
-          reason: r.reason || r.mismatch?.code || null,
-          error: r.error || r.mismatch?.message || null,
-        })),
-      });
-    }
+const apiFail = phase1.find(
+  (r) =>
+    r?.status >= 500 ||
+    r?.reason === 'META_API_FAILED' ||
+    r?.reason === 'YOUTUBE_TIMEOUT' ||
+    r?.reason === 'YOUTUBE_FORBIDDEN' ||
+    r?.reason === 'YOUTUBE_RATE_LIMIT' ||
+    r?.reason === 'YOUTUBE_UPSTREAM_ERROR'
+);
+
+if (apiFail) {
+  return res.status(apiFail.status || 503).json({
+    status: 'error',
+    message: apiFail.error || 'Influencer verification service is temporarily unavailable.',
+    reason: apiFail.reason || 'META_API_FAILED',
+    emailTaskId: task._id,
+    platform,
+    maxImages,
+    alreadySaved,
+    remainingSlots,
+    accepted: inputs.length,
+    results: phase1.map((r) => ({
+      ok: !!r.ok,
+      has_captcha: !!r.has_captcha,
+      reason: r.reason || r.mismatch?.code || null,
+      error: r.error || r.mismatch?.message || null,
+    })),
+  });
+}
 
     // ======================================================
     // 3) Phase 2: Persist only VALID items
@@ -1366,31 +1389,29 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
       });
     }
 
-    const anyMismatch = results.some((x) => x.mismatch === true);
-    const anyHardFailure = results.some(
-      (x) =>
-        x.saved === false &&
-        x.mismatch !== true &&
-        (x.reason === 'PROCESSING_ERROR' ||
-          x.reason === 'DUPLICATE_OR_INVALID' ||
-          x.reason === 'CAPTCHA')
-    );
+const anyMismatch = results.some((x) => x.mismatch === true);
 
-    return res.status(200).json({
-      status: anyMismatch || anyHardFailure ? 'partial' : 'ok',
-      message: anyMismatch
-        ? 'Some influencers did not match task filters and were not saved.'
-        : anyHardFailure
-          ? 'Some items failed to save.'
-          : 'Saved.',
-      emailTaskId: task._id,
-      platform,
-      maxImages,
-      alreadySaved,
-      remainingSlots,
-      accepted: inputs.length,
-      results,
-    });
+const anyHardFailure = results.some(
+  (x) =>
+    x.ok === false &&
+    x.mismatch !== true
+);
+
+return res.status(200).json({
+  status: anyMismatch || anyHardFailure ? 'partial' : 'ok',
+  message: anyMismatch
+    ? 'Some influencers did not match task filters and were not saved.'
+    : anyHardFailure
+      ? 'Some items failed to save.'
+      : 'Saved.',
+  emailTaskId: task._id,
+  platform,
+  maxImages,
+  alreadySaved,
+  remainingSlots,
+  accepted: inputs.length,
+  results,
+});
   } catch (err) {
     console.error('extractEmailsAndHandlesBatch error:', err);
     return res.status(400).json({
