@@ -6,23 +6,66 @@ const { Schema } = mongoose;
 const MIN_FOLLOWERS = 1000;
 const MAX_FOLLOWERS = 10_000_000;
 
+const PLATFORM_ENUM = ['youtube', 'instagram', 'twitter', 'tiktok', 'facebook', 'other'];
+
 const EmailTaskSchema = new Schema(
   {
-    createdBy:         { type: String, required: true, index: true },
-    targetUser:        { type: String, trim: true }, // must be String
-    targetPerEmployee: { type: Number, required: true, min: 0 },
-    platform:          { type: String, required: true, trim: true },
-    amountPerPerson:   { type: Number, required: true, min: 0 },
-    maxEmails:         { type: Number, required: true, min: 0 },
-    expireIn:          { type: Number, required: true, min: 1 },
+    createdBy: {
+      type: String,
+      required: true,
+      trim: true,
+      index: true,
+    },
 
-    // ✅ NEW: follower range
+    targetUser: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+
+    targetPerEmployee: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+
+    platform: {
+      type: String,
+      required: true,
+      trim: true,
+      lowercase: true,
+      enum: {
+        values: PLATFORM_ENUM,
+        message: `Platform must be one of: ${PLATFORM_ENUM.join(', ')}`,
+      },
+      index: true,
+    },
+
+    amountPerPerson: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+
+    maxEmails: {
+      type: Number,
+      required: true,
+      min: 1,
+    },
+
+    expireIn: {
+      type: Number,
+      required: true,
+      min: 1,
+    },
+
     minFollowers: {
       type: Number,
       default: MIN_FOLLOWERS,
       min: MIN_FOLLOWERS,
       max: MAX_FOLLOWERS,
     },
+
     maxFollowers: {
       type: Number,
       default: MAX_FOLLOWERS,
@@ -30,11 +73,12 @@ const EmailTaskSchema = new Schema(
       max: MAX_FOLLOWERS,
     },
 
-    // ✅ NEW: multi-select tags (ANY means no restriction)
+    // ANY means no restriction
     countries: {
       type: [String],
       default: ['ANY'],
     },
+
     categories: {
       type: [String],
       default: ['ANY'],
@@ -43,15 +87,11 @@ const EmailTaskSchema = new Schema(
   { timestamps: true }
 );
 
-// ✅ Ensure maxFollowers >= minFollowers
 EmailTaskSchema.path('maxFollowers').validate(function (v) {
   const min = Number(this.minFollowers || MIN_FOLLOWERS);
   const max = Number(v || MAX_FOLLOWERS);
   return Number.isFinite(min) && Number.isFinite(max) && max >= min;
 }, 'maxFollowers must be >= minFollowers');
 
-if (mongoose.models.EmailTask) {
-  try { mongoose.deleteModel('EmailTask'); } catch (_) { delete mongoose.connection.models['EmailTask']; }
-}
-
-module.exports = mongoose.model('EmailTask', EmailTaskSchema);
+module.exports =
+  mongoose.models.EmailTask || mongoose.model('EmailTask', EmailTaskSchema);

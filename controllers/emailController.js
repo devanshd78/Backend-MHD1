@@ -32,17 +32,12 @@ function isAnyToken(x) {
 // returns ONLY specific values; if none => means "ANY"
 function effectiveSpecificList(list) {
   const arr = Array.isArray(list) ? list : [];
-  const cleaned = arr.map(v => String(v || '').trim()).filter(Boolean);
-  const specific = cleaned.filter(v => !isAnyToken(v));
+  const cleaned = arr.map((v) => String(v || '').trim()).filter(Boolean);
+  const specific = cleaned.filter((v) => !isAnyToken(v));
   return specific; // [] means ANY
 }
 
-function taskWantsAny(list = []) {
-  return effectiveSpecificList(list).length === 0;
-}
-
 function normalizeCountry(v) {
-  // store + compare uppercase; recommend saving ISO2 in admin (US/AE/IN)
   return String(v || '').trim().toUpperCase();
 }
 
@@ -57,7 +52,9 @@ function matchesCategory(taskCategories = [], influencerCategories = []) {
   const want = new Set(specific);
   const got = new Set((influencerCategories || []).map(normalizeCategory));
 
-  for (const c of want) if (got.has(c)) return true;
+  for (const c of want) {
+    if (got.has(c)) return true;
+  }
   return false;
 }
 
@@ -73,8 +70,14 @@ function ensureTaskFilters(task, meta) {
   if (!task) return;
 
   // 1) Followers
-  const minF = Math.max(MIN_FOLLOWERS, Math.min(MAX_FOLLOWERS, Number(task.minFollowers ?? MIN_FOLLOWERS)));
-  const maxF = Math.max(MIN_FOLLOWERS, Math.min(MAX_FOLLOWERS, Number(task.maxFollowers ?? MAX_FOLLOWERS)));
+  const minF = Math.max(
+    MIN_FOLLOWERS,
+    Math.min(MAX_FOLLOWERS, Number(task.minFollowers ?? MIN_FOLLOWERS))
+  );
+  const maxF = Math.max(
+    MIN_FOLLOWERS,
+    Math.min(MAX_FOLLOWERS, Number(task.maxFollowers ?? MAX_FOLLOWERS))
+  );
 
   const count = Number(meta?.followerCount);
   if (!Number.isFinite(count) || count < minF || count > maxF) {
@@ -85,9 +88,8 @@ function ensureTaskFilters(task, meta) {
     );
   }
 
-  // 2) Country (FIXED: ignore ANY if specific values exist)
+  // 2) Country
   const wantCountries = effectiveSpecificList(task.countries).map(normalizeCountry);
-
   if (wantCountries.length) {
     const want = new Set(wantCountries);
     const got = normalizeCountry(meta?.country);
@@ -128,7 +130,7 @@ if (USE_SHARP) {
   try {
     sharp = require('sharp');
   } catch {
-    /* ignore */
+    // ignore
   }
 }
 
@@ -137,7 +139,7 @@ let jsonrepairFn = null;
 try {
   jsonrepairFn = require('jsonrepair').jsonrepair || require('jsonrepair');
 } catch {
-  /* ignore */
+  // ignore
 }
 
 // ======================================================
@@ -184,7 +186,7 @@ const AGGRESSIVE_RACE = process.env.AGGRESSIVE_RACE === '1';
 // ======================================================
 // YouTube API (for enrichment only)
 // ======================================================
-const YT_API_KEY = process.env.YOUTUBE_API_KEY; // for enrichment & meta service (YT)
+const YT_API_KEY = process.env.YOUTUBE_API_KEY;
 const YT_TIMEOUT_MS = Number(process.env.YOUTUBE_TIMEOUT_MS || 12000);
 const YT_BASE = 'https://www.googleapis.com/youtube/v3/channels';
 
@@ -193,8 +195,8 @@ const YT_BASE = 'https://www.googleapis.com/youtube/v3/channels';
 // ======================================================
 const EMAIL_RX = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
 const HANDLE_IN_TEXT = /@[A-Za-z0-9._\-]+/g;
-const YT_HANDLE_RX = /\/@([A-Za-z0-9._\-]+)/i; // deriveHandleFromMi
-const YT_HANDLE_RE = /@([A-Za-z0-9._\-]+)/i; // youtube handle parsing
+const YT_HANDLE_RX = /\/@([A-Za-z0-9._\-]+)/i;
+const YT_HANDLE_RE = /@([A-Za-z0-9._\-]+)/i;
 const IG_RX = /(?:instagram\.com|ig\.me)\/([A-Za-z0-9._\-]+)/i;
 const TW_RX = /(?:twitter\.com|x\.com)\/([A-Za-z0-9._\-]+)/i;
 
@@ -274,6 +276,7 @@ function now() {
 
 // cache ONLY parsed output / meta (never DB results)
 const CACHE = new Map();
+
 function cacheGet(key) {
   if (!ENABLE_CACHE) return null;
   const v = CACHE.get(key);
@@ -284,6 +287,7 @@ function cacheGet(key) {
   }
   return v.data;
 }
+
 function cacheSet(key, data) {
   if (!ENABLE_CACHE) return;
   CACHE.set(key, { ts: now(), data });
@@ -293,6 +297,10 @@ function cacheSet(key, data) {
       if (CACHE.size <= 400) break;
     }
   }
+}
+
+function validOnlyFilter(extra = {}) {
+  return { isValid: { $ne: false }, ...extra };
 }
 
 // ======================================================
@@ -309,7 +317,10 @@ const SECTION_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        properties: { key: { type: 'string' }, value: { type: 'string' } },
+        properties: {
+          key: { type: 'string' },
+          value: { type: 'string' },
+        },
         required: ['key', 'value'],
       },
     },
@@ -344,7 +355,7 @@ const USER_INSTRUCTIONS =
 // Image preprocessing
 // ======================================================
 async function enhanceIfDark(buffer) {
-  const darkEnhanceOn = process.env.ENABLE_DARK_ENHANCE === '0' ? false : true;
+  const darkEnhanceOn = process.env.ENABLE_DARK_ENHANCE !== '0';
   if (!sharp || !darkEnhanceOn) return buffer;
 
   try {
@@ -354,7 +365,10 @@ async function enhanceIfDark(buffer) {
     const avg = means.reduce((a, b) => a + b, 0) / (means.length || 1);
 
     if (avg < 85) {
-      return await sharp(buffer).modulate({ brightness: 1.35, saturation: 1.08 }).gamma(1.05).toBuffer();
+      return await sharp(buffer)
+        .modulate({ brightness: 1.35, saturation: 1.08 })
+        .gamma(1.05)
+        .toBuffer();
     }
     return buffer;
   } catch {
@@ -372,10 +386,19 @@ async function preprocessImage(buffer, mime) {
     const h = meta.height || 0;
 
     if (w > MAX_IMG_W || h > MAX_IMG_H) {
-      img = img.resize({ width: MAX_IMG_W, height: MAX_IMG_H, fit: 'inside', withoutEnlargement: true });
+      img = img.resize({
+        width: MAX_IMG_W,
+        height: MAX_IMG_H,
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
     }
 
-    const buf = await (mime.includes('png') ? img.png({ compressionLevel: 6 }) : img.jpeg({ quality: 80 })).toBuffer();
+    const buf = await (mime.includes('png')
+      ? img.png({ compressionLevel: 6 })
+      : img.jpeg({ quality: 80 })
+    ).toBuffer();
+
     return await enhanceIfDark(buf);
   } catch {
     return await enhanceIfDark(buffer);
@@ -397,7 +420,13 @@ async function imagePartFromPath(absPath) {
 }
 
 function imagePartFromUrl(url) {
-  return { type: 'input_image', image_url: { url: String(url), ...(IMAGE_DETAIL ? { detail: IMAGE_DETAIL } : {}) } };
+  return {
+    type: 'input_image',
+    image_url: {
+      url: String(url),
+      ...(IMAGE_DETAIL ? { detail: IMAGE_DETAIL } : {}),
+    },
+  };
 }
 
 // ======================================================
@@ -415,7 +444,10 @@ function extractOutputText(data) {
       }
     }
   }
-  if (typeof data?.output_text === 'string' && data.output_text.trim()) return data.output_text;
+
+  if (typeof data?.output_text === 'string' && data.output_text.trim()) {
+    return data.output_text;
+  }
 
   if (Array.isArray(data?.choices)) {
     const content = data.choices[0]?.message?.content;
@@ -440,15 +472,20 @@ function safeJSONParse(input) {
 
   const first = t.indexOf('{');
   const last = t.lastIndexOf('}');
-  if (first !== -1 && last !== -1 && first < last) t = t.slice(first, last + 1);
+  if (first !== -1 && last !== -1 && first < last) {
+    t = t.slice(first, last + 1);
+  }
 
-  t = t.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'").replace(/,\s*([}\]])/g, '$1');
+  t = t
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/,\s*([}\]])/g, '$1');
 
   try {
     return JSON.parse(t);
   } catch {
     if (jsonrepairFn) return JSON.parse(jsonrepairFn(t));
-    throw new Error(`Invalid JSON after repair attempts. Preview: ${t.slice(0, 200)}…`);
+    throw new Error(`Invalid JSON after repair attempts. Preview: ${t.slice(0, 200)}...`);
   }
 }
 
@@ -479,7 +516,10 @@ async function callOpenAI(body, timeoutMs) {
     const r = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       dispatcher: httpAgent,
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
       body: JSON.stringify(body),
       signal: ac.signal,
     });
@@ -523,6 +563,7 @@ async function tryOnce(imagePart, model, tokens) {
       if (!isValidStructured(parsed2)) throw new Error('Invalid structured output (fallback)');
       return parsed2;
     }
+
     throw e;
   }
 }
@@ -538,8 +579,7 @@ async function callVisionFast(imagePart) {
     })();
 
     const pFallback = tryOnce(imagePart, RESOLVED_MODEL_FALLBACK, RETRY_TOKENS).catch(() => null);
-    const winner = await Promise.any([pPrimary, pFallback].map((p) => p.catch(() => Promise.reject())));
-    return winner;
+    return Promise.any([pPrimary, pFallback].map((p) => p.catch(() => Promise.reject())));
   }
 
   try {
@@ -559,8 +599,11 @@ async function callVisionFast(imagePart) {
 function extractYouTube(fieldsArray = [], raw = '') {
   for (const kv of fieldsArray) {
     const k = (kv?.key || '').toLowerCase();
-    if (k === 'youtube' && typeof kv.value === 'string' && kv.value.trim()) return kv.value.trim();
+    if (k === 'youtube' && typeof kv.value === 'string' && kv.value.trim()) {
+      return kv.value.trim();
+    }
   }
+
   const m = raw.match(/(https?:\/\/)?(www\.)?youtube\.com\/@[A-Za-z0-9._\-]+/i);
   return m ? m[0].replace(/^https?:\/\//i, '').replace(/^www\./i, 'www.') : null;
 }
@@ -568,6 +611,7 @@ function extractYouTube(fieldsArray = [], raw = '') {
 function firstValidEmail(emailsArr = [], raw = '') {
   const norm = (emailsArr || []).flatMap((s) => String(s || '').match(EMAIL_RX) || []);
   if (norm.length) return norm[0].toLowerCase();
+
   const fromRaw = (raw || '').match(EMAIL_RX);
   return fromRaw ? fromRaw[0].toLowerCase() : null;
 }
@@ -577,6 +621,7 @@ function deriveHandleFromMi(mi = {}) {
     const s = String(h || '');
     const m = s.match(HANDLE_IN_TEXT);
     if (m && m[0]) return m[0].toLowerCase();
+
     const my = s.match(YT_HANDLE_RX);
     if (my && my[1]) return `@${my[1].toLowerCase()}`;
   }
@@ -590,8 +635,10 @@ function deriveHandleFromMi(mi = {}) {
   if (r && r[0]) return r[0].toLowerCase();
 
   const big = [...(mi.fields || []).map((kv) => `${kv.key}: ${kv.value}`), String(mi.raw_text || '')].join('\n');
+
   let m = big.match(IG_RX);
   if (m && m[1]) return `@${m[1].toLowerCase()}`;
+
   m = big.match(TW_RX);
   if (m && m[1]) return `@${m[1].toLowerCase()}`;
 
@@ -615,7 +662,11 @@ function shapeForClient(parsed) {
 
   return {
     has_captcha,
-    more_info: { emails: cleaned.emails, handles: cleaned.handles, YouTube: cleaned.YouTube },
+    more_info: {
+      emails: cleaned.emails,
+      handles: cleaned.handles,
+      YouTube: cleaned.YouTube,
+    },
     normalized: { email, handle },
   };
 }
@@ -643,6 +694,7 @@ function pickYouTubeHandle(more_info) {
   for (const h of arr) {
     if (typeof h === 'string' && h.trim().startsWith('@')) return h.trim();
   }
+
   return null;
 }
 
@@ -670,11 +722,16 @@ async function fetchYouTubeChannelByHandle(ytHandle) {
   const to = setTimeout(() => ac.abort(new Error('YouTube API timeout')), YT_TIMEOUT_MS);
 
   try {
-    const r = await fetch(`${YT_BASE}?${params.toString()}`, { dispatcher: httpAgent, signal: ac.signal });
+    const r = await fetch(`${YT_BASE}?${params.toString()}`, {
+      dispatcher: httpAgent,
+      signal: ac.signal,
+    });
+
     if (!r.ok) {
       const txt = await r.text().catch(() => '');
       throw new Error(`YouTube API ${r.status}: ${txt || r.statusText}`);
     }
+
     const data = await r.json();
     const item = data?.items?.[0];
     if (!item) return null;
@@ -704,7 +761,9 @@ async function fetchYouTubeChannelByHandle(ytHandle) {
 }
 
 async function enrichYouTubeForContact(more_info, persistResult) {
-  if (!YT_API_KEY) return { saved: false, message: 'YouTube enrichment skipped: Missing YOUTUBE_API_KEY.' };
+  if (!YT_API_KEY) {
+    return { saved: false, message: 'YouTube enrichment skipped: Missing YOUTUBE_API_KEY.' };
+  }
 
   const email =
     persistResult?.email ??
@@ -748,7 +807,11 @@ async function enrichYouTubeForContact(more_info, persistResult) {
   }
 
   if (!targetId) {
-    const out = { saved: false, message: 'Could not locate a single record to update with YouTube data.', youtube: yt };
+    const out = {
+      saved: false,
+      message: 'Could not locate a single record to update with YouTube data.',
+      youtube: yt,
+    };
     cacheSet(cacheKey, out);
     return out;
   }
@@ -761,7 +824,7 @@ async function enrichYouTubeForContact(more_info, persistResult) {
 }
 
 // ======================================================
-// Task gating wrapper (uses your services/influencerMeta.js)
+// Task gating wrapper
 // ======================================================
 const MISMATCH_CODES = new Set(['FOLLOWERS_MISMATCH', 'COUNTRY_MISMATCH', 'CATEGORY_MISMATCH']);
 
@@ -793,32 +856,51 @@ async function gateByTaskFilters(task, platform, shaped) {
     throw err;
   }
 
-  // ✅ mismatch should NOT throw outward now
   try {
     ensureTaskFilters(task, meta);
     return { ok: true, meta, mismatch: null };
   } catch (e) {
     if (MISMATCH_CODES.has(e.code)) {
-      return { ok: false, meta, mismatch: { code: e.code, message: e.message, details: e.details || null } };
+      return {
+        ok: false,
+        meta,
+        mismatch: {
+          code: e.code,
+          message: e.message,
+          details: e.details || null,
+        },
+      };
     }
-    throw e; // other errors still throw
+    throw e;
   }
 }
+
 // ======================================================
-// Persistence (unchanged behavior) + taskId attach
+// Persistence
 // ======================================================
 async function persistMoreInfo(normalized, platform, userId, taskId) {
   const email = normalized?.email ? normalized.email.toLowerCase().trim() : null;
   const handle = normalized?.handle ? normalized.handle.toLowerCase().trim() : null;
 
-  if (!userId || typeof userId !== 'string' || !userId.trim()) return { outcome: 'invalid', message: 'userId is required.' };
-  if (!platform) return { outcome: 'invalid', message: 'Platform is required.' };
+  if (!userId || typeof userId !== 'string' || !userId.trim()) {
+    return { outcome: 'invalid', message: 'userId is required.' };
+  }
+
+  if (!platform) {
+    return { outcome: 'invalid', message: 'Platform is required.' };
+  }
+
   if (!email || !handle || !/^@[A-Za-z0-9._\-]+$/.test(handle)) {
     return { outcome: 'invalid', message: 'No valid email or @handle found under more_info.' };
   }
 
-  const user = await User.findOne({ userId: userId.trim() }).select({ _id: 1, userId: 1 }).lean();
-  if (!user) return { outcome: 'invalid', message: 'Invalid userId (no such user).' };
+  const user = await User.findOne({ userId: userId.trim() })
+    .select({ _id: 1, userId: 1 })
+    .lean();
+
+  if (!user) {
+    return { outcome: 'invalid', message: 'Invalid userId (no such user).' };
+  }
 
   let taskObjectId = null;
   if (taskId) {
@@ -857,6 +939,7 @@ async function persistMoreInfo(normalized, platform, userId, taskId) {
 
     const updEmail = await attachTaskIdIfMissing(byEmail);
     const updHandle = await attachTaskIdIfMissing(byHandle);
+
     return {
       outcome: 'duplicate',
       message: 'Email and handle already exist (in different records).',
@@ -902,13 +985,13 @@ async function persistMoreInfo(normalized, platform, userId, taskId) {
   return { outcome: 'saved', id: doc._id };
 }
 
+// ======================================================
+// POST /email/extract-batch
+// ======================================================
 exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
   try {
     if (!OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY');
 
-    // ======================================================
-    // 0) Validate Task
-    // ======================================================
     const taskId = String(req.body?._id || req.body?.emailTaskId || req.body?.taskId || '').trim();
 
     if (!taskId) {
@@ -959,6 +1042,31 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
     const platform = normalizePlatform(task.platform) || normalizePlatform(req.body?.platform) || 'other';
     const userId = String(req.body?.userId || '').trim();
 
+    if (!userId) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'userId is required.',
+        emailTaskId: task._id,
+      });
+    }
+
+    const alreadySaved = await EmailContact.countDocuments({
+      taskId: task._id,
+      userId,
+      isValid: { $ne: false },
+    });
+
+    const remainingSlots = maxImages - alreadySaved;
+    if (remainingSlots <= 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: `Task limit already reached. Max allowed is ${maxImages}.`,
+        emailTaskId: task._id,
+        maxImages,
+        alreadySaved,
+      });
+    }
+
     // ======================================================
     // 1) Gather Inputs (files/urls/paths)
     // ======================================================
@@ -967,59 +1075,71 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
 
     const urls = Array.isArray(req.body?.imageUrl)
       ? req.body.imageUrl
-      : (Array.isArray(req.body?.imageUrls) ? req.body.imageUrls : []);
+      : Array.isArray(req.body?.imageUrls)
+        ? req.body.imageUrls
+        : [];
 
     const paths = Array.isArray(req.body?.imagePath)
       ? req.body.imagePath
-      : (Array.isArray(req.body?.imagePaths) ? req.body.imagePaths : []);
+      : Array.isArray(req.body?.imagePaths)
+        ? req.body.imagePaths
+        : [];
 
     const totalRequested = validFiles.length + urls.length + paths.length;
 
     if (totalRequested === 0) {
       return res.status(400).json({
         status: 'error',
-        message: `Provide up to ${maxImages} images via multipart (PNG/JPG/WEBP) or arrays imageUrls/imagePaths.`,
+        message: `Provide up to ${remainingSlots} images via multipart (PNG/JPG/WEBP) or arrays imageUrls/imagePaths.`,
         emailTaskId: task._id,
         maxImages,
+        alreadySaved,
+        remainingSlots,
       });
     }
 
-    if (totalRequested > maxImages) {
+    if (totalRequested > remainingSlots) {
       return res.status(400).json({
         status: 'error',
-        message: `This task allows up to ${maxImages} screenshots; you provided ${totalRequested}.`,
+        message: `Only ${remainingSlots} more screenshots can be submitted for this task.`,
         emailTaskId: task._id,
         maxImages,
+        alreadySaved,
+        remainingSlots,
         provided: totalRequested,
       });
     }
 
-    // Build ordered inputs (files -> urls -> paths), enforce maxImages
+    // Build ordered inputs (files -> urls -> paths), enforce remainingSlots
     const inputs = [];
-    let remaining = maxImages;
+    let remaining = remainingSlots;
 
     for (const f of validFiles) {
       if (remaining <= 0) break;
-      remaining--;
+      remaining -= 1;
       inputs.push({ kind: 'file', file: f });
     }
+
     for (const u of urls) {
       if (remaining <= 0) break;
-      remaining--;
+      remaining -= 1;
       inputs.push({ kind: 'url', url: u });
     }
+
     for (const pth of paths) {
       if (remaining <= 0) break;
-      remaining--;
+      remaining -= 1;
       inputs.push({ kind: 'path', pth });
     }
 
     if (!inputs.length) {
       return res.status(400).json({
         status: 'error',
-        message: `Provide up to ${maxImages} images for this task via multipart (PNG/JPG/WEBP) or arrays imageUrls/imagePaths.`,
+        message: `Provide up to ${remainingSlots} images for this task via multipart (PNG/JPG/WEBP) or arrays imageUrls/imagePaths.`,
         emailTaskId: task._id,
         maxImages,
+        alreadySaved,
+        remainingSlots,
       });
     }
 
@@ -1032,9 +1152,6 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
 
     // ======================================================
     // 2) Phase 1: Parse + Gate (NO DB write)
-    //    - Captcha => never save
-    //    - Meta/API down => 502 and stop
-    //    - Country mismatch => allow saving, but mark invalid later
     // ======================================================
     const phase1 = await Promise.all(
       inputs.map((item) =>
@@ -1080,12 +1197,10 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
                 details: null,
                 shaped,
                 meta: null,
+                mismatch: null,
               };
             }
 
-            // gateByTaskFilters:
-            // - returns { ok:true/false, meta, mismatch:{code,message,details} }
-            // - throws 502 when meta service fails
             const gated = await gateByTaskFilters(task, platform, shaped);
 
             return {
@@ -1094,7 +1209,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
               shaped,
               meta: gated.meta || null,
               gateOk: !!gated.ok,
-              mismatch: gated.mismatch || null, // { code, message, details }
+              mismatch: gated.mismatch || null,
             };
           } catch (e) {
             const pe = makePhaseError(e);
@@ -1114,7 +1229,6 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
       )
     );
 
-    // meta/api failure -> 502 and NO saves
     const apiFail = phase1.find((r) => r?.status === 502);
     if (apiFail) {
       return res.status(502).json({
@@ -1124,6 +1238,8 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
         emailTaskId: task._id,
         platform,
         maxImages,
+        alreadySaved,
+        remainingSlots,
         accepted: inputs.length,
         results: phase1.map((r) => ({
           ok: !!r.ok,
@@ -1135,10 +1251,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
     }
 
     // ======================================================
-    // 3) Phase 2: Persist + Update Validity + Enrich
-    //    ✅ Always save influencer if parsed OK (even mismatch)
-    //    ✅ If COUNTRY mismatched => isValid=false + save invalidReason/details
-    //    ✅ Response must show "country mismatching"
+    // 3) Phase 2: Persist only VALID items
     // ======================================================
     const results = [];
 
@@ -1147,6 +1260,7 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
         results.push({
           ok: false,
           saved: false,
+          mismatch: false,
           has_captcha: !!r.has_captcha,
           platform,
           reason: r.reason || 'PROCESSING_ERROR',
@@ -1158,22 +1272,40 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
 
       const shaped = r.shaped;
       const meta = r.meta;
-      const mismatch = r.mismatch; // { code, message, details } | null
+      const mismatch = r.mismatch;
+      const isTaskMismatch = !!mismatch;
 
-      // Persist extracted email/handle (taskId attached)
+      // block save for ALL mismatches
+      if (isTaskMismatch) {
+        results.push({
+          ok: false,
+          saved: false,
+          mismatch: true,
+          reason: mismatch.code,
+          error: mismatch.message,
+          details: mismatch.details || null,
+          platform,
+          has_captcha: false,
+          more_info: shaped.more_info,
+          normalized: shaped.normalized,
+          meta: {
+            followerCount: meta?.followerCount ?? null,
+            country: meta?.country ?? null,
+            categories: meta?.categories ?? [],
+          },
+          youtube: meta?.youtube || null,
+        });
+        continue;
+      }
+
       const dbRes = await persistMoreInfo(shaped.normalized, platform, userId, task._id);
 
-      // Collect IDs we should update (saved OR duplicate byEmail/byHandle)
       const idsToUpdate = new Set(
-        [dbRes?.id, dbRes?.emailId, dbRes?.handleId].filter(Boolean).map(String)
+        [dbRes?.id, dbRes?.emailId, dbRes?.handleId]
+          .filter(Boolean)
+          .map(String)
       );
 
-      const isCountryMismatch = mismatch?.code === 'COUNTRY_MISMATCH';
-      const countryMismatch = isCountryMismatch
-        ? { expected: mismatch?.details?.expected || [], got: mismatch?.details?.got || null }
-        : null;
-
-      // Update meta + validity (only if schema has these fields)
       if (meta && idsToUpdate.size) {
         for (const _id of idsToUpdate) {
           const update = {
@@ -1181,11 +1313,9 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
             country: meta?.country ?? null,
             categories: Array.isArray(meta?.categories) ? meta.categories : [],
             validatedAt: new Date(),
-
-            // ✅ requirement: country mismatch => isValid false
-            isValid: isCountryMismatch ? false : true,
-            invalidReason: isCountryMismatch ? 'COUNTRY_MISMATCH' : null,
-            invalidDetails: isCountryMismatch ? (mismatch?.details || null) : null,
+            isValid: true,
+            invalidReason: null,
+            invalidDetails: null,
           };
 
           if (meta?.youtube) update.youtube = meta.youtube;
@@ -1194,7 +1324,6 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
         }
       }
 
-      // YouTube enrichment attempt (non-blocking)
       let ytRes = null;
       try {
         const persistCtx = {
@@ -1213,50 +1342,52 @@ exports.extractEmailsAndHandlesBatch = asyncHandler(async (req, res) => {
       const savedOrExists = savedNow || dbRes?.outcome === 'duplicate';
 
       results.push({
-        ok: !isCountryMismatch && savedNow,
+        ok: savedNow,
         saved: !!savedOrExists,
-
-        // ✅ show mismatch in response
-        mismatch: !!isCountryMismatch,
-        reason: isCountryMismatch ? 'COUNTRY_MISMATCH' : (savedNow ? null : 'DUPLICATE_OR_INVALID'),
-        error: isCountryMismatch ? 'Country is mismatching for this task.' : (savedNow ? null : dbRes?.message || null),
-        details: isCountryMismatch ? (mismatch?.details || null) : (savedNow ? null : dbRes || null),
-        countryMismatch,
-
+        mismatch: false,
+        reason: savedNow ? null : 'DUPLICATE_OR_INVALID',
+        error: savedNow ? null : dbRes?.message || null,
+        details: savedNow ? null : dbRes || null,
         platform,
         has_captcha: false,
         more_info: shaped.more_info,
         normalized: shaped.normalized,
-
         db: savedNow
           ? { outcome: dbRes.outcome, id: dbRes.id }
           : { outcome: dbRes.outcome, ...dbRes },
-
         meta: {
           followerCount: meta?.followerCount ?? null,
           country: meta?.country ?? null,
           categories: meta?.categories ?? [],
         },
-
         youtube: ytRes?.youtube || meta?.youtube || null,
         youtubeSaved: !!ytRes?.saved,
         youtubeMessage: ytRes?.message || null,
       });
     }
 
-    const anyCountryMismatch = results.some((x) => x.reason === 'COUNTRY_MISMATCH');
+    const anyMismatch = results.some((x) => x.mismatch === true);
     const anyHardFailure = results.some(
-      (x) => x.saved === false && (x.reason === 'PROCESSING_ERROR' || x.reason === 'DUPLICATE_OR_INVALID')
+      (x) =>
+        x.saved === false &&
+        x.mismatch !== true &&
+        (x.reason === 'PROCESSING_ERROR' ||
+          x.reason === 'DUPLICATE_OR_INVALID' ||
+          x.reason === 'CAPTCHA')
     );
 
     return res.status(200).json({
-      status: anyCountryMismatch ? 'error' : (anyHardFailure ? 'partial' : 'ok'),
-      message: anyCountryMismatch
-        ? 'Saved, but some influencers have country mismatch.'
-        : (anyHardFailure ? 'Some items failed to save.' : 'Saved.'),
+      status: anyMismatch || anyHardFailure ? 'partial' : 'ok',
+      message: anyMismatch
+        ? 'Some influencers did not match task filters and were not saved.'
+        : anyHardFailure
+          ? 'Some items failed to save.'
+          : 'Saved.',
       emailTaskId: task._id,
       platform,
       maxImages,
+      alreadySaved,
+      remainingSlots,
       accepted: inputs.length,
       results,
     });
@@ -1276,9 +1407,10 @@ exports.getAllEmailContacts = asyncHandler(async (req, res) => {
   try {
     const body = req.body || {};
 
-    const _escapeRegex = typeof escapeRegex === 'function'
-      ? escapeRegex
-      : (str = '') => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const _escapeRegex =
+      typeof escapeRegex === 'function'
+        ? escapeRegex
+        : (str = '') => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
     const page = Math.max(1, parseInt(body.page ?? '1', 10));
     const limit = Math.min(50, Math.max(1, parseInt(body.limit ?? '50', 10)));
@@ -1286,11 +1418,20 @@ exports.getAllEmailContacts = asyncHandler(async (req, res) => {
     const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
     const search = typeof body.search === 'string' ? body.search.trim() : '';
 
-    const exportType = (body.exportType || '').toLowerCase(); // 'csv' | 'xlsx' | ''
+    const exportType = (body.exportType || '').toLowerCase();
     const exportAll = String(body.exportAll ?? 'false').toLowerCase() === 'true';
 
-    // include meta fields too (safe even if schema not updated yet)
-    const defaultFields = ['email', 'handle', 'platform', 'userId', 'createdAt', 'youtube', 'followerCount', 'country', 'categories'];
+    const defaultFields = [
+      'email',
+      'handle',
+      'platform',
+      'userId',
+      'createdAt',
+      'youtube',
+      'followerCount',
+      'country',
+      'categories',
+    ];
 
     const YT_ALLOWED_DOT_FIELDS = [
       'youtube.channelId',
@@ -1329,7 +1470,7 @@ exports.getAllEmailContacts = asyncHandler(async (req, res) => {
 
     if (!fields.length) fields = defaultFields.slice();
 
-    const query = {};
+    const query = validOnlyFilter();
     if (userId) query.userId = userId;
 
     if (search) {
@@ -1362,6 +1503,7 @@ exports.getAllEmailContacts = asyncHandler(async (req, res) => {
         return undefined;
       }
     };
+
     const asCell = (v) => {
       if (v == null) return '';
       if (Array.isArray(v)) return v.join('; ');
@@ -1372,7 +1514,10 @@ exports.getAllEmailContacts = asyncHandler(async (req, res) => {
     if (exportType === 'csv' || exportType === 'xlsx') {
       const hasYoutubeWildcard = fields.includes('youtube');
       const hasYoutubeDot = fields.some((f) => f.startsWith('youtube.'));
-      const ytExpanded = hasYoutubeWildcard && !hasYoutubeDot ? YT_EXPORT_DEFAULTS : fields.filter((f) => f.startsWith('youtube.'));
+      const ytExpanded =
+        hasYoutubeWildcard && !hasYoutubeDot
+          ? YT_EXPORT_DEFAULTS
+          : fields.filter((f) => f.startsWith('youtube.'));
 
       const nonYTFields = fields.filter((f) => f !== 'youtube' && !f.startsWith('youtube.'));
       const exportFields = [...nonYTFields, ...ytExpanded];
@@ -1380,14 +1525,25 @@ exports.getAllEmailContacts = asyncHandler(async (req, res) => {
       let docs = [];
       if (exportAll) {
         const toFetch = Math.min(total, EXPORT_CAP);
-        docs = await EmailContact.find(query).sort({ createdAt: -1 }).limit(toFetch).select(projection).lean();
+        docs = await EmailContact.find(query)
+          .sort({ createdAt: -1 })
+          .limit(toFetch)
+          .select(projection)
+          .lean();
       } else {
-        docs = await EmailContact.find(query).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).select(projection).lean();
+        docs = await EmailContact.find(query)
+          .sort({ createdAt: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .select(projection)
+          .lean();
       }
 
       const rows = docs.map((d) => {
         const out = {};
-        for (const f of exportFields) out[f] = asCell(f.startsWith('youtube.') ? getDeep(d, f) : d[f]);
+        for (const f of exportFields) {
+          out[f] = asCell(f.startsWith('youtube.') ? getDeep(d, f) : d[f]);
+        }
         return out;
       });
 
@@ -1405,6 +1561,7 @@ exports.getAllEmailContacts = asyncHandler(async (req, res) => {
           const s = String(v ?? '');
           return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
         };
+
         const header = exportFields.map(esc).join(',');
         const lines = rows.map((r) => exportFields.map((f) => esc(r[f])).join(','));
         const csv = [header, ...lines].join('\n');
@@ -1415,15 +1572,23 @@ exports.getAllEmailContacts = asyncHandler(async (req, res) => {
       }
 
       if (exportType === 'xlsx') {
-        const ExcelJS = require('exceljs'); // npm i exceljs
+        const ExcelJS = require('exceljs');
         const wb = new ExcelJS.Workbook();
         const ws = wb.addWorksheet('Contacts');
 
-        ws.columns = exportFields.map((f) => ({ header: f, key: f, width: Math.max(12, f.length + 2) }));
+        ws.columns = exportFields.map((f) => ({
+          header: f,
+          key: f,
+          width: Math.max(12, f.length + 2),
+        }));
+
         ws.addRows(rows);
 
         const buffer = await wb.xlsx.writeBuffer();
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
         res.setHeader('Content-Disposition', `attachment; filename="contacts_${stamp}.xlsx"`);
         return res.status(200).send(Buffer.from(buffer));
       }
@@ -1445,7 +1610,10 @@ exports.getAllEmailContacts = asyncHandler(async (req, res) => {
     });
   } catch (err) {
     console.error('getAllEmailContacts error:', err);
-    return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch contacts.' });
+    return res.status(400).json({
+      status: 'error',
+      message: err?.message || 'Failed to fetch contacts.',
+    });
   }
 });
 
@@ -1456,13 +1624,15 @@ exports.getContactsByUser = asyncHandler(async (req, res) => {
   try {
     const body = req.body || {};
     const userId = (body.userId || '').trim();
-    if (!userId) return res.status(400).json({ status: 'error', message: 'userId is required.' });
+    if (!userId) {
+      return res.status(400).json({ status: 'error', message: 'userId is required.' });
+    }
 
     const page = Math.max(1, parseInt(body.page ?? '1', 10));
     const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? '50', 10)));
     const search = typeof body.search === 'string' ? body.search.trim() : '';
 
-    const query = { userId };
+    const query = validOnlyFilter({ userId });
 
     if (search) {
       const needleRaw = search;
@@ -1483,7 +1653,17 @@ exports.getContactsByUser = asyncHandler(async (req, res) => {
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
-        .select({ email: 1, handle: 1, platform: 1, createdAt: 1, followerCount: 1, country: 1, categories: 1, youtube: 1, _id: 0 })
+        .select({
+          email: 1,
+          handle: 1,
+          platform: 1,
+          createdAt: 1,
+          followerCount: 1,
+          country: 1,
+          categories: 1,
+          youtube: 1,
+          _id: 0,
+        })
         .lean(),
       EmailContact.countDocuments(query),
     ]);
@@ -1498,7 +1678,10 @@ exports.getContactsByUser = asyncHandler(async (req, res) => {
     });
   } catch (err) {
     console.error('getContactsByUser error:', err);
-    return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch user contacts.' });
+    return res.status(400).json({
+      status: 'error',
+      message: err?.message || 'Failed to fetch user contacts.',
+    });
   }
 });
 
@@ -1509,7 +1692,9 @@ exports.getUserSummariesByEmployee = asyncHandler(async (req, res) => {
   try {
     const body = req.body || {};
     const employeeId = (body.employeeId || '').trim();
-    if (!employeeId) return res.status(400).json({ status: 'error', message: 'employeeId is required.' });
+    if (!employeeId) {
+      return res.status(400).json({ status: 'error', message: 'employeeId is required.' });
+    }
 
     const page = Math.max(1, parseInt(body.page ?? '1', 10));
     const limit = Math.min(200, Math.max(1, parseInt(body.limit ?? '50', 10)));
@@ -1532,8 +1717,12 @@ exports.getUserSummariesByEmployee = asyncHandler(async (req, res) => {
     const userIds = users.map((u) => u.userId);
 
     let contactsByUser = new Map();
+
     if (userIds.length) {
-      const contacts = await EmailContact.find({ userId: { $in: userIds } })
+      const contacts = await EmailContact.find({
+        userId: { $in: userIds },
+        isValid: { $ne: false },
+      })
         .select({ userId: 1, email: 1, handle: 1, platform: 1, createdAt: 1, _id: 0 })
         .sort({ createdAt: -1 })
         .lean();
@@ -1541,7 +1730,12 @@ exports.getUserSummariesByEmployee = asyncHandler(async (req, res) => {
       contactsByUser = contacts.reduce((map, c) => {
         const list = map.get(c.userId) || [];
         if (list.length < detailsLimit) {
-          list.push({ email: c.email, handle: c.handle, platform: c.platform, createdAt: c.createdAt });
+          list.push({
+            email: c.email,
+            handle: c.handle,
+            platform: c.platform,
+            createdAt: c.createdAt,
+          });
         }
         map.set(c.userId, list);
         return map;
@@ -1553,9 +1747,10 @@ exports.getUserSummariesByEmployee = asyncHandler(async (req, res) => {
 
       let firstSavedAt = null;
       let lastSavedAt = null;
+
       if (list.length) {
-        lastSavedAt = list[list.length - 1].createdAt || null;
-        firstSavedAt = list[0].createdAt || null;
+        lastSavedAt = list[0].createdAt || null;
+        firstSavedAt = list[list.length - 1].createdAt || null;
       }
 
       return {
@@ -1578,7 +1773,10 @@ exports.getUserSummariesByEmployee = asyncHandler(async (req, res) => {
     });
   } catch (err) {
     console.error('getUserSummariesByEmployee error:', err);
-    return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch employee summaries.' });
+    return res.status(400).json({
+      status: 'error',
+      message: err?.message || 'Failed to fetch employee summaries.',
+    });
   }
 });
 
@@ -1589,9 +1787,10 @@ exports.getEmployeeOverviewAdmin = asyncHandler(async (req, res) => {
   try {
     const body = req.body || {};
 
-    const _escapeRegex = typeof escapeRegex === 'function'
-      ? escapeRegex
-      : (str = '') => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const _escapeRegex =
+      typeof escapeRegex === 'function'
+        ? escapeRegex
+        : (str = '') => String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
     const search = typeof body.search === 'string' ? body.search.trim() : '';
     const page = Math.max(1, parseInt(body.page ?? '1', 10));
@@ -1612,7 +1811,14 @@ exports.getEmployeeOverviewAdmin = asyncHandler(async (req, res) => {
     ]);
 
     if (!employees.length) {
-      return res.json({ page, limit, totalEmployees, hasNext: false, detailsLimit, data: [] });
+      return res.json({
+        page,
+        limit,
+        totalEmployees,
+        hasNext: false,
+        detailsLimit,
+        data: [],
+      });
     }
 
     const employeeIds = employees.map((e) => e.employeeId);
@@ -1629,9 +1835,13 @@ exports.getEmployeeOverviewAdmin = asyncHandler(async (req, res) => {
     }, new Map());
 
     const collectorUserIds = users.map((u) => u.userId);
+
     let contacts = [];
     if (collectorUserIds.length) {
-      contacts = await EmailContact.find({ userId: { $in: collectorUserIds } })
+      contacts = await EmailContact.find({
+        userId: { $in: collectorUserIds },
+        isValid: { $ne: false },
+      })
         .select({
           userId: 1,
           email: 1,
@@ -1680,6 +1890,7 @@ exports.getEmployeeOverviewAdmin = asyncHandler(async (req, res) => {
 
       for (const [uid, list] of grouped.entries()) {
         countsByUser.set(uid, list.length);
+
         const limited = list.slice(0, detailsLimit).map((row) => ({
           email: row.email,
           handle: row.handle,
@@ -1690,6 +1901,7 @@ exports.getEmployeeOverviewAdmin = asyncHandler(async (req, res) => {
           categories: Array.isArray(row.categories) ? row.categories : [],
           youtube: summarizeYouTube(row.youtube),
         }));
+
         contactsByUser.set(uid, limited);
       }
     }
@@ -1705,14 +1917,20 @@ exports.getEmployeeOverviewAdmin = asyncHandler(async (req, res) => {
           dataCollected: contactsByUser.get(u.userId) || [],
         }));
 
-        const collectors = collectorsAll.filter((c) => Array.isArray(c.dataCollected) && c.dataCollected.length > 0);
+        const collectors = collectorsAll.filter(
+          (c) => Array.isArray(c.dataCollected) && c.dataCollected.length > 0
+        );
+
         const contactsTotal = collectors.reduce((a, c) => a + (c.totalCollected || 0), 0);
 
         return {
           employeeName: emp.name,
           employeeId: emp.employeeId,
           employeeEmail: emp.email,
-          teamCounts: { members: collectors.length, contactsTotal },
+          teamCounts: {
+            members: collectors.length,
+            contactsTotal,
+          },
           collectors,
         };
       })
@@ -1729,7 +1947,10 @@ exports.getEmployeeOverviewAdmin = asyncHandler(async (req, res) => {
     });
   } catch (err) {
     console.error('getEmployeeOverviewAdmin error:', err);
-    return res.status(400).json({ status: 'error', message: err?.message || 'Failed to fetch admin employee overview.' });
+    return res.status(400).json({
+      status: 'error',
+      message: err?.message || 'Failed to fetch admin employee overview.',
+    });
   }
 });
 
@@ -1742,12 +1963,17 @@ exports.checkStatus = asyncHandler(async (req, res) => {
     const rawPlatform = (req.body?.platform ?? '').trim();
     const userId = typeof req.body?.userId === 'string' ? req.body.userId.trim() : '';
 
-    if (!rawHandle) return res.status(400).json({ status: 'error', message: 'handle is required' });
-    if (!rawPlatform) return res.status(400).json({ status: 'error', message: 'platform is required' });
+    if (!rawHandle) {
+      return res.status(400).json({ status: 'error', message: 'handle is required' });
+    }
+
+    if (!rawPlatform) {
+      return res.status(400).json({ status: 'error', message: 'platform is required' });
+    }
 
     const handle = (rawHandle.startsWith('@') ? rawHandle : `@${rawHandle}`).toLowerCase();
-
     const HANDLE_RX2 = /^@[A-Za-z0-9._\-]+$/;
+
     if (!HANDLE_RX2.test(handle)) {
       return res.status(400).json({ status: 'error', message: 'Invalid handle format' });
     }
@@ -1768,14 +1994,20 @@ exports.checkStatus = asyncHandler(async (req, res) => {
 
     const platformKey = rawPlatform.toLowerCase();
     const platform = PLATFORM_MAP2.get(platformKey);
+
     if (!platform) {
       return res.status(400).json({
         status: 'error',
-        message: 'Invalid platform. Use: youtube|instagram|twitter|tiktok|facebook|other (or aliases: yt, ig, x, tt, fb)',
+        message:
+          'Invalid platform. Use: youtube|instagram|twitter|tiktok|facebook|other (or aliases: yt, ig, x, tt, fb)',
       });
     }
 
-    const query = { handle, platform, ...(userId ? { userId } : {}) };
+    const query = validOnlyFilter({
+      handle,
+      platform,
+      ...(userId ? { userId } : {}),
+    });
 
     const contact = await EmailContact.findOne(query)
       .select({ email: 1, handle: 1, platform: 1, userId: 1, _id: 0 })
@@ -1789,28 +2021,43 @@ exports.checkStatus = asyncHandler(async (req, res) => {
     });
   } catch (err) {
     console.error('checkStatus error:', err);
-    return res.status(400).json({ status: 'error', message: err?.message || 'Failed to check handle.' });
+    return res.status(400).json({
+      status: 'error',
+      message: err?.message || 'Failed to check handle.',
+    });
   }
 });
 
 // ======================================================
-// POST /email/entries  (getEmailContactsByTask)
+// POST /email/entries
 // ======================================================
 exports.getEmailContactsByTask = asyncHandler(async (req, res) => {
-  const { taskId, page = 1, limit = 20, sortBy = 'createdAt', sortOrder = 'desc', search, platform, userId } =
-    req.body || {};
+  const {
+    taskId,
+    page = 1,
+    limit = 20,
+    sortBy = 'createdAt',
+    sortOrder = 'desc',
+    search,
+    platform,
+    userId,
+  } = req.body || {};
 
   if (!taskId) return res.status(400).json({ error: 'taskId required' });
-  if (!mongoose.Types.ObjectId.isValid(taskId)) return res.status(400).json({ error: 'Invalid taskId format' });
+  if (!mongoose.Types.ObjectId.isValid(taskId)) {
+    return res.status(400).json({ error: 'Invalid taskId format' });
+  }
 
   const taskObjectId = new mongoose.Types.ObjectId(taskId);
 
   const { p, l, skip } = contactParsePageLimit(page, limit);
   const sort = contactParseSort(sortBy, sortOrder);
 
-  const filter = { taskId: taskObjectId };
+  const filter = validOnlyFilter({ taskId: taskObjectId });
 
-  if (userId && typeof userId === 'string') filter.userId = userId.trim();
+  if (userId && typeof userId === 'string') {
+    filter.userId = userId.trim();
+  }
 
   if (platform && typeof platform === 'string') {
     filter.platform = { $regex: `^${escapeRegex(platform.trim())}$`, $options: 'i' };
