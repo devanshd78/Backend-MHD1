@@ -19,7 +19,7 @@ const EmailTask = require('../models/EmailTask');
 const { fetchInfluencerMeta } = require('../services/influencerMeta');
 
 // ======================================================
-// Task Filters: Followers + Country + Category
+// Task Filters: Followers + Country
 // ======================================================
 const MIN_FOLLOWERS = 1000;
 const MAX_FOLLOWERS = 10_000_000;
@@ -101,15 +101,6 @@ function ensureTaskFilters(task, meta) {
         { expected: wantCountries, got }
       );
     }
-  }
-
-  // 3) Category
-  if (!matchesCategory(task.categories, meta?.categories || [])) {
-    throw taskError(
-      'CATEGORY_MISMATCH',
-      "Sorry, your screenshot uploaded doesn't match the task category.",
-      { expected: task.categories, got: meta?.categories || [] }
-    );
   }
 }
 
