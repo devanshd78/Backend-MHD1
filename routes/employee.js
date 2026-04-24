@@ -18,4 +18,6 @@ router.get('/emailtasks', employeeController.listEmailTasks);
 router.post('/taskbyuser', employeeController.taskByUser);
 router.post('/pay', employeeController.deductEmployeeBalanceForTask);
 
+router.get('/likelinks', employeeController.getLikeLinks);
+
 module.exports = router;

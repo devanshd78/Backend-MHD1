@@ -72,4 +72,12 @@ router.post('/emailtasks/list', ctrl.getEmailTaskList);
 router.post('/emailtasks/bytaskId', ctrl.getEmailTaskDetails)
 
 router.get('/countries', ctrl.getCountryList);
+
+router.route('/likelinks')
+  .get(ctrl.getLikeLinkTasks)
+  .post(ctrl.createLikeLinkTask);
+
+
+
+router.post("/likelinks/delete", ctrl.deleteLikeLink);
 module.exports = router;

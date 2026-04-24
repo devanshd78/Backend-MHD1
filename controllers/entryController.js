@@ -1,9 +1,3 @@
-// controllers/entryController.js  (YouTube API verification via Link.title + permalinks)
-// FULL REWRITE (no placeholders)
-// ✅ SAME user resubmits => UPDATE screenshot+entry (no duplicate error)
-// ✅ Reuse checks apply ONLY across DIFFERENT users
-// ✅ requireLike doesn't block verification; if required => liked assumed true
-
 const { v4: uuidv4 } = require("uuid");
 const mongoose = require("mongoose");
 const { Types } = mongoose;
@@ -18,6 +12,8 @@ const Link = require("../models/Link");
 const Employee = require("../models/Employee");
 const User = require("../models/User");
 const Screenshot = require("../models/Screenshot");
+const LikeTask = require("../models/liketask");
+const LikeLink = require("../models/likeLink");
 
 /* ------------------------ utils & helpers ------------------------ */
 const asyncHandler =
@@ -1129,4 +1125,153 @@ exports.listEntriesByLink = asyncHandler(async (req, res) => {
     pages: Math.ceil(total / Number(limit)),
     grandTotal,
   });
+});
+
+
+exports.setLikeTaskStatus = asyncHandler(async (req, res) => {
+  const { taskId, approve, employeeId } = req.body;
+
+  if (!taskId) {
+    return badRequest(res, "VALIDATION_ERROR", "taskId required");
+  }
+
+  const newStatus = Number(approve);
+  if (![0, 1].includes(newStatus)) {
+    return badRequest(res, "VALIDATION_ERROR", "approve must be 0 or 1");
+  }
+
+  const session = await mongoose.startSession();
+
+  try {
+    let responsePayload = null;
+
+    await session.withTransaction(async () => {
+      const task = await LikeTask.findOne({ taskId }).session(session);
+      if (!task) {
+        const err = new Error("Task not found");
+        err.code = "TASK_NOT_FOUND";
+        throw err;
+      }
+
+      if (task.status === newStatus) {
+        responsePayload = {
+          message: newStatus === 1 ? "Already approved" : "Already rejected",
+          task: {
+            taskId: task.taskId,
+            status: task.status,
+            amount: Number(task.amount || 0),
+          },
+        };
+        return;
+      }
+
+      const user = await User.findOne({ userId: task.userId })
+        .select("userId name worksUnder")
+        .session(session);
+
+      if (!user) {
+        const err = new Error("User not found");
+        err.code = "USER_NOT_FOUND";
+        throw err;
+      }
+
+      const targetEmployeeId = String(employeeId || user.worksUnder || "").trim();
+      if (!targetEmployeeId) {
+        const err = new Error("Employee not found for this task");
+        err.code = "EMPLOYEE_NOT_FOUND";
+        throw err;
+      }
+
+      if (employeeId && String(user.worksUnder || "") !== String(employeeId)) {
+        const err = new Error("This task does not belong to the given employee");
+        err.code = "EMPLOYEE_MISMATCH";
+        throw err;
+      }
+
+      let taskAmount = Number(task.amount || 0);
+
+      if (!Number.isFinite(taskAmount) || taskAmount <= 0) {
+        const likeLink = await LikeLink.findById(task.likeLinkId)
+          .select("amount")
+          .lean();
+
+        taskAmount = Number(likeLink?.amount || 0);
+        task.amount = taskAmount;
+      }
+
+      if (!Number.isFinite(taskAmount) || taskAmount <= 0) {
+        const err = new Error("Invalid task amount");
+        err.code = "INVALID_TASK_AMOUNT";
+        throw err;
+      }
+
+      let newBalance = null;
+
+      // deduct only when approving
+      if (newStatus === 1) {
+        const employee = await Employee.findOne({ employeeId: targetEmployeeId }).session(session);
+
+        if (!employee) {
+          const err = new Error("Employee not found");
+          err.code = "EMPLOYEE_NOT_FOUND";
+          throw err;
+        }
+
+        if (Number(employee.balance || 0) < taskAmount) {
+          const err = new Error("Insufficient balance");
+          err.code = "INSUFFICIENT_BALANCE";
+          throw err;
+        }
+
+        employee.balance = Number(employee.balance || 0) - taskAmount;
+        await employee.save({ session });
+
+        newBalance = employee.balance;
+      }
+
+      task.status = newStatus;
+      await task.save({ session });
+
+      responsePayload = {
+        message: newStatus === 1 ? "Like task approved" : "Like task rejected",
+        task: {
+          taskId: task.taskId,
+          status: task.status,
+          amount: Number(task.amount || 0),
+          userId: task.userId,
+          likeLinkId: String(task.likeLinkId),
+        },
+        ...(newStatus === 1 ? { amountDeducted: taskAmount, newBalance } : {}),
+      };
+    });
+
+    return res.json(responsePayload);
+  } catch (err) {
+    if (err.code === "TASK_NOT_FOUND") {
+      return notFound(res, "TASK_NOT_FOUND", "Task not found");
+    }
+    if (err.code === "USER_NOT_FOUND") {
+      return notFound(res, "USER_NOT_FOUND", "User not found");
+    }
+    if (err.code === "EMPLOYEE_NOT_FOUND") {
+      return notFound(res, "EMPLOYEE_NOT_FOUND", "Employee not found");
+    }
+    if (err.code === "EMPLOYEE_MISMATCH") {
+      return badRequest(res, "EMPLOYEE_MISMATCH", "This task does not belong to the given employee");
+    }
+    if (err.code === "INVALID_TASK_AMOUNT") {
+      return badRequest(res, "INVALID_TASK_AMOUNT", "Invalid task amount");
+    }
+    if (err.code === "INSUFFICIENT_BALANCE") {
+      return badRequest(
+        res,
+        "INSUFFICIENT_BALANCE",
+        "Insufficient balance. Please add funds before approval."
+      );
+    }
+
+    throw err;
+  } finally {
+    session.endSession();
+  }
 });

@@ -13,6 +13,7 @@ const EmailTask = require('../models/EmailTask');
 const EmailContact = require('../models/email');
 const BalanceHistory = require('../models/BalanceHistory');
 const Payout = require('../models/Payout');
+const LikeLink = require('../models/likeLink');
 
 const countryList = require('../services/countryList');
 
@@ -490,4 +491,29 @@ exports.deductEmployeeBalanceForTask = asyncHandler(async (req, res) => {
     }
     throw e;
   }
+});
+
+exports.getLikeLinks = asyncHandler(async (_req, res) => {
+  const likeLinks = await LikeLink.find()
+    .select('title videoUrl createdBy createdAt target amount expireIn requireLike')
+    .sort({ createdAt: -1 })
+    .lean();
+
+  if (!likeLinks.length) return res.json([]);
+
+  const now = new Date();
+
+  const rows = likeLinks.map((item, idx) => {
+    const expireAt = new Date(item.createdAt);
+    expireAt.setHours(expireAt.getHours() + Number(item.expireIn || 0));
+
+    return {
+      ...item,
+      expireAt,
+      status: now < expireAt ? 'active' : 'expired',
+      isLatest: idx === 0,
+    };
+  });
+
+  res.json(rows);
 });

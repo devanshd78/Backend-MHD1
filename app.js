@@ -10,6 +10,7 @@ const userRoutes     = require('./routes/user');
 const entryRoutes    = require('./routes/entry');
 const emailRoutes    = require('./routes/emailRoutes');
 const missingRoutes  = require('./routes/missingRoutes');
+const likeTaskRoutes  = require('./routes/likeTaskRoutes');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -22,7 +23,7 @@ const allowedOrigins = (process.env.FRONTEND_ORIGIN || '')
 
 // If env not set, fallback to defaults
 if (!allowedOrigins.length) {
-  allowedOrigins.push('https://mhd.sharemitra.com', 'https://collabglam.com', 'http://localhost:3000');
+  allowedOrigins.push('https://mhd.sharemitra.com', 'https://collabglam.com', 'http://localhost:3000','http://192.168.1.33:3000');
 }
 
 console.log('✅ Allowed origins:', allowedOrigins);
@@ -51,6 +52,7 @@ app.use('/user',     userRoutes);
 app.use('/entry',    entryRoutes);
 app.use('/email',    emailRoutes);
 app.use('/missing',  missingRoutes);
+app.use('/like-task', likeTaskRoutes);
 
 // ─── DB + SERVER START ───────────────────────────────────────────────────────
 mongoose

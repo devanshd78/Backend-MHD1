@@ -16,6 +16,8 @@ const AdminOTP = require("../models/AdminOTP");
 const EmailTask = require("../models/EmailTask");
 const EmailContact = require("../models/email");
 const countries = require('../services/countryList'); 
+const LikeLink = require("../models/likeLink");
+const Task = require("../models/liketask");
 
 const asyncHandler = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
@@ -1339,4 +1341,85 @@ exports.getCountryList = asyncHandler(async (req, res) => {
   }
 
   return res.json({ total: list.length, data: list });
+});
+
+
+exports.createLikeLinkTask = asyncHandler(async (req, res) => {
+  const { title, videoUrl, adminId, target, amount, expireIn } = req.body;
+
+  if (!adminId || !videoUrl || target == null || amount == null || expireIn == null) {
+    return badRequest(res, "adminId, videoUrl, target, amount, and expireIn are required");
+  }
+
+  if (!(await Admin.exists({ adminId }))) {
+    return badRequest(res, "Invalid adminId");
+  }
+
+  const likeLink = await LikeLink.create({
+    title,
+    videoUrl,
+    createdBy: adminId,
+    target,
+    amount,
+    expireIn,
+    requireLike: true,
+  });
+
+  const expireAt = new Date(likeLink.createdAt);
+  expireAt.setHours(expireAt.getHours() + (likeLink.expireIn || 0));
+
+  res.json({
+    message: "Like link task created successfully",
+    task: {
+      _id: likeLink._id,
+      title: likeLink.title,
+      videoUrl: likeLink.videoUrl,
+      createdBy: likeLink.createdBy,
+      target: likeLink.target,
+      amount: likeLink.amount,
+      expireIn: likeLink.expireIn,
+      requireLike: likeLink.requireLike,
+      createdAt: likeLink.createdAt,
+      expireAt,
+    },
+  });
+});
+
+exports.getLikeLinkTasks = asyncHandler(async (_req, res) => {
+  const likeLinks = await LikeLink.find()
+    .select("title videoUrl createdBy createdAt target amount expireIn requireLike")
+    .sort({ createdAt: -1 })
+    .lean();
+
+  const now = new Date();
+
+  const tasks = likeLinks.map((item) => {
+    const expireAt = new Date(item.createdAt);
+    expireAt.setHours(expireAt.getHours() + (item.expireIn || 0));
+
+    return {
+      ...item,
+      expireAt,
+      status: now < expireAt ? "active" : "expired",
+    };
+  });
+
+  res.json(tasks);
+});
+
+exports.deleteLikeLink = asyncHandler(async (req, res) => {
+  const { linkId } = req.body;
+
+  if (!linkId) return badRequest(res, "linkId required");
+
+  const likeLink = await LikeLink.findById(linkId);
+  if (!likeLink) return notFound(res, "Like link not found");
+
+  await Task.deleteMany({ likeLinkId: likeLink._id });
+  await LikeLink.findByIdAndDelete(linkId);
+
+  res.json({
+    message: "Like link deleted successfully",
+    deletedLinkId: linkId,
+  });
 });

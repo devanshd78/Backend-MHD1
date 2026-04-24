@@ -21,4 +21,7 @@ router.post('/updateStatus', entry.setEntryStatus);
 router.get('/getEntry/:entryId', entry.getEntryById);
 router.post('/listByLink', entry.listEntriesByLink);
 
+
+router.post("/updateLikeTaskStatus", entry.setLikeTaskStatus);
+
 module.exports = router;
