@@ -184,17 +184,130 @@ function meanRawRegion(raw, info, relBox) {
     return count ? sum / count : 0;
 }
 
-async function buildLikeChipCandidates(buffer) {
+function isPortraitMeta(meta) {
+    const w = Number(meta?.width || 0);
+    const h = Number(meta?.height || 0);
+    return w > 0 && h > 0 && h / w >= 1.45;
+}
+
+async function buildPhoneLikeIconCandidates(buffer) {
+    // Tuned for the mobile screenshots you uploaded.
+    // These crop the actual thumbs-up icon area directly.
+    return Promise.all([
+        cropRelative(buffer, { left: 0.381, top: 0.387, width: 0.110, height: 0.051 }),
+        cropRelative(buffer, { left: 0.386, top: 0.389, width: 0.102, height: 0.047 }),
+        cropRelative(buffer, { left: 0.389, top: 0.391, width: 0.098, height: 0.045 }),
+        cropRelative(buffer, { left: 0.377, top: 0.384, width: 0.114, height: 0.053 }),
+        cropRelative(buffer, { left: 0.395, top: 0.392, width: 0.094, height: 0.043 }),
+    ]);
+}
+
+async function buildDesktopLikeChipCandidates(buffer) {
+    // Preserves your desktop / wider screenshot flow.
     return Promise.all([
         cropRelative(buffer, { left: 0.02, top: 0.68, width: 0.28, height: 0.09 }),
         cropRelative(buffer, { left: 0.02, top: 0.70, width: 0.26, height: 0.085 }),
         cropRelative(buffer, { left: 0.02, top: 0.72, width: 0.24, height: 0.08 }),
         cropRelative(buffer, { left: 0.02, top: 0.725, width: 0.22, height: 0.08 }),
+        cropRelative(buffer, { left: 0.40, top: 0.38, width: 0.24, height: 0.10 }),
     ]);
 }
 
-async function scoreLikeChip(chipBuffer) {
-    // Crop only the thumbs-up icon area from the first chip
+async function buildLikeChipCandidates(buffer) {
+    const meta = await sharp(buffer).metadata();
+    return isPortraitMeta(meta)
+        ? buildPhoneLikeIconCandidates(buffer)
+        : buildDesktopLikeChipCandidates(buffer);
+}
+
+function getCornerBackgroundMean(gray) {
+    const corners = [
+        ...gray.slice(0, 8).flatMap((row) => row.slice(0, 8)),
+        ...gray.slice(0, 8).flatMap((row) => row.slice(-8)),
+        ...gray.slice(-8).flatMap((row) => row.slice(0, 8)),
+        ...gray.slice(-8).flatMap((row) => row.slice(-8)),
+    ];
+    return corners.reduce((a, b) => a + b, 0) / Math.max(corners.length, 1);
+}
+
+async function scorePhoneLikeIcon(chipBuffer) {
+    // Normalize icon crop to fixed size for stable scoring.
+    const { data, info } = await sharp(chipBuffer)
+        .resize(64, 64, { fit: "fill" })
+        .greyscale()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+    const width = info.width;
+    const height = info.height;
+    const channels = info.channels;
+
+    const gray = [];
+    for (let y = 0; y < height; y++) {
+        const row = [];
+        for (let x = 0; x < width; x++) {
+            row.push(data[(y * width + x) * channels]);
+        }
+        gray.push(row);
+    }
+
+    const bg = getCornerBackgroundMean(gray);
+    const threshold = 24;
+
+    let totalFg = 0;
+    let palmFg = 0;
+    let tipFg = 0;
+
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const isFg = Math.abs(gray[y][x] - bg) > threshold ? 1 : 0;
+            totalFg += isFg;
+
+            // Palm region
+            if (x >= 22 && x < 46 && y >= 20 && y < 44) {
+                palmFg += isFg;
+            }
+
+            // Tip / upper thumb region
+            if (x >= 30 && x < 52 && y >= 10 && y < 24) {
+                tipFg += isFg;
+            }
+        }
+    }
+
+    const score = totalFg + palmFg * 1.3 + tipFg * 0.4;
+
+    if (score >= 570 && totalFg >= 330 && palmFg >= 180) {
+        return {
+            state: "liked",
+            liked: true,
+            confidence: Math.min(0.99, 0.84 + Math.min((score - 570) / 220, 0.10)),
+            reason: "Filled thumbs-up icon detected",
+            debug: { bg, totalFg, palmFg, tipFg, score },
+        };
+    }
+
+    if (score <= 545 && totalFg <= 315 && palmFg <= 172) {
+        return {
+            state: "not_liked",
+            liked: false,
+            confidence: Math.min(0.99, 0.84 + Math.min((545 - score) / 180, 0.10)),
+            reason: "Outlined thumbs-up icon detected",
+            debug: { bg, totalFg, palmFg, tipFg, score },
+        };
+    }
+
+    return {
+        state: "unclear",
+        liked: false,
+        confidence: 0.35,
+        reason: "Thumb icon state is inconclusive",
+        debug: { bg, totalFg, palmFg, tipFg, score },
+    };
+}
+
+async function scoreDesktopLikeChip(chipBuffer) {
+    // Keeps your original desktop-style logic.
     const iconBuffer = await sharp(chipBuffer)
         .extract({
             left: 0,
@@ -207,10 +320,6 @@ async function scoreLikeChip(chipBuffer) {
 
     const { data, info } = await toGrayRaw(iconBuffer);
 
-    // Relative sample boxes inside the icon crop
-    // bg = button background near icon
-    // stroke = thumb border/stroke area
-    // palm = inner palm area that becomes filled when liked
     const bg = meanRawRegion(data, info, {
         left: 0.02,
         top: 0.58,
@@ -236,7 +345,8 @@ async function scoreLikeChip(chipBuffer) {
     const palmDelta = palm - bg;
     const strokeContrast = Math.abs(strokeDelta);
     const sameDirection =
-        Math.sign(strokeDelta || 0) === Math.sign(palmDelta || 0) && Math.sign(strokeDelta || 0) !== 0;
+        Math.sign(strokeDelta || 0) === Math.sign(palmDelta || 0) &&
+        Math.sign(strokeDelta || 0) !== 0;
 
     if (strokeContrast < 20) {
         return {
@@ -250,10 +360,6 @@ async function scoreLikeChip(chipBuffer) {
 
     const fillRatio = Math.abs(palmDelta) / Math.max(strokeContrast, 1);
 
-    // Works for both themes:
-    // dark mode: icon is brighter than chip background
-    // light mode: icon is darker than chip background
-    // In liked state, palm follows the icon stroke direction strongly.
     if (sameDirection && fillRatio >= 0.42) {
         return {
             state: "liked",
@@ -283,9 +389,12 @@ async function scoreLikeChip(chipBuffer) {
     };
 }
 
-async function verifyYoutubeLikeWithVisionFallback(fullBuffer, bestChipBuffer) {
+async function verifyYoutubeLikeWithVisionFallback(fullBuffer, candidateChips, isPortrait) {
     const fullBase64 = fullBuffer.toString("base64");
-    const chipBase64 = bestChipBuffer.toString("base64");
+    const chipPayload = (candidateChips || []).slice(0, 4).map((b) => ({
+        type: "image_url",
+        image_url: { url: `data:image/png;base64,${b.toString("base64")}` },
+    }));
 
     const response = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -297,15 +406,13 @@ async function verifyYoutubeLikeWithVisionFallback(fullBuffer, bestChipBuffer) {
 You are verifying whether a YouTube Like button is selected.
 
 Rules:
-1. Focus ONLY on the first action button (thumbs-up) below the channel area.
-2. Selected / liked:
-   - the thumb's inner palm area is FILLED
-   - it visually matches the icon stroke color
-3. Not selected / not liked:
-   - the thumb is OUTLINE only
-   - the palm area blends into the chip background
-4. Works for both dark mode and light mode.
-5. Ignore dislike, share, ask, save, ads, summarize, overlays, and video content.
+1. Focus ONLY on the thumbs-up button.
+2. "liked" means the thumb icon is filled/solid.
+3. "not_liked" means the thumb icon is outlined/hollow.
+4. This must work for both dark mode and light mode.
+5. For mobile screenshots, decide mainly from the cropped thumb images.
+6. Ignore Subscribe, Comments count, Shorts cards, Share, More, overlays, ads, and video content.
+7. If uncertain, return "unclear".
 
 Return only JSON:
 {
@@ -313,14 +420,16 @@ Return only JSON:
   "confidence": 0.0,
   "reason": "short reason"
 }
-        `.trim(),
+                `.trim(),
             },
             {
                 role: "user",
                 content: [
                     {
                         type: "text",
-                        text: "Image 1 is the full screenshot. Image 2 is the cropped first like button chip. Decide whether the Like button is selected.",
+                        text: isPortrait
+                            ? "These are phone screenshots. Decide whether the mobile YouTube Like button is selected."
+                            : "These are desktop or wide screenshots. Decide whether the YouTube Like button is selected.",
                     },
                     {
                         type: "image_url",
@@ -328,12 +437,7 @@ Return only JSON:
                             url: `data:image/png;base64,${fullBase64}`,
                         },
                     },
-                    {
-                        type: "image_url",
-                        image_url: {
-                            url: `data:image/png;base64,${chipBase64}`,
-                        },
-                    },
+                    ...chipPayload,
                 ],
             },
         ],
@@ -347,7 +451,7 @@ Return only JSON:
 
     try {
         parsed = JSON.parse(response.choices?.[0]?.message?.content || "{}");
-    } catch (_) { }
+    } catch (_) {}
 
     const state = ["liked", "not_liked", "unclear"].includes(parsed.state)
         ? parsed.state
@@ -362,28 +466,65 @@ Return only JSON:
 }
 
 async function verifyYoutubeLikeFromScreenshot(buffer) {
+    const meta = await sharp(buffer).metadata();
+    const isPortrait = isPortraitMeta(meta);
     const candidates = await buildLikeChipCandidates(buffer);
 
     const scored = [];
     for (const chip of candidates) {
-        const result = await scoreLikeChip(chip);
+        const result = isPortrait
+            ? await scorePhoneLikeIcon(chip)
+            : await scoreDesktopLikeChip(chip);
         scored.push({ chip, result });
     }
 
-    // Pick the crop with the strongest icon contrast, not just the highest label confidence
-    const best = scored.sort((a, b) => {
+    if (isPortrait) {
+        scored.sort((a, b) => (b.result?.confidence || 0) - (a.result?.confidence || 0));
+        const best = scored[0];
+
+        // For phone screenshots trust local icon reading first.
+        if (best && (best.result.state === "liked" || best.result.state === "not_liked") && best.result.confidence >= 0.82) {
+            return best.result;
+        }
+
+        const fallback = await verifyYoutubeLikeWithVisionFallback(
+            buffer,
+            candidates.slice(0, 4),
+            true
+        );
+
+        if (fallback.state !== "unclear" && fallback.confidence >= 0.92) {
+            return fallback;
+        }
+
+        return {
+            state: "unclear",
+            liked: false,
+            confidence: 0,
+            reason: best?.result?.reason || fallback?.reason || "Like state could not be verified",
+        };
+    }
+
+    // Desktop / wide screenshot logic
+    scored.sort((a, b) => {
         const ac = a.result?.debug?.strokeContrast || 0;
         const bc = b.result?.debug?.strokeContrast || 0;
         return bc - ac;
-    })[0];
+    });
+
+    const best = scored[0];
 
     if (best && best.result.state !== "unclear" && best.result.confidence >= 0.7) {
         return best.result;
     }
 
-    const fallback = await verifyYoutubeLikeWithVisionFallback(buffer, best.chip);
+    const fallback = await verifyYoutubeLikeWithVisionFallback(
+        buffer,
+        candidates.slice(0, 4),
+        false
+    );
 
-    if (fallback.state !== "unclear") {
+    if (fallback.state !== "unclear" && fallback.confidence >= 0.88) {
         return fallback;
     }
 
@@ -391,7 +532,7 @@ async function verifyYoutubeLikeFromScreenshot(buffer) {
         state: "unclear",
         liked: false,
         confidence: 0,
-        reason: best?.result?.reason || "Like state could not be verified",
+        reason: best?.result?.reason || fallback?.reason || "Like state could not be verified",
     };
 }
 
