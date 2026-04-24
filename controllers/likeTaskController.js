@@ -451,7 +451,7 @@ Return only JSON:
 
     try {
         parsed = JSON.parse(response.choices?.[0]?.message?.content || "{}");
-    } catch (_) {}
+    } catch (_) { }
 
     const state = ["liked", "not_liked", "unclear"].includes(parsed.state)
         ? parsed.state
@@ -644,6 +644,13 @@ function buildYoutubeOpenUrl(videoUrl) {
     )}&service=youtube`;
 }
 
+function buildYoutubeBrowserUrl(videoUrl) {
+    const target = new URL(videoUrl);
+    target.hostname = "m.youtube.com";
+    target.searchParams.set("authuser", "0");
+    return target.toString();
+}
+
 exports.googleCallback = asyncHandler(async (req, res) => {
     const { code, state } = req.query;
     if (!code || !state) return sendPopupError(res, "Missing Google callback data");
@@ -730,8 +737,9 @@ exports.googleCallback = asyncHandler(async (req, res) => {
 
     await task.save();
 
+
     const frontendOrigin = new URL(process.env.FRONTEND_URL).origin;
-    const youtubeOpenUrl = buildYoutubeOpenUrl(likeLink.videoUrl);
+    const youtubeBrowserUrl = buildYoutubeBrowserUrl(likeLink.videoUrl);
 
     res.set("Content-Type", "text/html");
     res.send(`
@@ -739,10 +747,24 @@ exports.googleCallback = asyncHandler(async (req, res) => {
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>Redirecting...</title>
+    <title>Continue to YouTube</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
   </head>
-  <body style="font-family: Arial, sans-serif; padding: 24px;">
-    <p>Authentication successful. Redirecting to YouTube with the selected Google account...</p>
+  <body style="font-family: Arial, sans-serif; padding: 24px; line-height: 1.5;">
+    <h3>Google authentication successful</h3>
+    <p>Authenticated account:</p>
+    <p><strong>${escapeHtml(email)}</strong></p>
+    <p>Continue to YouTube in the browser with this account.</p>
+
+    <button id="continueBtn" style="padding:12px 16px; font-size:16px; border-radius:8px; border:0; background:#111; color:#fff;">
+      Continue in browser
+    </button>
+
+    <p style="margin-top:16px; font-size:14px; color:#555;">
+      If your phone opens the YouTube app, that app may use the account already signed into the app.
+      For exact-account verification, continue in the browser.
+    </p>
+
     <script>
       (function () {
         var payload = {
@@ -759,7 +781,9 @@ exports.googleCallback = asyncHandler(async (req, res) => {
           }
         } catch (e) {}
 
-        window.location.replace(${JSON.stringify(youtubeOpenUrl)});
+        document.getElementById("continueBtn").addEventListener("click", function () {
+          window.location.href = ${JSON.stringify(youtubeBrowserUrl)};
+        });
       })();
     </script>
   </body>
