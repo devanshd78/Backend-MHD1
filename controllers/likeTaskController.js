@@ -451,7 +451,7 @@ Return only JSON:
 
     try {
         parsed = JSON.parse(response.choices?.[0]?.message?.content || "{}");
-    } catch (_) {}
+    } catch (_) { }
 
     const state = ["liked", "not_liked", "unclear"].includes(parsed.state)
         ? parsed.state
@@ -634,14 +634,11 @@ exports.startGoogleAuth = asyncHandler(async (req, res) => {
 });
 
 function buildYoutubeOpenUrl(videoUrl) {
-    const target = new URL(videoUrl);
-
-    // Helps Google/YouTube stay on the account flow in the same popup
-    target.searchParams.set("authuser", "0");
-
-    return `https://accounts.google.com/AccountChooser?continue=${encodeURIComponent(
-        target.toString()
-    )}&service=youtube`;
+    try {
+        return new URL(videoUrl).toString();
+    } catch (err) {
+        return String(videoUrl || "");
+    }
 }
 
 exports.googleCallback = asyncHandler(async (req, res) => {
