@@ -17,7 +17,7 @@ const EmailTask = require("../models/EmailTask");
 const EmailContact = require("../models/email");
 const countries = require('../services/countryList'); 
 const LikeLink = require("../models/likeLink");
-const Task = require("../models/liketask");
+const Task = require("../models/likeTask");
 
 const asyncHandler = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
