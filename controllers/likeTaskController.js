@@ -5,7 +5,7 @@ const mongoose = require("mongoose");
 const { google } = require("googleapis");
 const OpenAI = require("openai");
 
-const Task = require("../models/liketask");
+const Task = require("../models/likeTask");
 const LikeLink = require("../models/likeLink");
 const User = require("../models/User");
 
