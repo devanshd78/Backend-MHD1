@@ -12,7 +12,7 @@ const Link = require("../models/Link");
 const Employee = require("../models/Employee");
 const User = require("../models/User");
 const Screenshot = require("../models/Screenshot");
-const LikeTask = require("../models/liketask");
+const LikeTask = require("../models/likeTask");
 const LikeLink = require("../models/likeLink");
 
 /* ------------------------ utils & helpers ------------------------ */
