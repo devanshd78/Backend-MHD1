@@ -712,10 +712,31 @@ exports.googleCallback = asyncHandler(async (req, res) => {
         return sendPopupError(res, "This email already completed this task");
     }
 
-    const allUniqueEmails = new Set(task.emailSlots.map((x) => x.email));
-    const emailAlreadyExists = allUniqueEmails.has(email);
+    const nowMs = Date.now();
 
-    if (!emailAlreadyExists && task.emailSlots.length >= task.maxEmailsAllowed) {
+    // Remove expired and unverified slots before checking the email limit
+    task.emailSlots = (task.emailSlots || []).filter((slot) => {
+        const slotEmail = String(slot.email || "").trim().toLowerCase();
+        const isVerified = slot.verified === true;
+        const isActivePending =
+            !isVerified &&
+            slot.authExpiresAt &&
+            new Date(slot.authExpiresAt).getTime() > nowMs;
+
+        // keep:
+        // 1. verified slots
+        // 2. currently active pending slots
+        // 3. current same email slot if user is retrying same email
+        return isVerified || isActivePending || slotEmail === email;
+    });
+
+    const usedEmails = new Set(
+        task.emailSlots.map((x) => String(x.email || "").trim().toLowerCase()).filter(Boolean)
+    );
+
+    const emailAlreadyExists = usedEmails.has(email);
+
+    if (!emailAlreadyExists && usedEmails.size >= task.maxEmailsAllowed) {
         return sendPopupError(res, "Only 5 different emails are allowed for this task");
     }
 
