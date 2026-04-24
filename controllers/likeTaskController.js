@@ -633,10 +633,36 @@ exports.startGoogleAuth = asyncHandler(async (req, res) => {
     res.redirect(authUrl);
 });
 
-function buildYoutubeOpenUrl(videoUrl) {
+/**
+ * Constructs a URL that forces YouTube to open with the 
+ * specific email address used during Google Auth.
+ */
+function buildYoutubeOpenUrl(videoUrl, email) {
     try {
-        return new URL(videoUrl).toString();
-    } catch (err) {
+        let targetUrl = new URL(videoUrl);
+
+        // 1. FIX SHORTLINKS: Google strictly rejects 'youtu.be' in redirects.
+        // We must convert it to a full www.youtube.com link.
+        if (targetUrl.hostname === "youtu.be") {
+            const videoId = targetUrl.pathname.slice(1); // gets 'XYZ' from '/XYZ'
+            targetUrl = new URL(`https://www.youtube.com/watch?v=${videoId}`);
+        }
+
+        // Ensure it's using https and www
+        if (targetUrl.hostname === "youtube.com") {
+            targetUrl.hostname = "www.youtube.com";
+        }
+
+        // 2. Build the AccountChooser URL safely
+        const chooserUrl = new URL("https://accounts.google.com/AccountChooser");
+
+        // Setting 'continue' first, then 'Email'
+        chooserUrl.searchParams.set("continue", targetUrl.toString());
+        chooserUrl.searchParams.set("Email", email.trim().toLowerCase());
+
+        return chooserUrl.toString();
+    } catch (e) {
+        // Ultimate fallback if parsing completely fails
         return String(videoUrl || "");
     }
 }
@@ -728,7 +754,7 @@ exports.googleCallback = asyncHandler(async (req, res) => {
     await task.save();
 
     const frontendOrigin = new URL(process.env.FRONTEND_URL).origin;
-    const youtubeOpenUrl = buildYoutubeOpenUrl(likeLink.videoUrl);
+    const youtubeOpenUrl = buildYoutubeOpenUrl(likeLink.videoUrl, email);
 
     res.set("Content-Type", "text/html");
     res.send(`
@@ -739,7 +765,7 @@ exports.googleCallback = asyncHandler(async (req, res) => {
     <title>Redirecting...</title>
   </head>
   <body style="font-family: Arial, sans-serif; padding: 24px;">
-    <p>Authentication successful. Redirecting to YouTube with the selected Google account...</p>
+    <p>Authentication successful. Please select your authenticated account to continue to YouTube...</p>
     <script>
       (function () {
         var payload = {
