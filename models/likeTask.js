@@ -68,7 +68,9 @@ TaskSchema.pre("validate", async function (next) {
     }
 
     if (this.emailSlots.length > this.maxEmailsAllowed) {
-      return next(new Error(`Only ${this.maxEmailsAllowed} different emails are allowed per task`));
+      return next(
+        new Error(`Only ${this.maxEmailsAllowed} different emails are allowed per task`)
+      );
     }
 
     const normalized = this.emailSlots.map((x) =>
@@ -80,10 +82,14 @@ TaskSchema.pre("validate", async function (next) {
     }
 
     if (this.likeLinkId) {
-      const likeLink = await LikeLink.findById(this.likeLinkId).select("amount").lean();
+      const likeLink = await LikeLink.findById(this.likeLinkId)
+        .select("amount")
+        .lean();
+
       if (!likeLink) {
         return next(new Error("Invalid likeLinkId"));
       }
+
       this.amount = Number(likeLink.amount || 0);
     }
 
@@ -93,4 +99,6 @@ TaskSchema.pre("validate", async function (next) {
   }
 });
 
-module.exports = mongoose.model("LikeUploadTask", TaskSchema);
+module.exports =
+  mongoose.models.LikeUploadTask ||
+  mongoose.model("LikeUploadTask", TaskSchema);
