@@ -14,7 +14,7 @@ const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, ne
 const badRequest = (res, msg) => res.status(400).json({ error: msg });
 const notFound = (res, msg) => res.status(404).json({ error: msg });
 
-const AUTH_WINDOW_SECONDS = 300;
+const AUTH_WINDOW_SECONDS = 120;
 const AUTH_WINDOW_MS = AUTH_WINDOW_SECONDS * 1000;
 
 const upload = multer({
@@ -451,7 +451,7 @@ Return only JSON:
 
     try {
         parsed = JSON.parse(response.choices?.[0]?.message?.content || "{}");
-    } catch (_) { }
+    } catch (_) {}
 
     const state = ["liked", "not_liked", "unclear"].includes(parsed.state)
         ? parsed.state
@@ -644,13 +644,6 @@ function buildYoutubeOpenUrl(videoUrl) {
     )}&service=youtube`;
 }
 
-function buildYoutubeBrowserUrl(videoUrl) {
-    const target = new URL(videoUrl);
-    target.hostname = "m.youtube.com";
-    target.searchParams.set("authuser", "0");
-    return target.toString();
-}
-
 exports.googleCallback = asyncHandler(async (req, res) => {
     const { code, state } = req.query;
     if (!code || !state) return sendPopupError(res, "Missing Google callback data");
@@ -737,9 +730,8 @@ exports.googleCallback = asyncHandler(async (req, res) => {
 
     await task.save();
 
-
     const frontendOrigin = new URL(process.env.FRONTEND_URL).origin;
-    const youtubeBrowserUrl = buildYoutubeBrowserUrl(likeLink.videoUrl);
+    const youtubeOpenUrl = buildYoutubeOpenUrl(likeLink.videoUrl);
 
     res.set("Content-Type", "text/html");
     res.send(`
@@ -747,24 +739,10 @@ exports.googleCallback = asyncHandler(async (req, res) => {
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>Continue to YouTube</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Redirecting...</title>
   </head>
-  <body style="font-family: Arial, sans-serif; padding: 24px; line-height: 1.5;">
-    <h3>Google authentication successful</h3>
-    <p>Authenticated account:</p>
-    <p><strong>${escapeHtml(email)}</strong></p>
-    <p>Continue to YouTube in the browser with this account.</p>
-
-    <button id="continueBtn" style="padding:12px 16px; font-size:16px; border-radius:8px; border:0; background:#111; color:#fff;">
-      Continue in browser
-    </button>
-
-    <p style="margin-top:16px; font-size:14px; color:#555;">
-      If your phone opens the YouTube app, that app may use the account already signed into the app.
-      For exact-account verification, continue in the browser.
-    </p>
-
+  <body style="font-family: Arial, sans-serif; padding: 24px;">
+    <p>Authentication successful. Redirecting to YouTube with the selected Google account...</p>
     <script>
       (function () {
         var payload = {
@@ -781,9 +759,7 @@ exports.googleCallback = asyncHandler(async (req, res) => {
           }
         } catch (e) {}
 
-        document.getElementById("continueBtn").addEventListener("click", function () {
-          window.location.href = ${JSON.stringify(youtubeBrowserUrl)};
-        });
+        window.location.replace(${JSON.stringify(youtubeOpenUrl)});
       })();
     </script>
   </body>
