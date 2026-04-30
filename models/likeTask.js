@@ -4,17 +4,89 @@ const LikeLink = require("./likeLink");
 
 const EmailSlotSchema = new mongoose.Schema(
   {
-    email: { type: String, required: true, lowercase: true, trim: true },
-    googleSub: { type: String, required: true, trim: true },
+    email: {
+      type: String,
+      required: true,
+      lowercase: true,
+      trim: true,
+    },
 
-    authAt: { type: Date, required: true },
-    authExpiresAt: { type: Date, required: true },
+    googleSub: {
+      type: String,
+      required: true,
+      trim: true,
+    },
 
-    screenshotHash: { type: String, default: null },
-    submittedAt: { type: Date, default: null },
+    authAt: {
+      type: Date,
+      required: true,
+    },
 
-    verified: { type: Boolean, default: false },
-    verificationReason: { type: String, default: "" },
+    authExpiresAt: {
+      type: Date,
+      required: true,
+    },
+
+    screenshotHash: {
+      type: String,
+      default: null,
+    },
+
+    submittedAt: {
+      type: Date,
+      default: null,
+    },
+
+    verified: {
+      type: Boolean,
+      default: false,
+    },
+
+    verificationReason: {
+      type: String,
+      default: "",
+    },
+
+    verificationMessage: {
+      type: String,
+      default: "",
+    },
+
+    verifiedBy: {
+      type: String,
+      default: "",
+    },
+
+    videoId: {
+      type: String,
+      default: "",
+    },
+
+    youtubeRating: {
+      type: String,
+      enum: ["like", "dislike", "none", "unspecified", ""],
+      default: "",
+    },
+
+    youtubeApiResponse: {
+      type: Object,
+      default: null,
+    },
+
+    accessToken: {
+      type: String,
+      default: "",
+    },
+
+    refreshToken: {
+      type: String,
+      default: "",
+    },
+
+    tokenExpiryDate: {
+      type: Date,
+      default: null,
+    },
   },
   { _id: false }
 );
@@ -28,7 +100,11 @@ const TaskSchema = new mongoose.Schema(
       default: () => uuidv4(),
     },
 
-    userId: { type: String, ref: "User", required: true },
+    userId: {
+      type: String,
+      ref: "User",
+      required: true,
+    },
 
     likeLinkId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -48,8 +124,15 @@ const TaskSchema = new mongoose.Schema(
       default: null,
     },
 
-    maxEmailsAllowed: { type: Number, default: 5 },
-    authWindowSeconds: { type: Number, default: 300 },
+    maxEmailsAllowed: {
+      type: Number,
+      default: 5,
+    },
+
+    authWindowSeconds: {
+      type: Number,
+      default: 300,
+    },
 
     emailSlots: {
       type: [EmailSlotSchema],
