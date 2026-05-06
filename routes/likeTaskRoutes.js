@@ -26,10 +26,10 @@ router.get("/my-status", likeTaskController.getTaskStatuses);
 router.post("/session", likeTaskController.getOrCreateTask);
 
 router.get("/google/start", likeTaskController.startGoogleAuth);
-router.get("/google/callback", likeTaskController.googleCallback);
 
-// YouTube API verification route
-// No screenshot required now
+// Callback moved to /auth/google/callback in main server file
+// router.get("/google/callback", likeTaskController.googleCallback);
+
 router.post("/submit", likeTaskController.submitScreenshotAndVerify);
 
 router.post("/view-entries", likeTaskController.getLikeLinkEntries);
