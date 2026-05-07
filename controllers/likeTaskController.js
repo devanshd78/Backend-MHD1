@@ -68,7 +68,10 @@ function readState(state) {
 
     return JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
 }
-
+function getMaxEmailsAllowedFromLikeLink(likeLink) {
+    const target = Math.floor(Number(likeLink?.target || 0));
+    return Number.isFinite(target) && target > 0 ? target : 1;
+}
 function isLikeLinkExpired(linkDoc) {
     const expireAt = new Date(linkDoc.createdAt);
     expireAt.setHours(expireAt.getHours() + Number(linkDoc.expireIn || 0));
@@ -76,31 +79,9 @@ function isLikeLinkExpired(linkDoc) {
     return new Date() > expireAt;
 }
 
-function serializeTask(taskDoc) {
-    const now = Date.now();
-
-    const completed = (taskDoc.emailSlots || []).filter((x) => x.verified);
-
-    const active = (taskDoc.emailSlots || []).find(
-        (x) =>
-            !x.verified &&
-            x.authExpiresAt &&
-            new Date(x.authExpiresAt).getTime() > now
-    );
-
-    return {
-        taskId: taskDoc.taskId,
-        userId: taskDoc.userId,
-        likeLinkId: String(taskDoc.likeLinkId),
-        amount: Number(taskDoc.amount || 0),
-        status: taskDoc.status ?? null,
-        completedCount: completed.length,
-        completedEmails: completed.map((x) => x.email),
-        activeEmail: active ? active.email : null,
-        activeAuthExpiresAt: active ? active.authExpiresAt : null,
-        authWindowSeconds: taskDoc.authWindowSeconds,
-        locked: completed.length >= taskDoc.maxEmailsAllowed,
-    };
+function getMaxEmailsAllowedFromLikeLink(likeLink) {
+    const target = Math.floor(Number(likeLink?.target || 0));
+    return Number.isFinite(target) && target > 0 ? target : 1;
 }
 
 function escapeHtml(str = "") {
@@ -272,17 +253,24 @@ async function verifyYoutubeLikeByApi(slot, videoUrl) {
     };
 }
 
-async function findOrCreateTask(userId, likeLinkId) {
+async function findOrCreateTask(userId, likeLinkId, maxEmailsAllowed) {
     let task = await Task.findOne({ userId, likeLinkId });
 
     if (!task) {
         task = await Task.create({
             userId,
             likeLinkId,
-            maxEmailsAllowed: 5,
+            maxEmailsAllowed,
             authWindowSeconds: AUTH_WINDOW_SECONDS,
             emailSlots: [],
         });
+
+        return task;
+    }
+
+    if (Number(task.maxEmailsAllowed) !== Number(maxEmailsAllowed)) {
+        task.maxEmailsAllowed = maxEmailsAllowed;
+        await task.save();
     }
 
     return task;
@@ -323,8 +311,23 @@ exports.getTaskStatuses = asyncHandler(async (req, res) => {
 
     const tasks = await Task.find({ userId }).lean();
 
+    const likeLinkIds = [
+        ...new Set(tasks.map((task) => String(task.likeLinkId)).filter(Boolean)),
+    ];
+
+    const likeLinks = await LikeLink.find({ _id: { $in: likeLinkIds } })
+        .select("_id target")
+        .lean();
+
+    const likeLinkMap = likeLinks.reduce((acc, link) => {
+        acc[String(link._id)] = link;
+        return acc;
+    }, {});
+
     res.json({
-        tasks: tasks.map(serializeTask),
+        tasks: tasks.map((task) =>
+            serializeTask(task, likeLinkMap[String(task.likeLinkId)] || null)
+        ),
     });
 });
 
@@ -349,10 +352,10 @@ exports.getOrCreateTask = asyncHandler(async (req, res) => {
         return badRequest(res, "Like task has expired");
     }
 
-    const task = await findOrCreateTask(String(userId), likeLinkId);
+    const task = await findOrCreateTask(String(userId), likeLinkId, likeLink);
 
     res.json({
-        task: serializeTask(task),
+        task: serializeTask(task, likeLink),
     });
 });
 
@@ -399,8 +402,11 @@ exports.startGoogleAuth = asyncHandler(async (req, res) => {
 
     const completedCount = (task.emailSlots || []).filter((x) => x.verified).length;
 
-    if (completedCount >= task.maxEmailsAllowed) {
-        return sendPopupError(res, "All 5 email slots are already completed");
+    if (completedCount >= maxEmailsAllowed) {
+        return sendPopupError(
+            res,
+            `All ${maxEmailsAllowed} email slots are already completed`
+        );
     }
 
     const state = signState({
@@ -439,7 +445,8 @@ exports.googleCallback = asyncHandler(async (req, res) => {
 
     const { taskId, userId, likeLinkId } = parsedState;
 
-    const task = await Task.findOne({ taskId, userId, likeLinkId });
+    const task = await findOrCreateTask(String(userId), likeLinkId, likeLink);
+    const maxEmailsAllowed = getMaxEmailsAllowedFromLikeLink(likeLink);
 
     if (!task) {
         return sendPopupError(res, "Task not found");
@@ -450,6 +457,8 @@ exports.googleCallback = asyncHandler(async (req, res) => {
     if (!likeLink) {
         return sendPopupError(res, "Like link not found");
     }
+
+    task.maxEmailsAllowed = maxEmailsAllowed;
 
     if (!likeLink.videoUrl) {
         return sendPopupError(res, "videoUrl missing");
@@ -517,10 +526,10 @@ exports.googleCallback = asyncHandler(async (req, res) => {
 
     const emailAlreadyExists = usedEmails.has(email);
 
-    if (!emailAlreadyExists && usedEmails.size >= task.maxEmailsAllowed) {
+    if (!emailAlreadyExists && usedEmails.size >= maxEmailsAllowed) {
         return sendPopupError(
             res,
-            `Only ${task.maxEmailsAllowed} different emails are allowed for this task`
+            `Only ${maxEmailsAllowed} different emails are allowed for this task`
         );
     }
 
@@ -634,6 +643,21 @@ exports.submitScreenshotAndVerify = asyncHandler(async (req, res) => {
         return badRequest(res, "Like task has expired");
     }
 
+    const maxEmailsAllowed = getMaxEmailsAllowedFromLikeLink(likeLink);
+
+    if (Number(task.maxEmailsAllowed) !== maxEmailsAllowed) {
+        task.maxEmailsAllowed = maxEmailsAllowed;
+    }
+
+    const completedCount = (task.emailSlots || []).filter((slot) => slot.verified).length;
+
+    if (completedCount >= maxEmailsAllowed) {
+        return badRequest(
+            res,
+            `All ${maxEmailsAllowed} email slots are already completed`
+        );
+    }
+
     const now = Date.now();
 
     const activeSlotIndex = (task.emailSlots || []).findIndex(
@@ -742,7 +766,7 @@ exports.submitScreenshotAndVerify = asyncHandler(async (req, res) => {
 
     await task.save();
 
-    const serialized = serializeTask(task);
+    const serialized = serializeTask(task, likeLink);
 
     return res.json({
         message: LIKE_DETECTED_MESSAGE,
@@ -781,6 +805,8 @@ exports.getLikeLinkEntries = asyncHandler(async (req, res) => {
         .sort({ createdAt: -1 })
         .lean();
 
+    const maxEmailsAllowed = getMaxEmailsAllowedFromLikeLink(likeLink);
+
     const userIds = [...new Set(tasks.map((t) => t.userId).filter(Boolean))];
 
     const users = await User.find({ userId: { $in: userIds } })
@@ -806,7 +832,7 @@ exports.getLikeLinkEntries = asyncHandler(async (req, res) => {
             likeLinkId: task.likeLinkId,
             amount: Number(task.amount || 0),
             status: task.status ?? null,
-            maxEmailsAllowed: task.maxEmailsAllowed,
+            maxEmailsAllowed,
             authWindowSeconds: task.authWindowSeconds,
             completedCount: verifiedSlots.length,
             pendingCount: pendingSlots.length,
