@@ -965,58 +965,85 @@ exports.getEmployeeLikeLinkEntries = asyncHandler(async (req, res) => {
     }
 
     const maxEmailsAllowed = getMaxEmailsAllowedFromLikeLink(likeLink);
+    const linkObjectId = new mongoose.Types.ObjectId(linkId);
 
-    // Get only users assigned/under this employee
-    // Change employeeId field here if your User model uses another field name
-    const users = await User.find({ employeeId })
-        .select("userId name email phone employeeId")
-        .lean();
-
-    const userIds = users.map((user) => user.userId).filter(Boolean);
-
-    const userMap = users.reduce((acc, user) => {
-        acc[user.userId] = user;
-        return acc;
-    }, {});
-
-    if (userIds.length === 0) {
-        return res.json({
-            likeLink: {
-                _id: likeLink._id,
-                title: likeLink.title,
-                videoUrl: likeLink.videoUrl,
-                target: likeLink.target,
-                amount: likeLink.amount,
-                expireIn: likeLink.expireIn,
-                requireLike: likeLink.requireLike,
-                createdAt: likeLink.createdAt,
+    const pipeline = [
+        {
+            $match: {
+                likeLinkId: linkObjectId,
             },
-            pagination: {
-                page,
-                limit,
-                totalEntries: 0,
-                totalPages: 0,
-                hasNextPage: false,
-                hasPrevPage: false,
+        },
+        {
+            $lookup: {
+                from: "users",
+                localField: "userId",
+                foreignField: "userId",
+                as: "user",
             },
-            entries: [],
-        });
-    }
+        },
+        {
+            $unwind: {
+                path: "$user",
+                preserveNullAndEmptyArrays: false,
+            },
+        },
+        {
+            $match: {
+                "user.worksUnder": String(employeeId),
+            },
+        },
+        {
+            $sort: {
+                createdAt: -1,
+            },
+        },
+        {
+            $facet: {
+                metadata: [
+                    {
+                        $count: "totalEntries",
+                    },
+                ],
+                data: [
+                    {
+                        $skip: skip,
+                    },
+                    {
+                        $limit: limit,
+                    },
+                    {
+                        $project: {
+                            _id: 1,
+                            taskId: 1,
+                            userId: 1,
+                            likeLinkId: 1,
+                            amount: 1,
+                            status: 1,
+                            maxEmailsAllowed: 1,
+                            authWindowSeconds: 1,
+                            emailSlots: 1,
+                            createdAt: 1,
+                            updatedAt: 1,
+                            user: {
+                                userId: "$user.userId",
+                                name: "$user.name",
+                                email: "$user.email",
+                                phone: "$user.phone",
+                                worksUnder: "$user.worksUnder",
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+    ];
 
-    const query = {
-        likeLinkId: linkId,
-        userId: { $in: userIds },
-    };
+    const result = await Task.aggregate(pipeline);
 
-    const totalEntries = await Task.countDocuments(query);
+    const rows = result?.[0]?.data || [];
+    const totalEntries = result?.[0]?.metadata?.[0]?.totalEntries || 0;
 
-    const tasks = await Task.find(query)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean();
-
-    const entries = tasks.map((task) => {
+    const entries = rows.map((task) => {
         const emailSlots = Array.isArray(task.emailSlots) ? task.emailSlots : [];
 
         const verifiedSlots = emailSlots.filter((slot) => slot.verified);
@@ -1026,7 +1053,7 @@ exports.getEmployeeLikeLinkEntries = asyncHandler(async (req, res) => {
             _id: task._id,
             taskId: task.taskId,
             userId: task.userId,
-            user: userMap[task.userId] || null,
+            user: task.user || null,
             likeLinkId: task.likeLinkId,
             amount: Number(task.amount || 0),
             status: task.status ?? null,
