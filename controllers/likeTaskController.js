@@ -80,6 +80,42 @@ function getMaxEmailsAllowedFromLikeLink(likeLink) {
     return Number.isFinite(target) && target > 0 ? target : 1;
 }
 
+function serializeTask(taskDoc, likeLinkDoc = null) {
+    const now = Date.now();
+
+    const emailSlots = Array.isArray(taskDoc.emailSlots)
+        ? taskDoc.emailSlots
+        : [];
+
+    const completed = emailSlots.filter((slot) => slot.verified === true);
+
+    const active = emailSlots.find(
+        (slot) =>
+            slot.verified !== true &&
+            slot.authExpiresAt &&
+            new Date(slot.authExpiresAt).getTime() > now
+    );
+
+    const maxEmailsAllowed = likeLinkDoc
+        ? getMaxEmailsAllowedFromLikeLink(likeLinkDoc)
+        : Number(taskDoc.maxEmailsAllowed || 1);
+
+    return {
+        taskId: taskDoc.taskId,
+        userId: taskDoc.userId,
+        likeLinkId: String(taskDoc.likeLinkId),
+        amount: Number(taskDoc.amount || 0),
+        status: taskDoc.status ?? null,
+        maxEmailsAllowed,
+        completedCount: completed.length,
+        completedEmails: completed.map((slot) => slot.email),
+        activeEmail: active ? active.email : null,
+        activeAuthExpiresAt: active ? active.authExpiresAt : null,
+        authWindowSeconds: Number(taskDoc.authWindowSeconds || AUTH_WINDOW_SECONDS),
+        locked: completed.length >= maxEmailsAllowed,
+    };
+}
+
 function escapeHtml(str = "") {
     return String(str)
         .replace(/&/g, "&amp;")
@@ -247,29 +283,6 @@ async function verifyYoutubeLikeByApi(slot, videoUrl) {
         rating,
         youtubeApiResponse: response.data || null,
     };
-}
-
-async function findOrCreateTask(userId, likeLinkId, maxEmailsAllowed) {
-    let task = await Task.findOne({ userId, likeLinkId });
-
-    if (!task) {
-        task = await Task.create({
-            userId,
-            likeLinkId,
-            maxEmailsAllowed,
-            authWindowSeconds: AUTH_WINDOW_SECONDS,
-            emailSlots: [],
-        });
-
-        return task;
-    }
-
-    if (Number(task.maxEmailsAllowed) !== Number(maxEmailsAllowed)) {
-        task.maxEmailsAllowed = maxEmailsAllowed;
-        await task.save();
-    }
-
-    return task;
 }
 
 async function findOrCreateTask(userId, likeLinkId, likeLink) {
@@ -584,21 +597,50 @@ exports.googleCallback = asyncHandler(async (req, res) => {
     };
 
     if (existingPendingIndex >= 0) {
-        task.emailSlots[existingPendingIndex] = {
-            ...task.emailSlots[existingPendingIndex],
-            ...slotData,
-            refreshToken:
-                tokens.refresh_token ||
-                task.emailSlots[existingPendingIndex]?.refreshToken ||
-                "",
-        };
+        const oldSlot = task.emailSlots[existingPendingIndex];
+        const oldRefreshToken = oldSlot?.refreshToken || "";
+
+        task.emailSlots.set(existingPendingIndex, {
+            email: slotData.email,
+            googleSub: slotData.googleSub,
+            authAt: slotData.authAt,
+            authExpiresAt: slotData.authExpiresAt,
+            screenshotHash: slotData.screenshotHash,
+            submittedAt: slotData.submittedAt,
+            verified: slotData.verified,
+            verificationReason: slotData.verificationReason,
+            verificationMessage: slotData.verificationMessage,
+            verifiedBy: slotData.verifiedBy,
+            videoId: slotData.videoId,
+            youtubeRating: slotData.youtubeRating,
+            youtubeApiResponse: slotData.youtubeApiResponse,
+            accessToken: slotData.accessToken,
+            refreshToken: tokens.refresh_token || oldRefreshToken,
+            tokenExpiryDate: slotData.tokenExpiryDate,
+        });
     } else {
         task.emailSlots.push(slotData);
     }
 
     task.markModified("emailSlots");
-
     await task.save();
+
+    const savedTask = await Task.findOne({ taskId, userId, likeLinkId }).lean();
+
+    const savedActiveSlot = (savedTask?.emailSlots || []).find(
+        (slot) =>
+            normalizeEmail(slot.email) === email &&
+            slot.verified !== true &&
+            slot.authExpiresAt &&
+            new Date(slot.authExpiresAt).getTime() > Date.now()
+    );
+
+    if (!savedActiveSlot) {
+        return sendPopupError(
+            res,
+            "Authentication was not saved. Please authenticate again."
+        );
+    }
 
     const frontendOrigin = new URL(process.env.FRONTEND_URL).origin;
     const youtubeOpenUrl = buildYoutubeOpenUrl(likeLink.videoUrl, email);
