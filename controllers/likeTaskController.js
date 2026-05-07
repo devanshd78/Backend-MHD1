@@ -68,10 +68,6 @@ function readState(state) {
 
     return JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
 }
-function getMaxEmailsAllowedFromLikeLink(likeLink) {
-    const target = Math.floor(Number(likeLink?.target || 0));
-    return Number.isFinite(target) && target > 0 ? target : 1;
-}
 function isLikeLinkExpired(linkDoc) {
     const expireAt = new Date(linkDoc.createdAt);
     expireAt.setHours(expireAt.getHours() + Number(linkDoc.expireIn || 0));
@@ -276,6 +272,31 @@ async function findOrCreateTask(userId, likeLinkId, maxEmailsAllowed) {
     return task;
 }
 
+async function findOrCreateTask(userId, likeLinkId, likeLink) {
+    const maxEmailsAllowed = getMaxEmailsAllowedFromLikeLink(likeLink);
+
+    let task = await Task.findOne({ userId, likeLinkId });
+
+    if (!task) {
+        task = await Task.create({
+            userId,
+            likeLinkId,
+            maxEmailsAllowed,
+            authWindowSeconds: AUTH_WINDOW_SECONDS,
+            emailSlots: [],
+        });
+
+        return task;
+    }
+
+    if (Number(task.maxEmailsAllowed) !== maxEmailsAllowed) {
+        task.maxEmailsAllowed = maxEmailsAllowed;
+        await task.save();
+    }
+
+    return task;
+}
+
 function buildYoutubeOpenUrl(videoUrl, email) {
     try {
         let targetUrl = new URL(videoUrl);
@@ -384,7 +405,9 @@ exports.startGoogleAuth = asyncHandler(async (req, res) => {
         return sendPopupError(res, "Like task has expired");
     }
 
-    const task = await findOrCreateTask(String(userId), likeLinkId);
+    const maxEmailsAllowed = getMaxEmailsAllowedFromLikeLink(likeLink);
+
+    const task = await findOrCreateTask(String(userId), likeLinkId, likeLink);
 
     const activePending = (task.emailSlots || []).find(
         (x) =>
@@ -445,17 +468,18 @@ exports.googleCallback = asyncHandler(async (req, res) => {
 
     const { taskId, userId, likeLinkId } = parsedState;
 
-    const task = await findOrCreateTask(String(userId), likeLinkId, likeLink);
-    const maxEmailsAllowed = getMaxEmailsAllowedFromLikeLink(likeLink);
-
-    if (!task) {
-        return sendPopupError(res, "Task not found");
-    }
-
     const likeLink = await LikeLink.findById(likeLinkId).lean();
 
     if (!likeLink) {
         return sendPopupError(res, "Like link not found");
+    }
+
+    const maxEmailsAllowed = getMaxEmailsAllowedFromLikeLink(likeLink);
+
+    const task = await Task.findOne({ taskId, userId, likeLinkId });
+
+    if (!task) {
+        return sendPopupError(res, "Task not found");
     }
 
     task.maxEmailsAllowed = maxEmailsAllowed;
