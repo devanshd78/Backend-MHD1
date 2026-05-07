@@ -936,3 +936,144 @@ exports.getLikeLinkEntries = asyncHandler(async (req, res) => {
         entries,
     });
 });
+
+
+
+exports.getEmployeeLikeLinkEntries = asyncHandler(async (req, res) => {
+    const { linkId, employeeId } = req.body;
+
+    const page = Math.max(parseInt(req.body.page || 1, 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.body.limit || 10, 10), 1), 100);
+    const skip = (page - 1) * limit;
+
+    if (!linkId) {
+        return badRequest(res, "linkId is required");
+    }
+
+    if (!employeeId) {
+        return badRequest(res, "employeeId is required");
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(linkId)) {
+        return badRequest(res, "Invalid linkId");
+    }
+
+    const likeLink = await LikeLink.findById(linkId).lean();
+
+    if (!likeLink) {
+        return notFound(res, "Like link not found");
+    }
+
+    const maxEmailsAllowed = getMaxEmailsAllowedFromLikeLink(likeLink);
+
+    // Get only users assigned/under this employee
+    // Change employeeId field here if your User model uses another field name
+    const users = await User.find({ employeeId })
+        .select("userId name email phone employeeId")
+        .lean();
+
+    const userIds = users.map((user) => user.userId).filter(Boolean);
+
+    const userMap = users.reduce((acc, user) => {
+        acc[user.userId] = user;
+        return acc;
+    }, {});
+
+    if (userIds.length === 0) {
+        return res.json({
+            likeLink: {
+                _id: likeLink._id,
+                title: likeLink.title,
+                videoUrl: likeLink.videoUrl,
+                target: likeLink.target,
+                amount: likeLink.amount,
+                expireIn: likeLink.expireIn,
+                requireLike: likeLink.requireLike,
+                createdAt: likeLink.createdAt,
+            },
+            pagination: {
+                page,
+                limit,
+                totalEntries: 0,
+                totalPages: 0,
+                hasNextPage: false,
+                hasPrevPage: false,
+            },
+            entries: [],
+        });
+    }
+
+    const query = {
+        likeLinkId: linkId,
+        userId: { $in: userIds },
+    };
+
+    const totalEntries = await Task.countDocuments(query);
+
+    const tasks = await Task.find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean();
+
+    const entries = tasks.map((task) => {
+        const emailSlots = Array.isArray(task.emailSlots) ? task.emailSlots : [];
+
+        const verifiedSlots = emailSlots.filter((slot) => slot.verified);
+        const pendingSlots = emailSlots.filter((slot) => !slot.verified);
+
+        return {
+            _id: task._id,
+            taskId: task.taskId,
+            userId: task.userId,
+            user: userMap[task.userId] || null,
+            likeLinkId: task.likeLinkId,
+            amount: Number(task.amount || 0),
+            status: task.status ?? null,
+            maxEmailsAllowed,
+            authWindowSeconds: task.authWindowSeconds,
+            completedCount: verifiedSlots.length,
+            pendingCount: pendingSlots.length,
+            emailSlots: emailSlots.map((slot) => ({
+                email: slot.email,
+                googleSub: slot.googleSub,
+                authAt: slot.authAt,
+                authExpiresAt: slot.authExpiresAt,
+                submittedAt: slot.submittedAt,
+                verified: slot.verified,
+                verificationReason: slot.verificationReason,
+                verificationMessage: slot.verificationMessage,
+                verifiedBy: slot.verifiedBy,
+                videoId: slot.videoId,
+                youtubeRating: slot.youtubeRating,
+                youtubeApiResponse: slot.youtubeApiResponse,
+            })),
+            createdAt: task.createdAt,
+            updatedAt: task.updatedAt,
+        };
+    });
+
+    const totalPages = Math.ceil(totalEntries / limit);
+
+    res.json({
+        likeLink: {
+            _id: likeLink._id,
+            title: likeLink.title,
+            videoUrl: likeLink.videoUrl,
+            target: likeLink.target,
+            amount: likeLink.amount,
+            expireIn: likeLink.expireIn,
+            requireLike: likeLink.requireLike,
+            createdAt: likeLink.createdAt,
+        },
+        pagination: {
+            page,
+            limit,
+            totalEntries,
+            totalPages,
+            hasNextPage: page < totalPages,
+            hasPrevPage: page > 1,
+        },
+        entries,
+    });
+});

@@ -34,4 +34,6 @@ router.post("/submit", likeTaskController.submitScreenshotAndVerify);
 
 router.post("/view-entries", likeTaskController.getLikeLinkEntries);
 
+router.post("/employee-view-entries", likeTaskController.getEmployeeLikeLinkEntries);
+
 module.exports = router;
